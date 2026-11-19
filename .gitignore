@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Local data (DuckDB files, profiler traces, run artifacts)
+*.duckdb
+*.duckdb.wal
+*.wal
+*.pt.trace.json
+.pyrometer/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Personal Claude Code config — keep out of the public repo.
+# Machine-specific skills (homelab IPs etc.) live in ~/.claude/skills/,
+# but these patterns are a safety net if one is ever created in-tree.
+.claude/settings.local.json
+.claude/skills/*-local/
+.claude/skills/*-homelab/
+CLAUDE.local.md
+*.local.md
+
+# Scratch / screenshots
+/*.png
+scratch/
+tmp/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

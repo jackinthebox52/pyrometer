@@ -1,0 +1,993 @@
+"""Run — the handle returned by pyrometer.init() that the user interacts with."""
+
+import logging
+import math
+import os
+import sys
+import threading
+import time
+from contextlib import contextmanager
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+
+class _TeeWriter:
+    """Forwards writes to an original stream while buffering complete lines.
+
+    Installed on sys.stdout / sys.stderr by Run.__init__ so console output is
+    both displayed normally and shipped to the server as structured log lines.
+    Thread-safe: a per-instance lock serialises write() and flush() calls.
+    """
+
+    def __init__(self, original, stream_name: str, on_line) -> None:
+        self._orig = original
+        self._name = stream_name
+        self._on_line = on_line  # callable(line: str, stream: str)
+        self._buf = ""
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        with self._lock:
+            self._orig.write(text)
+            self._buf += text
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line:
+                    try:
+                        self._on_line(line, self._name)
+                    except Exception:
+                        pass
+        return len(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._buf.strip():
+                try:
+                    self._on_line(self._buf, self._name)
+                except Exception:
+                    pass
+                self._buf = ""
+            self._orig.flush()
+
+    def fileno(self) -> int:
+        return self._orig.fileno()
+
+    def isatty(self) -> bool:
+        return self._orig.isatty()
+
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+class Run:
+    """Represents an active training run.
+
+    Returned by :func:`pyrometer.init`. Not instantiated directly.
+
+    Manages two background threads:
+    - A flush thread that ships buffered metrics to the server every 5 seconds
+      (or immediately when the buffer reaches 100 entries).
+    - A system monitor thread that polls pynvml every 2 seconds and POSTs
+      GPU utilization, memory, temperature, and power draw to the server.
+    """
+
+    def __init__(self, run_id: str, server_url: str) -> None:
+        self.run_id = run_id
+        self._server = server_url
+        self._client = httpx.Client(base_url=server_url, timeout=10)
+
+        self._buffer: list[dict] = []
+        self._lock = threading.Lock()
+        self._finished = False
+        self._last_step = 0
+
+        # watch() state — gradient/weight monitoring
+        self._watch_hooks: list = []
+        self._param_stats_buffer: list[dict] = []
+        self._param_stats_lock = threading.Lock()
+        self._watch_grad_norm_history: dict[str, list[float]] = {}
+        self._watch_low_norm_streak: dict[str, int] = {}
+
+        # stdout/stderr capture
+        self._log_buffer: list[dict] = []
+        self._log_lock = threading.Lock()
+        self._original_stdout = None
+        self._original_stderr = None
+        self._install_stdout_capture()
+
+        # metric anomaly detection (loss spike, NaN)
+        self._metric_history: dict[str, list[float]] = {}
+        self._metric_cooldown: dict[str, int] = {}
+
+        self._our_pid = os.getpid()
+
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
+
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+    def log(self, metrics: dict, step: int) -> None:
+        """Log a dict of scalar metrics at a given training step.
+
+        Buffers entries in memory and flushes to the server every 5 seconds or
+        when the buffer reaches 100 entries — whichever comes first. This is
+        safe to call inside a tight training loop without hammering the API.
+
+        Args:
+            metrics: Dict mapping metric names to float values.
+                     Names can use slash notation, e.g. ``"train/loss"``.
+            step: Global training step (integer). Used as the x-axis in charts.
+
+        Example::
+
+            run.log({"train/loss": loss.item(), "lr": scheduler.get_last_lr()[0]}, step=global_step)
+        """
+        if self._finished:
+            return
+        self._last_step = step
+        ts = time.time()
+        with self._lock:
+            for name, value in metrics.items():
+                self._buffer.append({
+                    "step": step,
+                    "timestamp": ts,
+                    "name": name,
+                    "value": float(value),
+                })
+            if len(self._buffer) >= 100:
+                self._flush_locked()
+        # Anomaly checks run outside the buffer lock; HTTP calls happen in spawned threads.
+        for name, value in metrics.items():
+            try:
+                self._check_metric_anomaly(name, float(value), step)
+            except (ValueError, TypeError):
+                pass
+
+    def watch(self, model, log_freq: int = 100) -> None:
+        """Monitor gradient and weight statistics for all trainable parameters.
+
+        Registers a backward hook on every ``requires_grad`` parameter. Every
+        ``log_freq`` backward passes, computes per-parameter gradient and weight
+        statistics (L2 norm, min, max, mean, 32-bin histogram) and ships them to
+        the server. Anomaly detection fires alert events automatically when:
+
+        - Any gradient norm exceeds 100× the rolling median (spike).
+        - Any gradient norm stays below 1e-8 for 50 consecutive samples (dead layer).
+        - NaN or Inf is detected in gradients or weights.
+
+        Call once after :func:`pyrometer.init` and before the training loop::
+
+            run.watch(model, log_freq=50)  # log every 50th backward pass
+
+        Args:
+            model: A ``torch.nn.Module`` whose parameters will be monitored.
+            log_freq: How often (in number of backward passes per parameter)
+                      to compute and ship statistics. Default 100.
+        """
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            return
+
+        self._remove_watch_hooks()
+
+        def make_hook(param_name: str, param):
+            call_count = [0]
+
+            def hook(grad):
+                if grad is None:
+                    return
+                call_count[0] += 1
+                if call_count[0] % log_freq != 0:
+                    return
+                if self._finished:
+                    return
+
+                step = self._last_step
+                ts = time.time()
+                try:
+                    import torch as _torch
+
+                    # Move to CPU for all computations (safe across CUDA/CPU models)
+                    g = grad.detach().float().cpu()
+                    w = param.data.detach().float().cpu()
+                    flat_g = g.flatten()
+                    flat_w = w.flatten()
+
+                    grad_norm = float(flat_g.norm(2))
+                    has_nan_inf = (
+                        not bool(_torch.isfinite(g).all())
+                        or not bool(_torch.isfinite(w).all())
+                    )
+
+                    try:
+                        gh = _torch.histc(flat_g, bins=32).tolist()
+                        wh = _torch.histc(flat_w, bins=32).tolist()
+                    except Exception:
+                        gh, wh = [], []
+
+                    stat = {
+                        "step": step,
+                        "timestamp": ts,
+                        "param_name": param_name,
+                        "grad_norm": grad_norm,
+                        "grad_min": float(flat_g.min()),
+                        "grad_max": float(flat_g.max()),
+                        "grad_mean": float(flat_g.mean()),
+                        "weight_norm": float(flat_w.norm(2)),
+                        "weight_min": float(flat_w.min()),
+                        "weight_max": float(flat_w.max()),
+                        "weight_mean": float(flat_w.mean()),
+                        "grad_histogram": gh,
+                        "weight_histogram": wh,
+                    }
+
+                    with self._param_stats_lock:
+                        self._param_stats_buffer.append(stat)
+
+                    threading.Thread(
+                        target=self._check_grad_anomaly,
+                        args=(param_name, grad_norm, step, has_nan_inf),
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    log.exception("Error computing param stats for %s", param_name)
+
+            return hook
+
+        count = 0
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                h = param.register_hook(make_hook(name, param))
+                self._watch_hooks.append(h)
+                count += 1
+        log.debug("Watching %d parameters (log_freq=%d)", count, log_freq)
+
+    def event(
+        self,
+        message: str,
+        event_type: str = "custom",
+        severity: str = "info",
+        metadata: dict | None = None,
+    ) -> None:
+        """Log a structured event on the training timeline.
+
+        Events appear as vertical marker lines on all metric charts in the
+        dashboard. Hover a marker to see the event message and metadata.
+
+        Args:
+            message: Human-readable description of the event.
+            event_type: Category string. Built-in values: ``"checkpoint_saved"``,
+                        ``"lr_scheduled"``, ``"anomaly_detected"``, ``"cuda_error"``,
+                        ``"oom_warning"``, ``"thermal_throttle"``, ``"custom"``.
+            severity: One of ``"info"``, ``"warning"``, ``"error"``.
+            metadata: Optional JSON-serialisable dict of extra context.
+
+        Example::
+
+            run.event("switched to phase 2 training", metadata={"phase": 2})
+            run.event("checkpoint saved", event_type="checkpoint_saved",
+                      metadata={"path": "/ckpt/step_5000.pt"})
+        """
+        if self._finished:
+            return
+        try:
+            self._client.post(
+                f"/runs/{self.run_id}/events",
+                json={
+                    "timestamp": time.time(),
+                    "step": self._last_step,
+                    "event_type": event_type,
+                    "severity": severity,
+                    "message": message,
+                    "metadata": metadata or {},
+                },
+            )
+        except Exception:
+            log.exception("Failed to log event: %s", message)
+
+    def log_artifact(
+        self,
+        path: str,
+        artifact_type: str = "checkpoint",
+        metadata: dict | None = None,
+    ) -> None:
+        """Track a saved file artifact (model checkpoint, config, etc.).
+
+        Does **not** upload the file — only records its path, on-disk size,
+        timestamp, and associated metadata so you can see what was saved and
+        when in the dashboard.
+
+        Args:
+            path: Absolute or relative path to the saved file.
+            artifact_type: Category string, e.g. ``"checkpoint"``, ``"config"``,
+                           ``"dataset"``, ``"export"``.
+            metadata: Optional JSON-serialisable dict, e.g.
+                      ``{"step": 5000, "val_loss": 0.23}``.
+
+        Example::
+
+            torch.save(model.state_dict(), ckpt_path)
+            run.log_artifact(ckpt_path, artifact_type="checkpoint",
+                             metadata={"val_loss": val_loss})
+        """
+        if self._finished:
+            return
+        import os
+        try:
+            size: int | None = os.path.getsize(path) if os.path.exists(path) else None
+        except Exception:
+            size = None
+        try:
+            self._client.post(
+                f"/runs/{self.run_id}/artifacts",
+                json={
+                    "timestamp": time.time(),
+                    "step": self._last_step,
+                    "artifact_type": artifact_type,
+                    "path": str(path),
+                    "size_bytes": size,
+                    "metadata": metadata or {},
+                },
+            )
+        except Exception:
+            log.exception("Failed to log artifact: %s", path)
+
+    def log_image(self, name: str, image, step: int | None = None) -> None:
+        """Log an image at a given training step.
+
+        Accepts PIL Images, NumPy arrays, or PyTorch tensors. Converts to PNG
+        and ships to the server as a base64-encoded string. Float tensors are
+        clamped to [0, 1] and scaled to uint8 automatically.
+
+        Args:
+            name: Display name for this image stream, e.g. ``"predictions"``.
+            image: One of:
+                   - ``PIL.Image.Image``
+                   - NumPy array with shape ``(H, W)`` or ``(H, W, C)``
+                   - ``torch.Tensor`` with shape ``(C, H, W)``, ``(H, W)``,
+                     or ``(N, C, H, W)`` (first image in batch is used).
+            step: Training step. Defaults to the last step passed to
+                  :meth:`log`.
+
+        Example::
+
+            run.log_image("predictions", output_image_tensor, step=global_step)
+        """
+        if self._finished:
+            return
+        try:
+            data = self._image_to_b64(image)
+        except Exception:
+            log.exception("Failed to encode image '%s'", name)
+            return
+        self._post_media(name, "image", data, step)
+
+    def log_histogram(
+        self,
+        name: str,
+        data,
+        step: int | None = None,
+        num_bins: int = 32,
+    ) -> None:
+        """Log a histogram of a tensor or array at a given training step.
+
+        Flattens the input, computes a ``num_bins``-bin histogram, and ships
+        it to the server as JSON. Useful for monitoring activation distributions,
+        logit ranges, or any tensor distribution you care about beyond the
+        automatic per-layer gradient histograms from :meth:`watch`.
+
+        Args:
+            name: Display name, e.g. ``"activation_distribution"``.
+            data: ``torch.Tensor``, NumPy array, or plain Python list.
+            step: Training step. Defaults to the last step passed to
+                  :meth:`log`.
+            num_bins: Number of histogram bins (default 32).
+
+        Example::
+
+            run.log_histogram("logits", model_output.detach(), step=global_step)
+        """
+        if self._finished:
+            return
+        import json as _json
+        try:
+            hist_json = self._compute_histogram(data, num_bins)
+        except Exception:
+            log.exception("Failed to compute histogram '%s'", name)
+            return
+        self._post_media(name, "histogram", _json.dumps(hist_json), step)
+
+    def log_figure(self, name: str, figure, step: int | None = None) -> None:
+        """Log a matplotlib figure at a given training step.
+
+        Saves the figure to a PNG in memory, base64-encodes it, and ships it
+        to the server. Useful for confusion matrices, precision-recall curves,
+        or any custom matplotlib visualisation you want tracked over training.
+
+        Args:
+            name: Display name, e.g. ``"confusion_matrix"``.
+            figure: A ``matplotlib.figure.Figure`` instance.
+            step: Training step. Defaults to the last step passed to
+                  :meth:`log`.
+
+        Example::
+
+            fig, ax = plt.subplots()
+            ax.imshow(conf_matrix)
+            run.log_figure("confusion_matrix", fig, step=global_step)
+            plt.close(fig)
+        """
+        if self._finished:
+            return
+        try:
+            data = self._figure_to_b64(figure)
+        except Exception:
+            log.exception("Failed to encode figure '%s'", name)
+            return
+        self._post_media(name, "figure", data, step)
+
+    def finish(self) -> None:
+        """Mark the run as completed, flush remaining metrics, and close the HTTP session.
+
+        Always call this at the end of training — it flips the run status from
+        ``running`` to ``completed`` in the database and ensures no metrics are lost.
+
+        Example::
+
+            run.finish()
+        """
+        self._finished = True
+        self._flush()
+        self._restore_stdout_capture()
+        self._remove_watch_hooks()
+        try:
+            self._client.patch(f"/runs/{self.run_id}", json={"status": "completed"})
+        except Exception:
+            pass
+        self._client.close()
+
+    @contextmanager
+    def profile(self, step: int):
+        """Profile a single training step using torch.profiler.
+
+        Activates ``torch.profiler.profile`` with CPU + CUDA activity capture,
+        input shape recording, and memory profiling for exactly the code block
+        inside the ``with`` statement. After the block exits, aggregated
+        operator events (name, category, CPU/CUDA time, input shapes, memory
+        delta) are shipped to the server in a background thread so the training
+        loop is not blocked.
+
+        Only profile periodically (e.g. every 100 steps) — each profiling call
+        adds measurable overhead and can produce thousands of events.
+
+        If ``torch`` is not importable the context manager is a silent no-op,
+        so non-PyTorch code paths are unaffected.
+
+        Args:
+            step: The training step being profiled. Stored alongside all events
+                  so the dashboard can correlate profiler data with metric charts.
+
+        Example::
+
+            with run.profile(step=global_step):
+                loss = val_step(model, batch)
+        """
+        try:
+            import torch.profiler as _tp
+        except ImportError:
+            yield
+            return
+
+        ts = time.time()
+        with _tp.profile(
+            activities=[_tp.ProfilerActivity.CPU, _tp.ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        ) as _prof:
+            yield
+
+        # Ship events off the hot path — failures are silently swallowed.
+        threading.Thread(
+            target=self._ship_profile,
+            args=(_prof, step, ts),
+            daemon=True,
+        ).start()
+
+    def _ship_profile(self, prof, step: int, ts: float) -> None:
+        """Extract key_averages from a finished profiler session and POST to server."""
+        try:
+            events = []
+            for evt in prof.key_averages():
+                cpu_us = float(evt.self_cpu_time_total or 0)
+                # self_cuda_time_total was renamed to self_device_time_total in PyTorch 2.x
+                device_us = float(
+                    getattr(evt, "self_device_time_total", None)
+                    or getattr(evt, "self_cuda_time_total", None)
+                    or 0
+                )
+                total_us = cpu_us + device_us
+                if total_us < 1.0:
+                    continue  # skip sub-microsecond bookkeeping noise
+
+                category = "cuda_kernel" if device_us > 0 else "cpu_op"
+
+                # Coerce input_shapes (may contain torch.Size) to plain lists.
+                try:
+                    shapes = [[int(s) for s in shape] for shape in (evt.input_shapes or [])]
+                except Exception:
+                    shapes = []
+
+                # Net memory delta: device preferred, fall back to CPU.
+                mem = (
+                    getattr(evt, "cuda_memory_usage", None)
+                    or getattr(evt, "self_device_memory_usage", None)
+                    or evt.cpu_memory_usage
+                    or None
+                )
+
+                events.append({
+                    "step": step,
+                    "timestamp": ts,
+                    "name": evt.key,
+                    "category": category,
+                    "duration_us": total_us,
+                    "cuda_time_us": device_us,
+                    "cpu_time_us": cpu_us,
+                    "input_shapes": shapes,
+                    "memory_bytes": int(mem) if mem else None,
+                    "device_id": 0,
+                })
+
+            if events:
+                resp = self._client.post(f"/runs/{self.run_id}/profile", json=events)
+                resp.raise_for_status()
+                log.debug("Shipped %d profile events for step %d", len(events), step)
+            else:
+                log.warning("Profile step %d produced no events (all sub-microsecond)", step)
+        except Exception:
+            log.exception("Failed to ship profile events for step %d", step)
+
+    # --- internals ---
+
+    # -- stdout/stderr capture --
+
+    def _install_stdout_capture(self) -> None:
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        sys.stdout = _TeeWriter(sys.stdout, "stdout", self._on_log_line)
+        sys.stderr = _TeeWriter(sys.stderr, "stderr", self._on_log_line)
+
+    def _restore_stdout_capture(self) -> None:
+        if self._original_stdout is not None:
+            sys.stdout = self._original_stdout
+            self._original_stdout = None
+        if self._original_stderr is not None:
+            sys.stderr = self._original_stderr
+            self._original_stderr = None
+
+    def _on_log_line(self, line: str, stream: str) -> None:
+        ts = time.time()
+        should_flush = False
+        with self._log_lock:
+            self._log_buffer.append({
+                "timestamp": ts,
+                "stream": stream,
+                "line": line,
+                "step": self._last_step,
+            })
+            should_flush = len(self._log_buffer) >= 50
+        if should_flush:
+            threading.Thread(target=self._flush_logs, daemon=True).start()
+
+    def _flush_logs(self) -> None:
+        with self._log_lock:
+            if not self._log_buffer:
+                return
+            batch = self._log_buffer[:]
+            self._log_buffer.clear()
+        try:
+            self._client.post(f"/runs/{self.run_id}/logs", json=batch)
+        except Exception:
+            log.exception("Failed to flush %d log lines", len(batch))
+
+    # -- gradient/weight monitoring --
+
+    def _remove_watch_hooks(self) -> None:
+        for h in self._watch_hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self._watch_hooks.clear()
+
+    def _check_grad_anomaly(
+        self, param_name: str, grad_norm: float, step: int, has_nan_inf: bool
+    ) -> None:
+        if has_nan_inf:
+            self._fire_anomaly_event(
+                param_name, step, "NaN or Inf detected in gradients or weights"
+            )
+            return
+
+        hist = self._watch_grad_norm_history.setdefault(param_name, [])
+        hist.append(grad_norm)
+        if len(hist) > 200:
+            del hist[0]
+
+        if len(hist) >= 10:
+            prev = sorted(hist[:-1])
+            median = prev[len(prev) // 2]
+            if median > 0 and grad_norm > 100 * median:
+                self._fire_anomaly_event(
+                    param_name,
+                    step,
+                    f"Gradient norm spike: {grad_norm:.4g} vs median {median:.4g}",
+                )
+
+        if grad_norm < 1e-8:
+            streak = self._watch_low_norm_streak.get(param_name, 0) + 1
+            self._watch_low_norm_streak[param_name] = streak
+            if streak == 50:  # fire once when threshold crossed
+                self._fire_anomaly_event(
+                    param_name,
+                    step,
+                    f"Gradient norm below 1e-8 for {streak} consecutive samples — possible dead layer",
+                )
+        else:
+            self._watch_low_norm_streak[param_name] = 0
+
+    def _fire_anomaly_event(self, param_name: str, step: int, message: str) -> None:
+        if self._finished:
+            return
+        try:
+            self._client.post(
+                f"/runs/{self.run_id}/events",
+                json={
+                    "timestamp": time.time(),
+                    "step": step,
+                    "event_type": "anomaly_detected",
+                    "severity": "warning",
+                    "message": f"{param_name}: {message}",
+                    "metadata": {"param_name": param_name},
+                },
+            )
+        except Exception:
+            log.exception("Failed to fire anomaly event for %s", param_name)
+
+    def _check_metric_anomaly(self, name: str, value: float, step: int) -> None:
+        """Rolling z-score spike detection and NaN/Inf check for a single metric value."""
+        if math.isnan(value) or math.isinf(value):
+            threading.Thread(
+                target=self._fire_metric_spike_event,
+                args=(name, step, f"NaN or Inf in metric '{name}'", "error"),
+                daemon=True,
+            ).start()
+            return
+
+        hist = self._metric_history.setdefault(name, [])
+        hist.append(value)
+        if len(hist) > 30:
+            del hist[0]
+
+        cooldown = self._metric_cooldown.get(name, 0)
+        if cooldown > 0:
+            self._metric_cooldown[name] = cooldown - 1
+            return
+
+        # Require at least 5 samples — low enough that infrequent metrics (val/loss
+        # logged once per epoch) can still trigger detection early in training.
+        if len(hist) < 5:
+            return
+
+        # Compute median and std over the window excluding the current value
+        window = hist[:-1]
+        n = len(window)
+        sorted_w = sorted(window)
+        median = sorted_w[n // 2]
+        mean = sum(window) / n
+        std = (sum((x - mean) ** 2 for x in window) / n) ** 0.5
+
+        if std < 1e-10:
+            return
+
+        z = abs(value - median) / std
+        if z > 5.0:
+            self._metric_cooldown[name] = 10
+            threading.Thread(
+                target=self._fire_metric_spike_event,
+                args=(
+                    name,
+                    step,
+                    f"Spike in '{name}': {value:.4g} (z={z:.1f}, median={median:.4g})",
+                    "warning",
+                ),
+                daemon=True,
+            ).start()
+
+    def _fire_metric_spike_event(self, name: str, step: int, message: str, severity: str) -> None:
+        if self._finished:
+            return
+        try:
+            self._client.post(
+                f"/runs/{self.run_id}/events",
+                json={
+                    "timestamp": time.time(),
+                    "step": step,
+                    "event_type": "anomaly_detected",
+                    "severity": severity,
+                    "message": message,
+                    "metadata": {"metric": name},
+                },
+            )
+        except Exception:
+            log.exception("Failed to fire spike event for metric %s", name)
+
+    def _flush_param_stats(self) -> None:
+        with self._param_stats_lock:
+            if not self._param_stats_buffer:
+                return
+            batch = self._param_stats_buffer[:]
+            self._param_stats_buffer.clear()
+        try:
+            self._client.post(f"/runs/{self.run_id}/param-stats", json=batch)
+        except Exception:
+            log.exception("Failed to flush %d param stats", len(batch))
+
+    def _flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+        self._flush_param_stats()
+        self._flush_logs()
+
+    def _flush_locked(self) -> None:
+        """Must be called with self._lock held."""
+        if not self._buffer:
+            return
+        batch = self._buffer[:]
+        self._buffer.clear()
+        try:
+            self._client.post(f"/runs/{self.run_id}/metrics", json=batch)
+        except Exception:
+            log.exception("Failed to flush %d metrics to server", len(batch))
+
+    # ------------------------------------------------------------------
+    # Media helpers
+    # ------------------------------------------------------------------
+
+    def _image_to_b64(self, image) -> str:
+        """Convert an image-like object to a base64-encoded PNG string."""
+        import base64
+        import io
+
+        pil_img = self._to_pil(image)
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _to_pil(self, image):
+        """Normalise various image formats to a PIL Image."""
+        try:
+            from PIL import Image as _PILImage
+        except ImportError as exc:
+            raise ImportError(
+                "Pillow is required for log_image / log_figure. "
+                "Install it with: pip install Pillow"
+            ) from exc
+
+        # Already a PIL Image
+        if hasattr(image, "save") and hasattr(image, "mode"):
+            return image
+
+        # torch.Tensor
+        try:
+            import torch as _torch
+            if isinstance(image, _torch.Tensor):
+                t = image.detach().cpu()
+                if t.ndim == 4:  # (N, C, H, W) — take first
+                    t = t[0]
+                if t.ndim == 3:  # (C, H, W) → (H, W, C)
+                    t = t.permute(1, 2, 0)
+                # Now (H, W) or (H, W, C)
+                if t.is_floating_point():
+                    t = (t.clamp(0, 1) * 255).byte()
+                arr = t.numpy()
+                if arr.ndim == 3 and arr.shape[2] == 1:
+                    arr = arr[:, :, 0]
+                return _PILImage.fromarray(arr)
+        except ImportError:
+            pass
+
+        # NumPy array
+        import numpy as _np
+        arr = _np.asarray(image)
+        if arr.dtype != _np.uint8:
+            if arr.max() <= 1.0:
+                arr = (arr * 255).clip(0, 255).astype(_np.uint8)
+            else:
+                arr = arr.clip(0, 255).astype(_np.uint8)
+        return _PILImage.fromarray(arr)
+
+    def _figure_to_b64(self, figure) -> str:
+        """Render a matplotlib figure to a base64-encoded PNG string."""
+        import base64
+        import io
+
+        buf = io.BytesIO()
+        figure.savefig(buf, format="png", bbox_inches="tight", dpi=96)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("ascii")
+
+    def _compute_histogram(self, data, num_bins: int) -> dict:
+        """Compute a histogram dict with keys 'edges' and 'counts'."""
+        try:
+            import torch as _torch
+            if isinstance(data, _torch.Tensor):
+                flat = data.detach().float().cpu().flatten()
+                vmin, vmax = float(flat.min()), float(flat.max())
+                if vmin == vmax:
+                    vmax = vmin + 1.0
+                counts = _torch.histc(flat, bins=num_bins, min=vmin, max=vmax).tolist()
+                edges = [vmin + i * (vmax - vmin) / num_bins for i in range(num_bins + 1)]
+                return {"edges": edges, "counts": counts}
+        except ImportError:
+            pass
+
+        import numpy as _np
+        arr = _np.asarray(data, dtype=float).flatten()
+        counts, edges = _np.histogram(arr, bins=num_bins)
+        return {"edges": edges.tolist(), "counts": counts.tolist()}
+
+    def _post_media(self, name: str, media_type: str, data: str, step: int | None) -> None:
+        """Ship a media item to the server in a background thread."""
+        if self._finished:
+            return
+        resolved_step = step if step is not None else self._last_step
+
+        def _send():
+            try:
+                self._client.post(
+                    f"/runs/{self.run_id}/media",
+                    json={
+                        "step": resolved_step,
+                        "timestamp": time.time(),
+                        "name": name,
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                    timeout=30,  # images can be large; use a longer timeout
+                )
+            except Exception:
+                log.exception("Failed to post media '%s'", name)
+
+        threading.Thread(target=_send, daemon=True).start()
+
+    def _flush_loop(self) -> None:
+        while not self._finished:
+            time.sleep(5)
+            self._flush()
+        self._flush()  # drain on exit
+
+    def _monitor_loop(self) -> None:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            return  # no GPU or pynvml unavailable
+
+        while not self._finished:
+            try:
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW → W
+
+                fan: float | None = None
+                try:
+                    fan = float(pynvml.nvmlDeviceGetFanSpeed(handle))
+                except Exception:
+                    pass
+
+                sm_clock: int | None = None
+                mem_clock: int | None = None
+                try:
+                    sm_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
+                    mem_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+                except Exception:
+                    pass
+
+                # --- Per-process attribution ---
+                #
+                # Layer 1 — exact VRAM: nvmlDeviceGetComputeRunningProcesses
+                #   gives our process's allocated VRAM directly, no root needed.
+                #
+                # Layer 2 — exact utilization: nvmlDeviceGetProcessUtilization
+                #   samples SM utilization per-process from hardware counters,
+                #   no root or accounting mode required on driver ≥ 346.x.
+                #   This is the preferred source for attributed_utilization.
+                #
+                # Layer 3 — fallbacks when layer 2 is unavailable:
+                #   • Exclusive process → device util/power are fully ours.
+                #   • Shared GPU → scale by VRAM fraction (estimate).
+
+                process_memory_used: int | None = None
+                process_exclusive: bool | None = None
+                attributed_utilization: float | None = None
+                attributed_power: float | None = None
+
+                # Layer 1: per-process VRAM
+                our_vram: int = 0
+                all_procs: list = []
+                try:
+                    all_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                    our_entries = [p for p in all_procs if p.pid == self._our_pid]
+                    other_entries = [p for p in all_procs if p.pid != self._our_pid]
+                    if our_entries:
+                        our_vram = our_entries[0].usedGpuMemory or 0
+                        process_memory_used = our_vram
+                        process_exclusive = len(other_entries) == 0
+                except Exception:
+                    pass
+
+                # Layer 2: direct per-process SM utilization (no root needed)
+                try:
+                    # lastSeenTimeStamp=0 returns the most recent available samples.
+                    samples = pynvml.nvmlDeviceGetProcessUtilization(handle, 0)
+                    our_samples = [s for s in samples if s.pid == self._our_pid]
+                    if our_samples:
+                        latest = max(our_samples, key=lambda s: s.timeStamp)
+                        attributed_utilization = float(latest.smUtil)
+                except Exception:
+                    pass
+
+                # Layer 3: fallback util attribution
+                if attributed_utilization is None:
+                    if process_exclusive:
+                        attributed_utilization = float(util.gpu)
+                    elif our_vram > 0 and all_procs:
+                        total_compute_vram = sum(
+                            p.usedGpuMemory for p in all_procs if p.usedGpuMemory
+                        )
+                        if total_compute_vram > 0:
+                            attributed_utilization = (
+                                float(util.gpu) * our_vram / total_compute_vram
+                            )
+
+                # Power attribution: scale by util fraction when available,
+                # otherwise by VRAM fraction, otherwise full power if exclusive.
+                device_util = float(util.gpu)
+                if process_exclusive:
+                    attributed_power = power
+                elif attributed_utilization is not None and device_util > 0:
+                    attributed_power = power * (attributed_utilization / device_util)
+                elif our_vram > 0 and all_procs:
+                    total_compute_vram = sum(
+                        p.usedGpuMemory for p in all_procs if p.usedGpuMemory
+                    )
+                    if total_compute_vram > 0:
+                        attributed_power = power * our_vram / total_compute_vram
+
+                self._client.post(f"/runs/{self.run_id}/system", json={
+                    "timestamp": time.time(),
+                    "gpu_utilization": float(util.gpu),
+                    "memory_used": mem.used,
+                    "memory_total": mem.total,
+                    "temperature": float(temp),
+                    "power_draw": power,
+                    "fan_speed": fan,
+                    "sm_clock_mhz": sm_clock,
+                    "memory_clock_mhz": mem_clock,
+                    "process_memory_used": process_memory_used,
+                    "process_exclusive": process_exclusive,
+                    "attributed_utilization": attributed_utilization,
+                    "attributed_power": attributed_power,
+                })
+            except Exception:
+                pass
+
+            time.sleep(2)
