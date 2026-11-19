@@ -1,5 +1,7 @@
 """Pyrometer SDK — drop-in experiment tracking and GPU profiling for PyTorch."""
 
+import os
+
 from pyrometer._hardware import fingerprint
 from pyrometer._run import Run
 
@@ -9,7 +11,8 @@ def init(
     hyperparams: dict | None = None,
     tags: list[str] | None = None,
     notes: str | None = None,
-    server: str = "http://localhost:8321",
+    server: str | None = None,
+    api_key: str | None = None,
 ) -> Run:
     """Initialize a new training run and register it with the Pyrometer server.
 
@@ -22,7 +25,18 @@ def init(
         hyperparams: Arbitrary key-value dict of hyperparameters to store.
         tags: List of string tags for filtering runs in the dashboard.
         notes: Free-text notes attached to the run.
-        server: Base URL of the Pyrometer API server.
+        server: Base URL of the Pyrometer API server. Defaults to the
+            ``PYROMETER_SERVER`` environment variable, then
+            ``http://localhost:8321``.
+        api_key: API key with the ``ingest`` scope (create one on the server
+            with ``pyrometer keys create``). Defaults to the
+            ``PYROMETER_API_KEY`` environment variable. Prefer the environment
+            variable so the key never lands in source control. Not needed when
+            the server runs in local ``--no-auth`` mode.
+
+    Raises:
+        PermissionError: If the server rejects the API key (missing, invalid,
+            revoked, or lacking the ``ingest`` scope).
 
     Returns:
         A :class:`Run` instance. Call :meth:`Run.log` to record metrics and
@@ -47,11 +61,25 @@ def init(
         **hw,
     }
 
-    resp = httpx.post(f"{server}/runs", json=payload, timeout=10)
+    server = (server or os.environ.get("PYROMETER_SERVER") or "http://localhost:8321").rstrip("/")
+    api_key = api_key or os.environ.get("PYROMETER_API_KEY") or None
+
+    resp = httpx.post(
+        f"{server}/runs",
+        json=payload,
+        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+        timeout=10,
+    )
+    if resp.status_code in (401, 403):
+        raise PermissionError(
+            f"Pyrometer server at {server} rejected the request ({resp.status_code}). "
+            "Set PYROMETER_API_KEY (or pass api_key=) to a key with the 'ingest' scope; "
+            "create one with `pyrometer keys create --name <name>`."
+        )
     resp.raise_for_status()
     run_data = resp.json()["data"]
 
-    return Run(run_id=run_data["run_id"], server_url=server)
+    return Run(run_id=run_data["run_id"], server_url=server, api_key=api_key)
 
 
 __all__ = ["init", "Run"]

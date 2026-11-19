@@ -1,7 +1,11 @@
-import type { ApiResponse, Artifact, MediaItem, Metric, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, SystemSnapshot } from './types.ts'
+import type { ApiResponse, Artifact, MediaItem, Metric, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, Session, SystemSnapshot } from './types.ts'
 
 async function apiFetch<T>(path: string): Promise<T> {
   const res = await fetch(path)
+  if (res.status === 401) {
+    // Session expired or key revoked: reload so the login gate takes over.
+    window.location.reload()
+  }
   if (!res.ok) {
     let msg = res.statusText
     try {
@@ -17,7 +21,21 @@ async function apiFetch<T>(path: string): Promise<T> {
   return json.data
 }
 
+async function authPost<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  const json = await res.json().catch(() => null)
+  if (!res.ok) throw new Error(json?.detail?.error ?? res.statusText)
+  return json.data as T
+}
+
 export const api = {
+  getSession: () => apiFetch<Session>('/auth/session'),
+  login: (key: string) => authPost<{ user: string }>('/auth/login', { key }),
+  logout: () => authPost<{ logged_out: boolean }>('/auth/logout'),
   listRuns: () => apiFetch<Run[]>('/runs'),
   getRun: (id: string) => apiFetch<Run>(`/runs/${id}`),
   getMetricNames: (id: string) => apiFetch<string[]>(`/runs/${id}/metric-names`),

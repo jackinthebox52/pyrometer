@@ -20,10 +20,18 @@ ask first.
 ## Setup
 
 1. `pip install pyrometer` (torch is a peer dependency, not installed for you).
-2. Make sure a server is reachable. Locally: `pyrometer serve`
-   (default `http://localhost:8321`). Pass a different server with
-   `pyrometer.init(..., server="http://host:8321")`.
-3. Check reachability with `curl <server>/health` before instrumenting.
+2. Make sure a server is reachable. Locally: `pyrometer serve --no-auth`
+   (loopback only, `http://localhost:8321`). Shared/remote servers require
+   auth: `pyrometer serve`, then `pyrometer keys create --name <project>
+   --scopes ingest` on the server.
+3. Point the SDK at it through the environment, not source code:
+   `PYROMETER_SERVER=http://host:8321` and `PYROMETER_API_KEY=pyro_...`
+   (or `pyrometer.init(..., server=, api_key=)`).
+4. Check reachability with `curl <server>/health` before instrumenting.
+   `init()` raises `PermissionError` if the key is missing, invalid or revoked.
+
+**Never commit API keys or the server's address into a project.** Read them
+from environment variables or a secret store.
 
 ## Minimal instrumentation
 
@@ -67,7 +75,8 @@ and the run is marked complete.
 
 ## Reading results
 
-REST API, all responses shaped `{"data": ..., "error": null}`:
+REST API (send `Authorization: Bearer $PYROMETER_API_KEY`; reads need a
+key with the `read` scope), all responses shaped `{"data": ..., "error": null}`:
 
 - `GET /runs` — list runs
 - `GET /runs/{id}` — run detail

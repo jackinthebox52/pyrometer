@@ -15,8 +15,18 @@ git clone <repo>
 cd pyrometer
 uv sync
 
-# Start the server (default: http://localhost:8321)
+# Start the server in local mode (http://localhost:8321, no auth, loopback only)
+uv run pyrometer serve --no-auth
+```
+
+Auth is on by default. To run with auth, create a key and export it for your scripts
+(see [docs/auth.md](docs/auth.md)):
+
+```bash
 uv run pyrometer serve
+uv run pyrometer keys create --name my-project --scopes ingest   # shown once
+export PYROMETER_API_KEY=pyro_...
+export PYROMETER_SERVER=http://localhost:8321                      # optional
 ```
 
 Add three lines to any training script:
@@ -156,8 +166,12 @@ conn.execute("SELECT name, status, created_at FROM runs ORDER BY created_at DESC
 ## Server options
 
 ```bash
-uv run pyrometer serve --host 0.0.0.0 --port 8321
+uv run pyrometer serve --host 127.0.0.1 --port 8321   # defaults
+uv run pyrometer serve --no-auth                      # local mode, loopback only
 ```
+
+Authentication, API keys and reverse-proxy (authentik) support: [docs/auth.md](docs/auth.md).
+Docker and nginx deployment: [docs/deployment.md](docs/deployment.md).
 
 ---
 

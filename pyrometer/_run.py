@@ -73,10 +73,14 @@ class Run:
       GPU utilization, memory, temperature, and power draw to the server.
     """
 
-    def __init__(self, run_id: str, server_url: str) -> None:
+    def __init__(self, run_id: str, server_url: str, api_key: str | None = None) -> None:
         self.run_id = run_id
         self._server = server_url
-        self._client = httpx.Client(base_url=server_url, timeout=10)
+        self._client = httpx.Client(
+            base_url=server_url,
+            timeout=10,
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+        )
 
         self._buffer: list[dict] = []
         self._lock = threading.Lock()

@@ -1,15 +1,25 @@
 """FastAPI application — route handlers only. All DB access goes through db.py."""
 
 import json
+import logging
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from pyrometer.server.auth import (
+    COOKIE_NAME,
+    auth_enabled,
+    authenticate,
+    is_https,
+    list_keys,
+    require_auth,
+    verify_key,
+)
 from pyrometer.server.db import (
     db_compute_run_summary,
     db_create_run,
@@ -39,7 +49,33 @@ from pyrometer.server.db import (
     db_update_run,
 )
 
-app = FastAPI(title="Pyrometer API", version="0.1.0")
+_log = logging.getLogger("pyrometer.server")
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    if not auth_enabled():
+        _log.warning("AUTH DISABLED (PYROMETER_AUTH=off) — local mode only, do not expose this server")
+    elif not list_keys():
+        _log.warning(
+            "No API keys configured, so SDK clients cannot connect. "
+            "Create one with: pyrometer keys create --name <name>"
+        )
+    yield
+
+
+# Every API route requires auth by default (see auth.require_auth). Interactive docs expose the
+# schema without credentials, so they are only served in local no-auth mode.
+_local = not auth_enabled()
+app = FastAPI(
+    title="Pyrometer API",
+    version="0.1.0",
+    lifespan=_lifespan,
+    dependencies=[Depends(require_auth)],
+    docs_url="/docs" if _local else None,
+    redoc_url="/redoc" if _local else None,
+    openapi_url="/openapi.json" if _local else None,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +133,8 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         _ws.disconnect(websocket)
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# No CORS middleware: the dashboard is served same-origin, and a wildcard CORS policy would let
+# any website a user visits read this API from their browser.
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +265,51 @@ class MediaEntry(BaseModel):
 @app.get("/health")
 def health():
     return ok({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Routes — auth (public; they bootstrap the dashboard's session)
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    key: str
+
+
+@app.get("/auth/session")
+def auth_session(request: Request):
+    if not auth_enabled():
+        return ok({"auth": "off", "authenticated": True, "user": None})
+    principal = authenticate(request, read_only=True)
+    ok_read = principal is not None and "read" in principal.scopes
+    return ok({
+        "auth": "required",
+        "authenticated": ok_read,
+        "user": principal.name if ok_read else None,
+    })
+
+
+@app.post("/auth/login")
+def auth_login(req: LoginRequest, request: Request, response: Response):
+    """Exchange a read-scoped API key for an HttpOnly session cookie (read-only access)."""
+    principal = verify_key(req.key)
+    if principal is None or "read" not in principal.scopes:
+        err("Invalid API key, or key lacks the 'read' scope", 401)
+    response.set_cookie(
+        COOKIE_NAME,
+        req.key,
+        max_age=30 * 24 * 3600,
+        httponly=True,
+        samesite="strict",
+        secure=is_https(request),
+        path="/",
+    )
+    return ok({"user": principal.name})
+
+
+@app.post("/auth/logout")
+def auth_logout(response: Response):
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return ok({"logged_out": True})
 
 
 # ---------------------------------------------------------------------------

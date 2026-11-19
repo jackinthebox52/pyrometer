@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { HashRouter, Route, Routes } from 'react-router-dom'
+import LoginGate from './components/LoginGate.tsx'
 import RunSidebar from './components/RunSidebar.tsx'
 import CompareView from './pages/CompareView.tsx'
 import EmptyState from './pages/EmptyState.tsx'
@@ -19,6 +20,7 @@ export default function App() {
   }
 
   return (
+    <LoginGate>
     <HashRouter>
       <div className="flex h-screen overflow-hidden bg-py-base">
         <RunSidebar
@@ -35,5 +37,6 @@ export default function App() {
         </main>
       </div>
     </HashRouter>
+    </LoginGate>
   )
 }

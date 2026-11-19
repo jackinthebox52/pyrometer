@@ -88,7 +88,6 @@ pyrometer/
 ├── uv.lock                 # Lock file
 ├── README.md
 ├── SPEC.md
-├── DEVNOTES.md
 └── CLAUDE.md
 ```
 

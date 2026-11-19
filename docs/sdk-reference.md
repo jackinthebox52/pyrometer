@@ -39,6 +39,7 @@ run = pyrometer.init(
     tags=["baseline", "resnet"],
     notes="Initial baseline with default hyperparameters",
     server="http://localhost:8321",
+    api_key="pyro_...",   # or set PYROMETER_API_KEY (preferred)
 )
 ```
 
@@ -50,7 +51,10 @@ run = pyrometer.init(
 | `hyperparams` | `dict` | `{}` | Arbitrary hyperparameter dictionary. Nested dicts and arrays are preserved as JSON. |
 | `tags` | `list[str]` | `[]` | List of string tags for filtering runs in the dashboard. |
 | `notes` | `str \| None` | `None` | Free-text notes attached to the run. |
-| `server` | `str` | `"http://localhost:8321"` | Base URL of the Pyrometer API server. |
+| `server` | `str \| None` | `$PYROMETER_SERVER`, else `"http://localhost:8321"` | Base URL of the Pyrometer API server. |
+| `api_key` | `str \| None` | `$PYROMETER_API_KEY` | API key with the `ingest` scope (`pyrometer keys create`). Not needed against a `--no-auth` local server. Prefer the environment variable so the key stays out of source control. |
+
+Raises `PermissionError` if the server rejects the key. See [auth.md](auth.md).
 
 #### Returns
 

@@ -7,6 +7,7 @@ Complete REST API and WebSocket reference for the Pyrometer server.
 ## Table of Contents
 
 - [Overview](#overview)
+- [Authentication](#authentication)
 - [Response Format](#response-format)
 - [Health](#health)
 - [Runs](#runs)
@@ -62,6 +63,29 @@ The Pyrometer server is a FastAPI application that:
 **Base URL**: `http://localhost:8321`
 
 **Default port**: 8321 (configurable via `--port`)
+
+## Authentication
+
+Every endpoint except `GET /health` and the `/auth/*` endpoints below requires a
+credential (see [auth.md](auth.md)). Reads (`GET`, WebSocket `/ws`) need the `read`
+scope; writes (`POST`/`PATCH`) need `ingest`.
+
+```bash
+curl -H "Authorization: Bearer $PYROMETER_API_KEY" http://localhost:8321/runs
+```
+
+| Status | Meaning |
+|--------|---------|
+| `401` | Missing or invalid credentials (`WWW-Authenticate: Bearer`) |
+| `403` | Valid key, but it lacks the required scope |
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/auth/session` | `{"auth": "required"\|"off", "authenticated": bool, "user": str\|null}` |
+| `POST` | `/auth/login` | Body `{"key": "..."}`. Exchanges a `read` key for an HttpOnly session cookie |
+| `POST` | `/auth/logout` | Clears the session cookie |
+
+In `--no-auth` local mode all endpoints are open. A WebSocket without valid credentials is rejected at the handshake.
 
 ---
 

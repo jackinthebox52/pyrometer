@@ -1,0 +1,16 @@
+.git
+.venv
+.claude
+local
+notes
+tests
+docs
+examples
+**/node_modules
+frontend/dist
+**/__pycache__
+*.duckdb
+*.duckdb.wal
+keys.json
+.env*
+*.png

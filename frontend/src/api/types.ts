@@ -1,3 +1,9 @@
+export interface Session {
+  auth: 'required' | 'off'
+  authenticated: boolean
+  user: string | null
+}
+
 export type RunStatus = 'running' | 'completed' | 'crashed' | 'killed'
 
 export interface Run {
