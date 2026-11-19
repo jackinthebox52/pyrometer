@@ -10,12 +10,14 @@ Monorepo: Python SDK (`/sdk`), FastAPI server (`/server`), React frontend (`/fro
 - React 18 + TypeScript + Vite + Recharts + d3 for frontend
 - SDK ships as pip-installable package, torch is a peer dependency
 - WebSocket for live dashboard updates during active training runs
+- Auth is on by default. API keys (hashed at rest) for the SDK; trusted-reverse-proxy identity headers
+  (authentik) for the dashboard. `--no-auth` local mode is loopback-only. See `docs/auth.md`.
 - SDK is model-agnostic and optimizer-agnostic — never inspect or assume model architecture, 
   just log what the user passes. torch.profiler handles operator-level capture regardless of model type.
 
 
 ## Development Rules
-- After implementing any feature, update `DEVNOTES.md` with what was built, design decisions made, and any known limitations
+- After implementing any feature, update `DEVNOTES.md` (local-only, gitignored, never tracked) with what was built, design decisions made, and any known limitations
 - After implementing any feature or changing one, update the relevant documentation files in the docs/ directory
 - After any significant milestone, update `README.md` usage examples and feature list
 - Write docstrings on all public SDK methods — these are user-facing API
@@ -26,12 +28,24 @@ Monorepo: Python SDK (`/sdk`), FastAPI server (`/server`), React frontend (`/fro
 - Frontend components go in `/frontend/src/components/`, pages in `/frontend/src/pages/`, API calls in `/frontend/src/api/`
 - **Any new SDK feature that produces dashboard-visible data must be demo'd in all three main example scripts: `examples/synthetic_train.py`, `examples/lr_sweep.py`, and `examples/optimizer_compare.py`**
 
+## Repo Hygiene (public repo — enforce on every commit)
+- `AGENTS.md` is a symlink to this file. Edit `CLAUDE.md`, never replace the symlink with a copy.
+- Agent notes, scratch files, plans and TODO lists (e.g. anything under `notes/`, `scratch/`, `local/`) are never
+  committed and never tracked. They are gitignored; keep them there. This includes `DEVNOTES.md`,
+  which stays on disk for agents to maintain but is never tracked.
+- Never commit secrets (API keys, tokens, `.env`, `keys.json`) or anything specific to the maintainer's
+  environment: IP addresses, hostnames, domains, network layout, homelab details. Use placeholders
+  (`pyrometer.example.com`, `192.0.2.x`) in docs and examples.
+- Never commit agent-specific or personal config (`.claude/`, personal skills, `CLAUDE.local.md`).
+  Personal skills are kept untracked in `local/` and installed to `~/.claude/skills/`, never in this repo.
+- Before committing, check `git status` / `git diff --cached` for any of the above.
+
 ## MCP Tools
 
 - Use the context7 tool if you ever need up-to-date information about a library. (e.g. pytorch, scikit-learn, numpy, uvicorn)
 
 ## SDK Public API (canonical reference)
-- `pyrometer.init(name, hyperparams, tags, server)` → Run
+- `pyrometer.init(name, hyperparams, tags, server, api_key)` → Run  (`server` ← `PYROMETER_SERVER`, `api_key` ← `PYROMETER_API_KEY` if omitted)
 - `run.log(metrics_dict, step)` → None
 - `run.profile(step)` → context manager wrapping torch.profiler
 - `run.watch(model, log_freq=100)` → None  (registers gradient/weight monitoring hooks)
@@ -46,7 +60,6 @@ Monorepo: Python SDK (`/sdk`), FastAPI server (`/server`), React frontend (`/fro
 
 ## Anti-Patterns to Avoid
 - Don't add caching/Redis/message queues — DuckDB is fast enough for single-user
-- Don't add user auth for v0.1
 - Don't profile every training step — SDK defaults to profiling every 100 steps
 - Don't use ORM (SQLAlchemy etc) — raw DuckDB SQL is clearer for analytical queries
 - Don't split the frontend into micro-components prematurely

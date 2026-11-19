@@ -28,18 +28,28 @@ frontend/.vite/
 .env.*
 !.env.example
 
-# Personal Claude Code config — keep out of the public repo.
-# Machine-specific skills (homelab IPs etc.) live in ~/.claude/skills/,
-# but these patterns are a safety net if one is ever created in-tree.
-.claude/settings.local.json
-.claude/skills/*-local/
-.claude/skills/*-homelab/
+# Agent / personal config and notes — never tracked (see CLAUDE.md "Repo Hygiene").
+# Personal skills live in ~/.claude/skills/, not in-tree.
+.claude/
+.cursor/
+.codex/
+.gemini/
+.aider*
 CLAUDE.local.md
+AGENTS.local.md
 *.local.md
+notes/
+NOTES.md
+DEVNOTES.md
+TODO.md
+scratch/
+local/
+
+# API key stores
+keys.json
 
 # Scratch / screenshots
 /*.png
-scratch/
 tmp/
 
 # OS / editor
