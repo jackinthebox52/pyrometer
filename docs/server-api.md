@@ -1262,13 +1262,20 @@ bounded queue and a 5 second timeout) and never delays ingestion.
 `POST /admin/alerts` body:
 
 ```json
-{"name": "loss blew up", "kind": "metric_threshold", "url": "https://hooks.example.com/abc",
- "format": "slack", "project": null, "metric": "loss", "op": ">", "threshold": 5.0, "enabled": true}
+{"name": "training problems", "url": "https://hooks.example.com/abc", "format": "slack", "project": null,
+ "enabled": true,
+ "triggers": [{"kind": "run_failed"}, {"kind": "metric_threshold", "metric": "loss", "op": ">", "threshold": 5.0}]}
 ```
+
+A rule has one or more `triggers`; it sends a message when **any** trigger matches, at most one message per
+event (an anomaly that matches both an `event` and an `anomaly` trigger is sent once). The single-trigger
+shorthand (`"kind": "run_failed"`, plus `min_severity` / `metric` / `op` / `threshold` as needed, no `triggers`)
+is still accepted on `POST`. `PATCH` with `triggers` replaces the whole list (at least one). Rules created before
+multi-trigger support are migrated automatically. Responses always return `triggers`.
 
 | Field | Values |
 |---|---|
-| `kind` | `run_crashed`, `run_failed`, `event` (needs `min_severity`: `info`/`warning`/`error`/`critical`, default `error`), `anomaly` (`anomaly_detected` events, including NaN/Inf), `metric_threshold` (needs `metric`, `op` in `>` `>=` `<` `<=`, `threshold`) |
+| trigger `kind` | `run_crashed`, `run_failed`, `event` (optional `min_severity`: `info`/`warning`/`error`/`critical`, default `error`), `anomaly` (`anomaly_detected` events, including NaN/Inf), `metric_threshold` (needs `metric`, `op` in `>` `>=` `<` `<=`, `threshold`) |
 | `format` | `generic` (JSON `{title, message, severity, rule, link}`), `slack`, `discord`, `ntfy` (plain body, `Title`/`Priority`/`Click` headers) |
 | `project` | Restrict to one project; `null` = all |
 
@@ -1280,4 +1287,9 @@ Behaviour: `run_crashed` fires once when the server marks a run crashed (sweeper
 per ingested batch (a duplicate `X-Pyrometer-Batch` does not); metric rules fire when a metric **crosses** the
 threshold, not on every point beyond it. Alerts carry only run name, project and an optional link. Each rule is
 limited to `PYROMETER_ALERT_RATE` alerts per minute (default 10) and identical alerts are suppressed for 5 minutes.
+This state (when each alert was sent, which runs are currently past a threshold) is stored in the database, so a
+server restart neither re-fires alerts nor forgets a threshold crossing. A failed delivery (network error, HTTP
+5xx/408/425/429) is retried up to 3 more times with backoff (2 s, 10 s, 30 s) without blocking other alerts; other
+4xx answers are not retried. After the final failure the alert is dropped (and may be sent again if the event
+repeats); log lines name the rule, never the URL.
 Set `PYROMETER_PUBLIC_URL` (e.g. `https://pyrometer.example.com`) to include `<url>/#/runs/<id>` links.

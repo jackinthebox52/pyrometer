@@ -60,7 +60,7 @@ def main() -> None:
         _train_simulated(run)
 
     run.finish()
-    print("Done. Check: http://localhost:8321/runs")
+    print(f"Done. Check: {run.server}/#/runs/{run.run_id}")
 
 
 def _train_torch(run: pyrometer.Run) -> None:

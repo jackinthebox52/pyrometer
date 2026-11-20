@@ -18,5 +18,9 @@ def fresh_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "_DB_PATH", str(tmp_path / "test.duckdb"))
     monkeypatch.setattr(db, "_conn", None)
     yield
+    # Background run-summary and alert work must finish before the DB it uses is closed.
+    from pyrometer.server import app as server_app
+
+    server_app.drain_background()
     if db._conn is not None:
         db._conn.close()

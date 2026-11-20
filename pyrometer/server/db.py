@@ -17,7 +17,7 @@ _DB_PATH = os.environ.get(
 )
 
 _BATCH_TTL_S = 30 * 86400
-_lock = threading.Lock()
+_lock = threading.RLock()  # re-entrant: ingest holds it across claim-batch + insert
 _conn: duckdb.DuckDBPyConnection | None = None
 
 
@@ -30,7 +30,7 @@ def get_conn() -> duckdb.DuckDBPyConnection:
     return _conn
 
 
-def get_lock() -> threading.Lock:
+def get_lock() -> threading.RLock:
     return _lock
 
 
@@ -236,6 +236,8 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("DELETE FROM seen_batches WHERE seen_at < ?", [time.time() - _BATCH_TTL_S])
 
     # Webhook alert rules (admin-managed). ``url`` is a secret: never returned by list/get helpers' callers unmasked.
+    # A rule has one or more triggers (``triggers`` JSON list). The flat kind/min_severity/metric/op/threshold
+    # columns are the pre-multi-trigger layout: migrated into ``triggers`` below, unused afterwards.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS alert_rules (
             id           VARCHAR PRIMARY KEY,
@@ -251,6 +253,31 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             enabled      BOOLEAN,
             created_at   DOUBLE,
             created_by   VARCHAR
+        )
+    """)
+    conn.execute("ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS triggers JSON")
+    for rid, kind, sev, metric, op, thr in conn.execute(
+        "SELECT id, kind, min_severity, metric, op, threshold FROM alert_rules WHERE triggers IS NULL"
+    ).fetchall():
+        legacy = {"kind": kind, "min_severity": sev, "metric": metric, "op": op, "threshold": thr}
+        conn.execute("UPDATE alert_rules SET triggers = ? WHERE id = ?", [json.dumps([legacy]), rid])
+
+    # Alert delivery state, persisted so a restart neither re-fires nor forgets: when each alert was sent
+    # (dedupe window + per-minute rate limit) and which runs are currently past a metric threshold.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_sent (
+            rule_id VARCHAR,
+            dkey    VARCHAR,
+            sent_at DOUBLE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_violations (
+            rule_id     VARCHAR,
+            trigger_key VARCHAR,
+            run_id      VARCHAR,
+            violating   BOOLEAN,
+            PRIMARY KEY (rule_id, trigger_key, run_id)
         )
     """)
 
@@ -1359,14 +1386,16 @@ def db_get_run_summary(run_id: str) -> dict | None:
 # Alert rules
 # ---------------------------------------------------------------------------
 
-_ALERT_COLS = "id, name, kind, url, format, project, min_severity, metric, op, threshold, enabled, created_at, created_by"
+_ALERT_COLS = "id, name, url, format, project, enabled, created_at, created_by, triggers, kind, min_severity, metric, op, threshold"
 
 
 def _row_to_alert_rule(r: tuple) -> dict:
+    triggers = _parse_json(r[8])
+    if not triggers:  # defensive: a row written by an older version between migrations
+        triggers = [{"kind": r[9], "min_severity": r[10], "metric": r[11], "op": r[12], "threshold": r[13]}]
     return {
-        "id": r[0], "name": r[1], "kind": r[2], "url": r[3], "format": r[4], "project": r[5],
-        "min_severity": r[6], "metric": r[7], "op": r[8], "threshold": r[9],
-        "enabled": bool(r[10]), "created_at": r[11], "created_by": r[12],
+        "id": r[0], "name": r[1], "url": r[2], "format": r[3], "project": r[4],
+        "enabled": bool(r[5]), "created_at": r[6], "created_by": r[7], "triggers": triggers,
     }
 
 
@@ -1387,49 +1416,105 @@ def db_create_alert_rule(rule: dict, created_by: str) -> dict:
     rule_id = uuid.uuid4().hex[:12]
     with _lock:
         get_conn().execute(
-            f"INSERT INTO alert_rules ({_ALERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [rule_id, rule["name"], rule["kind"], rule["url"], rule["format"], rule.get("project"),
-             rule.get("min_severity"), rule.get("metric"), rule.get("op"), rule.get("threshold"),
-             rule.get("enabled", True), time.time(), created_by],
+            "INSERT INTO alert_rules (id, name, url, format, project, enabled, created_at, created_by, triggers) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [rule_id, rule["name"], rule["url"], rule["format"], rule.get("project"),
+             rule.get("enabled", True), time.time(), created_by, json.dumps(rule["triggers"])],
         )
     return db_get_alert_rule(rule_id)
 
 
 def db_update_alert_rule(rule_id: str, fields: dict) -> bool:
     """Update the given columns (a subset of the rule's fields). False if the rule does not exist."""
-    allowed = {"name", "url", "format", "project", "min_severity", "metric", "op", "threshold", "enabled"}
+    allowed = {"name", "url", "format", "project", "enabled", "triggers"}
     cols = [c for c in fields if c in allowed]
     with _lock:
         conn = get_conn()
         if conn.execute("SELECT 1 FROM alert_rules WHERE id = ?", [rule_id]).fetchone() is None:
             return False
         if cols:
+            values = [json.dumps(fields[c]) if c == "triggers" else fields[c] for c in cols]
             conn.execute(
                 f"UPDATE alert_rules SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
-                [fields[c] for c in cols] + [rule_id],
+                values + [rule_id],
             )
     return True
 
 
 def db_delete_alert_rule(rule_id: str) -> bool:
     with _lock:
-        row = get_conn().execute("DELETE FROM alert_rules WHERE id = ? RETURNING id", [rule_id]).fetchone()
+        conn = get_conn()
+        row = conn.execute("DELETE FROM alert_rules WHERE id = ? RETURNING id", [rule_id]).fetchone()
+        conn.execute("DELETE FROM alert_sent WHERE rule_id = ?", [rule_id])
+        conn.execute("DELETE FROM alert_violations WHERE rule_id = ?", [rule_id])
     return row is not None
 
 
-def db_matching_alert_rules(kinds: list[str], project: str | None, metrics: list[str] | None = None) -> list[dict]:
-    """Enabled rules of the given kinds that apply to ``project`` (unscoped rules apply everywhere).
-
-    With ``metrics``, ``metric_threshold`` rules are narrowed to those metric names.
-    """
-    sql = f"SELECT {_ALERT_COLS} FROM alert_rules WHERE enabled AND kind IN ({', '.join('?' * len(kinds))}) AND (project IS NULL OR project = ?)"
-    params: list = [*kinds, project]
-    if metrics is not None:
-        sql += f" AND metric IN ({', '.join('?' * len(metrics))})"
-        params += metrics
+def db_matching_alert_rules(project: str | None) -> list[dict]:
+    """Enabled rules that apply to ``project`` (unscoped rules apply everywhere); callers filter on triggers."""
     with _lock:
-        rows = get_conn().execute(sql, params).fetchall()
+        rows = get_conn().execute(
+            f"SELECT {_ALERT_COLS} FROM alert_rules WHERE enabled AND (project IS NULL OR project = ?) "
+            "ORDER BY created_at",
+            [project],
+        ).fetchall()
     return [_row_to_alert_rule(r) for r in rows]
+
+
+def db_alert_acquire(rule_id: str, dkey: str, window_s: float, per_minute: int, now: float | None = None) -> str:
+    """Decide whether an alert may be sent and record it, atomically.
+
+    Returns ``"ok"`` (recorded: send it), ``"dup"`` (the same ``dkey`` was sent within ``window_s``) or
+    ``"rate"`` (``per_minute`` alerts already went out for the rule in the last minute).
+    """
+    now = time.time() if now is None else now
+    with _lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM alert_sent WHERE sent_at < ?", [now - max(window_s, 60.0)])
+        if conn.execute(
+            "SELECT 1 FROM alert_sent WHERE rule_id = ? AND dkey = ? AND sent_at >= ?", [rule_id, dkey, now - window_s]
+        ).fetchone():
+            return "dup"
+        recent = conn.execute(
+            "SELECT COUNT(*) FROM alert_sent WHERE rule_id = ? AND sent_at >= ?", [rule_id, now - 60.0]
+        ).fetchone()[0]
+        if recent >= per_minute:
+            return "rate"
+        conn.execute("INSERT INTO alert_sent VALUES (?, ?, ?)", [rule_id, dkey, now])
+    return "ok"
+
+
+def db_alert_release(rule_id: str, dkey: str) -> None:
+    """Forget a recorded alert whose delivery finally failed, so an identical alert can be tried again."""
+    with _lock:
+        get_conn().execute("DELETE FROM alert_sent WHERE rule_id = ? AND dkey = ?", [rule_id, dkey])
+
+
+def db_alert_clear_state() -> None:
+    """Drop all rate-limit/dedupe/threshold state (tests)."""
+    with _lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM alert_sent")
+        conn.execute("DELETE FROM alert_violations")
+
+
+def db_alert_swap_violating(rule_id: str, trigger_key: str, run_id: str, now_over: bool) -> bool:
+    """Store the run's current over-threshold state and return the previous one (``False`` if unseen)."""
+    with _lock:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT violating FROM alert_violations WHERE rule_id = ? AND trigger_key = ? AND run_id = ?",
+            [rule_id, trigger_key, run_id],
+        ).fetchone()
+        was = bool(row[0]) if row else False
+        if row is None:
+            conn.execute("INSERT INTO alert_violations VALUES (?, ?, ?, ?)", [rule_id, trigger_key, run_id, now_over])
+        elif was != now_over:
+            conn.execute(
+                "UPDATE alert_violations SET violating = ? WHERE rule_id = ? AND trigger_key = ? AND run_id = ?",
+                [now_over, rule_id, trigger_key, run_id],
+            )
+    return was
 
 
 def db_get_run_for_alert(run_id: str) -> dict | None:

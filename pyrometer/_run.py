@@ -31,7 +31,7 @@ class _TeeWriter:
         self._name = stream_name
         self._on_line = on_line  # callable(line: str, stream: str)
         self._buf = ""
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def write(self, text: str) -> int:
         with self._lock:
@@ -152,7 +152,9 @@ class Run:
         self._stop = threading.Event()
 
         self._buffer: list[dict] = []
-        self._lock = threading.Lock()
+        # Re-entrant: the SIGTERM handler runs finish() on the main thread, possibly while that very
+        # thread is inside log()/print() holding one of these locks; a plain Lock would deadlock it.
+        self._lock = threading.RLock()
         self._finished = False
         self._last_step = 0
         self._step_known = False
@@ -162,13 +164,13 @@ class Run:
         # watch() state — gradient/weight monitoring
         self._watch_hooks: list = []
         self._param_stats_buffer: list[dict] = []
-        self._param_stats_lock = threading.Lock()
+        self._param_stats_lock = threading.RLock()
         self._watch_grad_norm_history: dict[str, list[float]] = {}
         self._watch_low_norm_streak: dict[str, int] = {}
 
         # stdout/stderr capture
         self._log_buffer: list[dict] = []
-        self._log_lock = threading.Lock()
+        self._log_lock = threading.RLock()
         self._original_stdout = None
         self._original_stderr = None
         self._install_stdout_capture()
@@ -182,7 +184,7 @@ class Run:
         self._our_pid = os.getpid()
 
         # Liveness: a heartbeat every HEARTBEAT_INTERVAL s (sent immediately at start). Never spooled.
-        self._last_heartbeat = 0.0
+        self._last_heartbeat = float("-inf")  # monotonic() can be < HEARTBEAT_INTERVAL right after boot
         self._exit_status = "completed"
         _active_runs.add(self)
         _install_exit_hooks()
@@ -231,6 +233,11 @@ class Run:
                 self._check_metric_anomaly(name, float(value), step)
             except (ValueError, TypeError):
                 pass
+
+    @property
+    def server(self) -> str:
+        """Base URL of the Pyrometer server this run reports to (as resolved by :func:`pyrometer.init`)."""
+        return self._server
 
     @property
     def last_step(self) -> int | None:
@@ -625,6 +632,9 @@ class Run:
             pass
         self._stop.set()
         self._flush_thread.join(timeout=5)
+        # Stop sampling before the transport closes, or a late snapshot would be spilled to disk.
+        if self._monitor_thread is not threading.current_thread():
+            self._monitor_thread.join(timeout=3)
         self._flush()
         self._restore_stdout_capture()
         self._remove_watch_hooks()
@@ -992,10 +1002,12 @@ class Run:
         if not handles:
             return
 
-        while not self._finished:
+        while not self._stop.is_set():
             try:
                 for snap in _gpu.sample_all(pynvml, handles, self._our_pid):
+                    if self._stop.is_set():
+                        break
                     self._transport.submit("POST", f"/runs/{self.run_id}/system", snap)
             except Exception:
                 pass
-            time.sleep(2)
+            self._stop.wait(2)

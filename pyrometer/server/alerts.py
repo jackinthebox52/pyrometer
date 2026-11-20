@@ -2,17 +2,20 @@
 
 Ingestion only ever calls the ``notify_*`` / ``check_metrics`` functions, which put a job on a small
 bounded queue and return. A single daemon worker thread does the rule lookups, evaluation and HTTP
-calls, so a slow or dead webhook never delays ingestion. Webhook URLs are secrets: they are never
-logged, and failures are reported without them.
+calls, so a slow or dead webhook never delays ingestion. A rule has one or more triggers and fires at
+most once per matching event. Rate-limit, dedupe and threshold-crossing state live in the database, so
+a restart neither re-fires nor forgets. Failed deliveries are retried a few times with backoff (as timer
+jobs, never blocking the worker). Webhook URLs are secrets: they are never logged, and failures are
+reported without them.
 """
 
+import hashlib
 import logging
 import operator
 import os
 import queue
 import threading
 import time
-from collections import deque
 
 import httpx
 
@@ -27,14 +30,13 @@ OPS = {">": operator.gt, ">=": operator.ge, "<": operator.lt, "<=": operator.le}
 
 TIMEOUT_S = 5.0
 DEDUPE_WINDOW_S = 300.0
+RETRY_BACKOFF_S = (2.0, 10.0, 30.0)  # delays before retry 1, 2, 3 (so up to 4 attempts in total)
 _QUEUE_MAX = 1000
 
 _queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
 _worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
-_sent: dict[str, deque] = {}            # rule id -> send timestamps (rate limit)
-_recent: dict[tuple, float] = {}        # (rule id, dedupe key) -> last sent (dedupe)
-_violating: dict[tuple[str, str], bool] = {}  # (rule id, run id) -> currently over the threshold
+_pending_retries = 0                    # delivery retries waiting on a timer (guarded by _worker_lock)
 
 
 def public_url() -> str | None:
@@ -102,10 +104,15 @@ def send_test(rule: dict) -> str | None:
 
 
 def flush(timeout: float = 5.0) -> None:
-    """Wait until queued alert jobs are processed (used by tests and shutdown)."""
+    """Wait until queued alert jobs (and pending delivery retries) are processed (tests and shutdown)."""
     deadline = time.time() + timeout
-    while _queue.unfinished_tasks and time.time() < deadline:
+    while (_queue.unfinished_tasks or _pending_retries) and time.time() < deadline:
         time.sleep(0.01)
+
+
+def reset_state() -> None:
+    """Forget all persisted rate-limit/dedupe/threshold state (tests)."""
+    db.db_alert_clear_state()
 
 
 def _submit(job: tuple) -> None:
@@ -137,77 +144,102 @@ def _run_worker() -> None:
 
 def _handle(job: tuple) -> None:
     kind = job[0]
-    run_id = job[1]
-    run = db.db_get_run_for_alert(run_id)
+    if kind == "deliver":
+        _attempt(*job[1:])
+        return
+    run = db.db_get_run_for_alert(job[1])
     if run is None:
         return
-    project = run["project"]
+    run_id, project = run["run_id"], run["project"]
+    rules = db.db_matching_alert_rules(project)
     if kind == "status":
         status = job[2]
         rule_kind = "run_crashed" if status == "crashed" else "run_failed"
-        for rule in db.db_matching_alert_rules([rule_kind], project):
-            title = f"Run {status}: {run['name']}"
-            body = f"Run {run['name']!r} in project {project!r} {status}."
-            _fire(rule, run, title, body, "error", dedupe=(rule_kind, run_id))
+        for rule in rules:
+            if any(t["kind"] == rule_kind for t in rule["triggers"]):
+                title = f"Run {status}: {run['name']}"
+                body = f"Run {run['name']!r} in project {project!r} {status}."
+                _fire(rule, run, title, body, "error", dedupe=(rule_kind, run_id))
     elif kind == "event":
         ev = job[2]
         sev = ev.get("severity") or "info"
         is_anomaly = ev.get("event_type") == "anomaly_detected"
-        wanted = ["event", "anomaly"] if is_anomaly else ["event"]
-        for rule in db.db_matching_alert_rules(wanted, project):
-            if rule["kind"] == "event" and _sev_rank(sev) < _sev_rank(rule["min_severity"] or "error"):
-                continue
-            title = f"{'Anomaly' if is_anomaly else 'Event'} ({sev}): {run['name']}"
-            body = f"{ev.get('message', '')} (run {run['name']!r}, project {project!r})"
-            _fire(rule, run, title, body, sev, dedupe=(rule["kind"], run_id, ev.get("event_type"), ev.get("message")))
+        for rule in rules:
+            if any(_event_matches(t, sev, is_anomaly) for t in rule["triggers"]):  # once per rule, however many match
+                title = f"{'Anomaly' if is_anomaly else 'Event'} ({sev}): {run['name']}"
+                body = f"{ev.get('message', '')} (run {run['name']!r}, project {project!r})"
+                _fire(rule, run, title, body, sev, dedupe=("event", run_id, ev.get("event_type"), ev.get("message")))
     elif kind == "metrics":
-        _check_thresholds(run, job[2])
+        _check_thresholds(run, rules, job[2])
+
+
+def _event_matches(trigger: dict, sev: str, is_anomaly: bool) -> bool:
+    if trigger["kind"] == "anomaly":
+        return is_anomaly
+    if trigger["kind"] == "event":
+        return _sev_rank(sev) >= _sev_rank(trigger.get("min_severity") or "error")
+    return False
 
 
 def _sev_rank(sev: str) -> int:
     return SEVERITIES.index(sev) if sev in SEVERITIES else 0
 
 
-def _check_thresholds(run: dict, points: list[dict]) -> None:
-    names = sorted({p["name"] for p in points})
-    rules = db.db_matching_alert_rules(["metric_threshold"], run["project"], names)
+def _check_thresholds(run: dict, rules: list[dict], points: list[dict]) -> None:
     for rule in rules:
-        cmp = OPS.get(rule["op"] or "")
-        if cmp is None or rule["threshold"] is None:
-            continue
-        key = (rule["id"], run["run_id"])
-        for p in sorted((p for p in points if p["name"] == rule["metric"]), key=lambda p: p["step"]):
-            now_over = bool(cmp(p["value"], rule["threshold"]))
-            was_over = _violating.get(key, False)
-            _violating[key] = now_over
-            if now_over and not was_over:  # fire on crossing only, not on every point beyond it
-                title = f"Metric threshold: {run['name']}"
-                body = (f"{rule['metric']} = {p['value']:.6g} {rule['op']} {rule['threshold']:g} "
-                        f"at step {p['step']} (run {run['name']!r}, project {run['project']!r})")
-                _fire(rule, run, title, body, "warning", dedupe=("metric_threshold", run["run_id"], rule["metric"]))
+        for trig in rule["triggers"]:
+            cmp = OPS.get(trig.get("op") or "")
+            if trig["kind"] != "metric_threshold" or cmp is None or trig.get("threshold") is None:
+                continue
+            tkey = f"{trig['metric']}{trig['op']}{trig['threshold']!r}"
+            for p in sorted((p for p in points if p["name"] == trig["metric"]), key=lambda p: p["step"]):
+                now_over = bool(cmp(p["value"], trig["threshold"]))
+                was_over = db.db_alert_swap_violating(rule["id"], tkey, run["run_id"], now_over)
+                if now_over and not was_over:  # fire on crossing only, not on every point beyond it
+                    title = f"Metric threshold: {run['name']}"
+                    body = (f"{trig['metric']} = {p['value']:.6g} {trig['op']} {trig['threshold']:g} "
+                            f"at step {p['step']} (run {run['name']!r}, project {run['project']!r})")
+                    _fire(rule, run, title, body, "warning", dedupe=("metric_threshold", run["run_id"], tkey))
 
 
 def _fire(rule: dict, run: dict, title: str, body: str, severity: str, dedupe: tuple) -> None:
-    """Apply dedupe and rate limit, then send."""
-    now = time.time()
-    dkey = (rule["id"], *dedupe)
-    if now - _recent.get(dkey, 0.0) < DEDUPE_WINDOW_S:
-        return
-    sent = _sent.setdefault(rule["id"], deque())
-    while sent and now - sent[0] > 60:
-        sent.popleft()
-    if len(sent) >= rate_limit_per_min():
+    """Apply dedupe and rate limit (persisted), then send."""
+    dkey = hashlib.sha1(repr(dedupe).encode()).hexdigest()
+    verdict = db.db_alert_acquire(rule["id"], dkey, DEDUPE_WINDOW_S, rate_limit_per_min())
+    if verdict == "rate":
         _log.warning("alert rate limit reached for rule %s; dropping alert", rule["id"])
+    if verdict != "ok":
         return
-    for k in [k for k, t in _recent.items() if now - t >= DEDUPE_WINDOW_S]:
-        del _recent[k]
-    _recent[dkey] = now
-    sent.append(now)
     base = public_url()
     link = f"{base}/#/runs/{run['run_id']}" if base else None
-    error = _deliver(rule, _build_alert(rule, title, body, link, severity))
-    if error:
-        _log.warning("alert delivery failed for rule %s: %s", rule["id"], error)
+    _attempt(rule["id"], _build_alert(rule, title, body, link, severity), dkey, 0)
+
+
+def _attempt(rule_id: str, req: dict, dkey: str, attempt: int) -> None:
+    """One delivery attempt; a retryable failure schedules the next one on a timer."""
+    global _pending_retries
+    rule = db.db_get_alert_rule(rule_id)  # re-read: it may have been deleted or disabled meanwhile
+    if rule is None or not rule["enabled"]:
+        return
+    error, retryable = _deliver_once(rule, req)
+    if error is None:
+        return
+    if retryable and attempt < len(RETRY_BACKOFF_S):
+        with _worker_lock:
+            _pending_retries += 1
+        timer = threading.Timer(RETRY_BACKOFF_S[attempt], _retry, (rule_id, req, dkey, attempt + 1))
+        timer.daemon = True
+        timer.start()
+        return
+    _log.warning("alert delivery failed for rule %s after %d attempt(s): %s", rule_id, attempt + 1, error)
+    db.db_alert_release(rule_id, dkey)  # nothing arrived: let an identical alert try again
+
+
+def _retry(rule_id: str, req: dict, dkey: str, attempt: int) -> None:
+    global _pending_retries
+    _submit(("deliver", rule_id, req, dkey, attempt))
+    with _worker_lock:
+        _pending_retries -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -230,15 +262,20 @@ def _build_alert(rule: dict, title: str, body: str, link: str | None, severity: 
     return {"json": {"title": title, "message": body, "severity": severity, "rule": rule["name"], "link": link}}
 
 
-def _deliver(rule: dict, req: dict) -> str | None:
-    """POST to the webhook. Returns an error description that never contains the URL."""
+def _deliver_once(rule: dict, req: dict) -> tuple[str | None, bool]:
+    """POST to the webhook. Returns ``(error, retryable)``; the error text never contains the URL."""
     try:
         resp = _post(rule["url"], req)
-        if resp.status_code >= 400:
-            return f"HTTP {resp.status_code}"
-        return None
     except Exception as e:
-        return type(e).__name__  # message may embed the URL
+        return type(e).__name__, True  # message may embed the URL; network failures are worth retrying
+    if resp.status_code >= 400:
+        return f"HTTP {resp.status_code}", resp.status_code in (408, 425, 429) or resp.status_code >= 500
+    return None, False
+
+
+def _deliver(rule: dict, req: dict) -> str | None:
+    """Single attempt (the test endpoint). Returns an error description, or ``None`` on success."""
+    return _deliver_once(rule, req)[0]
 
 
 def _post(url: str, req: dict) -> httpx.Response:

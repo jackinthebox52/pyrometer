@@ -316,8 +316,12 @@ Gradient and weight statistics from `run.watch()`.
 
 #### `alert_rules`
 
-Admin-managed webhook alert rules: `id`, `name`, `kind`, `url` (secret), `format`, `project` (NULL = all),
-`min_severity`, `metric`, `op`, `threshold`, `enabled`, `created_at`, `created_by`. Delivery logic lives in
+Admin-managed webhook alert rules: `id`, `name`, `url` (secret), `format`, `project` (NULL = all), `enabled`,
+`created_at`, `created_by`, `triggers` (JSON list of `{kind, min_severity, metric, op, threshold}`; the flat
+`kind`/`min_severity`/`metric`/`op`/`threshold` columns are the pre-multi-trigger layout, migrated into `triggers`
+and unused). Companion tables `alert_sent(rule_id, dkey, sent_at)` (dedupe window + per-minute rate limit) and
+`alert_violations(rule_id, trigger_key, run_id, violating)` (threshold-crossing state) persist alert state across
+restarts. Run summaries are computed on a managed single-worker executor drained on shutdown. Delivery logic lives in
 `pyrometer/server/alerts.py` (one worker thread, bounded queue; hooks in the ingest routes and
 `db_mark_stale_runs`). See [server-api.md](server-api.md#alerts).
 

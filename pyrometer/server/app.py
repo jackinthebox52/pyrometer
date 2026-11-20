@@ -6,10 +6,12 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import duckdb
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +24,7 @@ from pyrometer.server.db import (
     db_compute_run_summary,
     db_create_project,
     db_create_run,
+    get_lock,
     db_get_artifacts,
     db_get_events,
     db_get_logs,
@@ -77,6 +80,33 @@ _log = logging.getLogger("pyrometer.server")
 set_status_hook(alerts.notify_run_status)
 
 
+# Run summaries are computed off the request path, on one managed worker that shutdown (and the test
+# fixtures) drain, so no summary thread can touch the database after it is closed.
+_summary_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pyrometer-summary")
+_summary_lock = threading.Lock()
+
+
+def _compute_summary_safely(run_id: str) -> None:
+    try:
+        db_compute_run_summary(run_id)
+    except Exception:
+        _log.exception("run summary failed for %s", run_id)
+
+
+def _queue_summary(run_id: str) -> None:
+    with _summary_lock:
+        _summary_pool.submit(_compute_summary_safely, run_id)
+
+
+def drain_background() -> None:
+    """Wait for queued run summaries and alert jobs to finish (server shutdown, test teardown)."""
+    global _summary_pool
+    with _summary_lock:
+        pool, _summary_pool = _summary_pool, ThreadPoolExecutor(max_workers=1, thread_name_prefix="pyrometer-summary")
+    pool.shutdown(wait=True)
+    alerts.flush()
+
+
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     if not auth_enabled():
@@ -97,6 +127,7 @@ async def _lifespan(_: FastAPI):
         yield
     finally:
         task.cancel()
+        await asyncio.to_thread(drain_background)
 
 
 async def _crash_sweeper() -> None:
@@ -105,7 +136,7 @@ async def _crash_sweeper() -> None:
         await asyncio.sleep(30)
         try:
             for run_id in db_mark_stale_runs():
-                threading.Thread(target=db_compute_run_summary, args=(run_id,), daemon=True).start()
+                _queue_summary(run_id)
                 await _ws.broadcast({"type": "run_updated", "run_id": run_id})
         except Exception:
             _log.exception("crash sweep failed")
@@ -364,17 +395,27 @@ class CreateKeyRequest(BaseModel):
     project: str | None = None  # bind the key to one project
 
 
-class AlertRuleRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=64)
+class AlertTrigger(BaseModel):
     kind: str
-    url: str = Field(max_length=2048)
-    format: str = "generic"
-    project: str | None = None          # None = every project
     min_severity: str | None = None     # kind "event"
     metric: str | None = None           # kind "metric_threshold"
     op: str | None = None
     threshold: float | None = None
+
+
+class AlertRuleRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    url: str = Field(max_length=2048)
+    format: str = "generic"
+    project: str | None = None          # None = every project
     enabled: bool = True
+    triggers: list[AlertTrigger] | None = Field(default=None, max_length=20)
+    # Single-trigger shorthand from before rules had several triggers; used when ``triggers`` is omitted.
+    kind: str | None = None
+    min_severity: str | None = None
+    metric: str | None = None
+    op: str | None = None
+    threshold: float | None = None
 
 
 class UpdateAlertRuleRequest(BaseModel):
@@ -382,11 +423,8 @@ class UpdateAlertRuleRequest(BaseModel):
     url: str | None = Field(default=None, max_length=2048)
     format: str | None = None
     project: str | None = None
-    min_severity: str | None = None
-    metric: str | None = None
-    op: str | None = None
-    threshold: float | None = None
     enabled: bool | None = None
+    triggers: list[AlertTrigger] | None = Field(default=None, max_length=20)
 
 
 class CreateUserRequest(BaseModel):
@@ -629,8 +667,6 @@ def admin_update_project(name: str, req: UpdateProjectRequest):
 
 def _check_alert_rule(rule: dict) -> None:
     """Validate a complete rule dict, answering 400/404 through ``err``."""
-    if rule["kind"] not in alerts.KINDS:
-        err(f"kind must be one of {', '.join(alerts.KINDS)}", 400)
     if rule["format"] not in alerts.FORMATS:
         err(f"format must be one of {', '.join(alerts.FORMATS)}", 400)
     bad_url = alerts.validate_url(rule["url"])
@@ -638,11 +674,30 @@ def _check_alert_rule(rule: dict) -> None:
         err(bad_url, 400)
     if rule.get("project") is not None and db_get_project(rule["project"]) is None:
         err("No such project", 404)
-    if rule["kind"] == "event" and (rule.get("min_severity") or "error") not in alerts.SEVERITIES:
-        err(f"min_severity must be one of {', '.join(alerts.SEVERITIES)}", 400)
-    if rule["kind"] == "metric_threshold":
-        if not rule.get("metric") or rule.get("op") not in alerts.OPS or rule.get("threshold") is None:
-            err("metric_threshold rules need metric, op (>, >=, <, <=) and threshold", 400)
+    if not rule["triggers"]:
+        err("A rule needs at least one trigger", 400)
+    for t in rule["triggers"]:
+        if t["kind"] not in alerts.KINDS:
+            err(f"kind must be one of {', '.join(alerts.KINDS)}", 400)
+        if t["kind"] == "event" and (t.get("min_severity") or "error") not in alerts.SEVERITIES:
+            err(f"min_severity must be one of {', '.join(alerts.SEVERITIES)}", 400)
+        if t["kind"] == "metric_threshold" and (
+            not t.get("metric") or t.get("op") not in alerts.OPS or t.get("threshold") is None
+        ):
+            err("metric_threshold triggers need metric, op (>, >=, <, <=) and threshold", 400)
+
+
+def _clean_triggers(triggers: list[dict]) -> list[dict]:
+    """Keep only the fields that apply to each trigger kind (event severity defaults to error)."""
+    out = []
+    for t in triggers:
+        if t["kind"] == "event":
+            out.append({"kind": "event", "min_severity": t.get("min_severity") or "error"})
+        elif t["kind"] == "metric_threshold":
+            out.append({k: t.get(k) for k in ("kind", "metric", "op", "threshold")})
+        else:
+            out.append({"kind": t["kind"]})
+    return out
 
 
 @app.get("/admin/alerts")
@@ -652,11 +707,15 @@ def admin_list_alerts():
 
 @app.post("/admin/alerts", status_code=201)
 def admin_create_alert(req: AlertRuleRequest, request: Request):
-    rule = req.model_dump()
+    rule = req.model_dump(exclude={"kind", "min_severity", "metric", "op", "threshold"})
     rule["name"] = rule["name"].strip()
+    if req.triggers is None:
+        if req.kind is None:
+            err("A rule needs triggers", 400)
+        rule["triggers"] = [{"kind": req.kind, "min_severity": req.min_severity, "metric": req.metric,
+                             "op": req.op, "threshold": req.threshold}]
     _check_alert_rule(rule)
-    if rule["kind"] == "event" and not rule["min_severity"]:
-        rule["min_severity"] = "error"
+    rule["triggers"] = _clean_triggers(rule["triggers"])
     me = _principal(request)
     return ok(alerts.public_rule(db_create_alert_rule(rule, me.name if me else "local")))
 
@@ -667,7 +726,11 @@ def admin_update_alert(rule_id: str, req: UpdateAlertRuleRequest):
     if current is None:
         err("No such alert rule", 404)
     patch = req.model_dump(exclude_unset=True)
+    if patch.get("triggers") is None:
+        patch.pop("triggers", None)
     _check_alert_rule({**current, **patch})
+    if "triggers" in patch:
+        patch["triggers"] = _clean_triggers(patch["triggers"])
     db_update_alert_rule(rule_id, patch)
     return ok(alerts.public_rule(db_get_alert_rule(rule_id)))
 
@@ -704,16 +767,22 @@ def _ingest_once(run_id: str, request: Request, insert):
     The SDK retries undelivered batches, possibly after the server stored them but the response was
     lost. Returns ``insert()``'s result, or ``None`` for a duplicate (nothing inserted).
     """
+    if db_get_run_project(run_id) is None:
+        err("Run not found", 404)  # never create orphan rows (or claim batch ids) for an unknown run
     batch_id = request.headers.get(BATCH_HEADER)
     if not batch_id:
         return insert()
-    if not db_claim_batch(run_id, batch_id[:64]):
-        return None
-    try:
-        return insert()
-    except Exception:
-        db_release_batch(run_id, batch_id[:64])
-        raise
+    # Claim and insert under one lock hold: a retry that arrives while the first attempt is still
+    # inserting waits for it, instead of being told "duplicate" and then losing the data if the
+    # first attempt fails (the lock is re-entrant, the db_* helpers take it again).
+    with get_lock():
+        if not db_claim_batch(run_id, batch_id[:64]):
+            return None
+        try:
+            return insert()
+        except Exception:
+            db_release_batch(run_id, batch_id[:64])
+            raise
 
 
 def _dup() -> dict:
@@ -758,23 +827,33 @@ async def create_run(req: CreateRunRequest, request: Request):
                 err("No such project", 404)
             run = db_get_run(req.run_id)
             return ok({k: run[k] for k in ("run_id", "name", "status", "created_at", "project")})
-    run = db_create_run(
-        run_id=req.run_id,
-        created_at=req.created_at,
-        name=req.name,
-        hyperparams=req.hyperparams,
-        tags=req.tags,
-        notes=req.notes,
-        git_hash=req.git_hash,
-        git_dirty=req.git_dirty,
-        gpu_model=req.gpu_model,
-        gpu_memory_total=req.gpu_memory_total,
-        cuda_version=req.cuda_version,
-        pytorch_version=req.pytorch_version,
-        python_version=req.python_version,
-        hostname=req.hostname,
-        project=project,
-    )
+    try:
+        run = db_create_run(
+            run_id=req.run_id,
+            created_at=req.created_at,
+            name=req.name,
+            hyperparams=req.hyperparams,
+            tags=req.tags,
+            notes=req.notes,
+            git_hash=req.git_hash,
+            git_dirty=req.git_dirty,
+            gpu_model=req.gpu_model,
+            gpu_memory_total=req.gpu_memory_total,
+            cuda_version=req.cuda_version,
+            pytorch_version=req.pytorch_version,
+            python_version=req.python_version,
+            hostname=req.hostname,
+            project=project,
+        )
+    except duckdb.ConstraintException:
+        # A concurrent identical create (original + retry) won the race: answer like the repeat it is.
+        existing = db_get_run_project(req.run_id) if req.run_id else None
+        if existing is None:
+            raise
+        if not auth.can_write_project(principal, existing):
+            err("No such project", 404)
+        run = db_get_run(req.run_id)
+        return ok({k: run[k] for k in ("run_id", "name", "status", "created_at", "project")})
     await _ws.broadcast({"type": "run_created", "run_id": run["run_id"]})
     return ok(run)
 
@@ -803,9 +882,7 @@ async def update_run(run_id: str, req: UpdateRunRequest):
         alerts.notify_run_status(run_id, req.status)
     # Compute derived summary stats when a run reaches a terminal state.
     if req.status in TERMINAL_STATUSES:
-        threading.Thread(
-            target=db_compute_run_summary, args=(run_id,), daemon=True
-        ).start()
+        _queue_summary(run_id)
     await _ws.broadcast({"type": "run_updated", "run_id": run_id})
     return ok({"updated": True})
 
@@ -971,6 +1048,14 @@ def get_artifacts(run_id: str):
 # Routes — run summaries (derived stats + LLM export)
 # ---------------------------------------------------------------------------
 
+def _current_summary(run_id: str) -> dict | None:
+    """The stored summary for a finished run; in-progress (or resumed) runs are recomputed, never served stale."""
+    summary = db_get_run_summary(run_id)
+    if summary is None or db_get_run_status(run_id) not in TERMINAL_STATUSES:
+        summary = db_compute_run_summary(run_id)
+    return summary
+
+
 @app.get("/runs/{run_id}/summary")
 def get_run_summary(run_id: str):
     """Return derived stats for the run.
@@ -978,9 +1063,7 @@ def get_run_summary(run_id: str):
     If no summary has been computed yet (e.g., run still in progress),
     computes one on-the-fly and caches it for future requests.
     """
-    summary = db_get_run_summary(run_id)
-    if summary is None:
-        summary = db_compute_run_summary(run_id)
+    summary = _current_summary(run_id)
     if summary is None:
         err("Run not found", status_code=404)
     return ok(summary)
@@ -993,9 +1076,7 @@ def get_llm_summary(run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail={"data": None, "error": "Run not found"})
 
-    summary = db_get_run_summary(run_id)
-    if summary is None:
-        summary = db_compute_run_summary(run_id)
+    summary = _current_summary(run_id)
 
     lines: list[str] = []
 

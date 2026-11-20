@@ -24,13 +24,10 @@ def fresh(tmp_path, monkeypatch):
     auth._cache = None
     auth._setup_token = None
     auth._failures.clear()
+    monkeypatch.setattr(alerts, "RETRY_BACKOFF_S", (0.0, 0.0, 0.0))
     alerts.flush()
-    alerts._sent.clear()
-    alerts._recent.clear()
-    alerts._violating.clear()
+    alerts.reset_state()
     yield
-    alerts.flush()
-    time.sleep(0.2)  # let run-summary threads started by terminal PATCHes finish before the DB closes
 
 
 @pytest.fixture
@@ -177,7 +174,8 @@ def test_metric_threshold_fires_on_crossing_only(admin, sdk, posts):
     alerts.flush()
     assert len(posts) == 1  # still above
     sdk.post(f"/runs/{rid}/metrics", json=[pt(5, 1.0)])
-    alerts._recent.clear()  # skip the dedupe window to observe a second crossing
+    db.db_alert_clear_state()  # skip the dedupe window to observe a second crossing
+    db.db_alert_swap_violating(db.db_list_alert_rules()[0]["id"], "loss>5.0", rid, False)
     sdk.post(f"/runs/{rid}/metrics", json=[pt(6, 9.0)])
     alerts.flush()
     assert len(posts) == 2
@@ -222,3 +220,116 @@ def test_test_endpoint_and_failures_never_leak_url(admin, monkeypatch, caplog):
     assert r.status_code == 502 and "SECRET" not in r.text and "SECRET" not in caplog.text
     monkeypatch.setattr(alerts, "_post", lambda url, req: httpx.Response(204))
     assert admin.post(f"/admin/alerts/{rule['id']}/test").status_code == 200
+
+
+# --- multi-trigger rules, persisted state, delivery retries ------------------------------------
+
+def test_rule_with_several_triggers_fires_once_per_event(admin, sdk, posts):
+    rule = add_rule(admin, triggers=[{"kind": "run_failed"}, {"kind": "event", "min_severity": "warning"}, {"kind": "anomaly"}])
+    assert [t["kind"] for t in rule["triggers"]] == ["run_failed", "event", "anomaly"]
+    rid = new_run(sdk)
+    sdk.patch(f"/runs/{rid}", json={"status": "failed"})
+    # a warning anomaly matches both the event and anomaly triggers: still one message for the rule
+    sdk.post(f"/runs/{rid}/events", json={"timestamp": 1.0, "event_type": "anomaly_detected", "severity": "warning", "message": "NaN"})
+    sdk.post(f"/runs/{rid}/events", json={"timestamp": 1.0, "event_type": "custom", "severity": "info", "message": "quiet"})
+    alerts.flush()
+    assert len(posts) == 2
+
+
+def test_trigger_validation_and_update(admin):
+    body = {"name": "r", "url": SECRET}
+    post = lambda **kw: admin.post("/admin/alerts", json={**body, **kw}).status_code
+    assert post(triggers=[]) == 400
+    assert post() == 400  # neither triggers nor kind
+    assert post(triggers=[{"kind": "nope"}]) == 400
+    assert post(triggers=[{"kind": "run_failed"}, {"kind": "metric_threshold"}]) == 400
+    rule = add_rule(admin, triggers=[{"kind": "run_failed"}])
+    r = admin.patch(f"/admin/alerts/{rule['id']}", json={"triggers": [{"kind": "run_crashed"}, {"kind": "event"}]})
+    assert r.status_code == 200
+    assert r.json()["data"]["triggers"] == [{"kind": "run_crashed"}, {"kind": "event", "min_severity": "error"}]
+    assert admin.patch(f"/admin/alerts/{rule['id']}", json={"triggers": []}).status_code == 400
+
+
+def test_legacy_single_trigger_rows_are_migrated(admin):
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT INTO alert_rules (id, name, kind, url, format, min_severity, enabled, created_at, created_by) "
+        "VALUES ('old1', 'legacy', 'event', ?, 'generic', 'warning', true, 1.0, 'x')", [SECRET]
+    )
+    db._init_schema(conn)  # what a restart onto an old database does
+    rule = db.db_get_alert_rule("old1")
+    assert rule["triggers"] == [{"kind": "event", "min_severity": "warning", "metric": None, "op": None, "threshold": None}]
+    assert [r["id"] for r in admin.get("/admin/alerts").json()["data"]] == ["old1"]
+
+
+def restart_db() -> None:
+    """Close and reopen the database file, as a server restart would."""
+    db._conn.close()
+    db._conn = None
+
+
+def test_dedupe_and_rate_limit_survive_restart(admin, sdk, posts, monkeypatch):
+    monkeypatch.setenv("PYROMETER_ALERT_RATE", "2")
+    add_rule(admin, kind="event", min_severity="info")
+    rid = new_run(sdk)
+    ev = lambda m: {"timestamp": 1.0, "event_type": "c", "severity": "info", "message": m}
+    sdk.post(f"/runs/{rid}/events", json=ev("m0"))
+    sdk.post(f"/runs/{rid}/events", json=ev("m1"))
+    alerts.flush()
+    assert len(posts) == 2
+    restart_db()
+    sdk.post(f"/runs/{rid}/events", json=ev("m0"))  # same alert as before the restart: deduped
+    sdk.post(f"/runs/{rid}/events", json=ev("m2"))  # new alert: over the per-minute rate
+    alerts.flush()
+    assert len(posts) == 2
+
+
+def test_threshold_state_survives_restart(admin, sdk, posts):
+    add_rule(admin, kind="metric_threshold", metric="loss", op=">", threshold=5.0)
+    rid = new_run(sdk)
+    pt = lambda step, v: {"step": step, "timestamp": 1.0, "name": "loss", "value": v}
+    sdk.post(f"/runs/{rid}/metrics", json=[pt(1, 6.0)])
+    alerts.flush()
+    assert len(posts) == 1
+    restart_db()
+    sdk.post(f"/runs/{rid}/metrics", json=[pt(2, 7.0)])  # still above the threshold: no new crossing
+    alerts.flush()
+    assert len(posts) == 1
+
+
+def test_delivery_is_retried_then_succeeds_without_leaking_url(admin, sdk, monkeypatch, caplog):
+    add_rule(admin)
+    calls: list[int] = []
+
+    def flaky(url, req):
+        calls.append(1)
+        if len(calls) < 3:
+            raise httpx.ConnectError(f"cannot connect to {url}")
+        return httpx.Response(200)
+
+    monkeypatch.setattr(alerts, "_post", flaky)
+    rid = new_run(sdk)
+    with caplog.at_level(logging.DEBUG):
+        sdk.patch(f"/runs/{rid}", json={"status": "failed"})
+        alerts.flush()
+    assert len(calls) == 3
+    assert "SECRET" not in caplog.text
+
+
+def test_permanent_failure_gives_up_and_allows_a_later_retry(admin, sdk, monkeypatch, caplog):
+    add_rule(admin)
+    calls: list[int] = []
+    monkeypatch.setattr(alerts, "_post", lambda url, req: (calls.append(1), httpx.Response(500))[1])
+    rid = new_run(sdk)
+    with caplog.at_level(logging.WARNING):
+        sdk.patch(f"/runs/{rid}", json={"status": "failed"})
+        alerts.flush()
+    assert len(calls) == 1 + len(alerts.RETRY_BACKOFF_S)  # bounded
+    assert "SECRET" not in caplog.text and "failed for rule" in caplog.text
+    # a client error is not retried
+    calls.clear()
+    monkeypatch.setattr(alerts, "_post", lambda url, req: (calls.append(1), httpx.Response(404))[1])
+    rid2 = new_run(sdk, name="b")
+    sdk.patch(f"/runs/{rid2}", json={"status": "failed"})
+    alerts.flush()
+    assert len(calls) == 1

@@ -722,6 +722,7 @@ Use the **"Copy for LLM"** button to export a run summary for:
 ## Alerts (Settings)
 
 Admins see an **Alerts** section in Settings. Add a rule with a name, a webhook URL (generic JSON, ntfy,
-Discord or Slack), a trigger (run crashed, run failed, event at or above a severity, anomaly/NaN, or a metric
-threshold such as `loss > 5`) and an optional project. **Send test** posts a test message; rules can be
+Discord or Slack), one or more triggers (run crashed, run failed, event at or above a severity, anomaly/NaN, or a
+metric threshold such as `loss > 5`; pick one and press **Add trigger**, repeat for more; the rule fires when any
+matches) and an optional project. **Send test** posts a test message; rules can be
 disabled or deleted. After saving, the URL is shown masked (host only). See [server-api.md](server-api.md#alerts).

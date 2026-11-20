@@ -194,17 +194,21 @@ export interface SamplesPage {
 export type AlertKind = 'run_crashed' | 'run_failed' | 'event' | 'anomaly' | 'metric_threshold'
 export type AlertFormat = 'generic' | 'ntfy' | 'discord' | 'slack'
 
+export interface AlertTrigger {
+  kind: AlertKind
+  min_severity?: string | null // kind "event"
+  metric?: string | null // kind "metric_threshold"
+  op?: string | null
+  threshold?: number | null
+}
+
 export interface AlertRule {
   id: string
   name: string
-  kind: AlertKind
   url: string // masked by the server: scheme and host only
   format: AlertFormat
   project: string | null
-  min_severity: string | null
-  metric: string | null
-  op: string | null
-  threshold: number | null
+  triggers: AlertTrigger[] // the rule fires when any of them matches
   enabled: boolean
 }
 

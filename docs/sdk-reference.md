@@ -81,6 +81,7 @@ for step in range(start, total_steps):
   (metadata: `previous_status`, `last_step`) marks the point on the charts.
 - **Config**: the original name, hyperparams, tags and notes are kept. Hyperparams/tags you pass that differ are not
   applied: a warning is printed and the differences are stored in the event's `config_changes` metadata.
+- `run.server` is the server base URL the run reports to (handy for printing a link: `f"{run.server}/#/runs/{run.run_id}"`).
 - **Steps**: `run.resumed` is `True`; `run.last_step` is the highest step stored on the server (`None` if none).
   Pyrometer never rewrites history: if you log steps that already exist you get duplicates, so continue from
   `last_step + 1` (or restore from your checkpoint's step and expect overlap).

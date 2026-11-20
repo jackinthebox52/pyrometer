@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api } from '../api/client.ts'
-import type { AlertFormat, AlertKind, AlertRule, ApiKey, CreatedApiKey, Project, Session, UserAccount } from '../api/types.ts'
+import type { AlertFormat, AlertKind, AlertRule, AlertTrigger, ApiKey, CreatedApiKey, Project, Session, UserAccount } from '../api/types.ts'
 
 const input =
   'rounded border border-py-border bg-py-elevated px-2 py-1.5 text-xs font-mono text-py-text outline-none focus:border-py-border-hi'
@@ -57,6 +57,7 @@ export default function SettingsPage() {
   const [aUrl, setAUrl] = useState('')
   const [aFormat, setAFormat] = useState<AlertFormat>('generic')
   const [aKind, setAKind] = useState<AlertKind>('run_crashed')
+  const [aTriggers, setATriggers] = useState<AlertTrigger[]>([])
   const [aProject, setAProject] = useState('')
   const [aSeverity, setASeverity] = useState('error')
   const [aMetric, setAMetric] = useState('')
@@ -133,16 +134,13 @@ export default function SettingsPage() {
         name: aName.trim(),
         url: aUrl.trim(),
         format: aFormat,
-        kind: aKind,
         project: aProject || null,
-        min_severity: aKind === 'event' ? aSeverity : null,
-        metric: aKind === 'metric_threshold' ? aMetric.trim() : null,
-        op: aKind === 'metric_threshold' ? aOp : null,
-        threshold: aKind === 'metric_threshold' ? Number(aThreshold) : null,
+        triggers: aTriggers,
         enabled: true,
       })
       setAName('')
       setAUrl('')
+      setATriggers([])
     }, 'Failed to create alert')
   }
   const testAlert = (id: string) => {
@@ -152,12 +150,24 @@ export default function SettingsPage() {
       setAlertNote('Test alert sent.')
     }, 'Test alert failed')
   }
-  const describeRule = (r: AlertRule) =>
-    r.kind === 'event'
-      ? `event severity >= ${r.min_severity}`
-      : r.kind === 'metric_threshold'
-        ? `${r.metric} ${r.op} ${r.threshold}`
-        : r.kind.replace('_', ' ')
+  const describeTrigger = (t: AlertTrigger) =>
+    t.kind === 'event'
+      ? `event severity >= ${t.min_severity}`
+      : t.kind === 'metric_threshold'
+        ? `${t.metric} ${t.op} ${t.threshold}`
+        : t.kind.replace('_', ' ')
+  const describeRule = (r: AlertRule) => r.triggers.map(describeTrigger).join(' | ')
+  const draftValid = aKind !== 'metric_threshold' || (aMetric.trim() !== '' && aThreshold !== '' && !isNaN(Number(aThreshold)))
+  const addTrigger = () => {
+    setATriggers((ts) => [
+      ...ts,
+      aKind === 'event'
+        ? { kind: aKind, min_severity: aSeverity }
+        : aKind === 'metric_threshold'
+          ? { kind: aKind, metric: aMetric.trim(), op: aOp, threshold: Number(aThreshold) }
+          : { kind: aKind },
+    ])
+  }
   const changePassword = (e: FormEvent) => {
     e.preventDefault()
     setPwDone(false)
@@ -405,15 +415,31 @@ export default function SettingsPage() {
                   <input value={aThreshold} onChange={(e) => setAThreshold(e.target.value)} placeholder="value" className={`${input} w-24`} />
                 </>
               )}
+              <button type="button" disabled={!draftValid} onClick={addTrigger} className={btn}>
+                Add trigger
+              </button>
+            </div>
+            <div className="flex items-center gap-2 text-xs font-mono">
+              <span className="text-py-muted">Triggers (any match fires):</span>
+              {aTriggers.length === 0 && <span className="text-py-faint">none yet</span>}
+              {aTriggers.map((t, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  title="Remove"
+                  className="rounded border border-py-border px-2 py-0.5 text-py-amber"
+                  onClick={() => setATriggers((ts) => ts.filter((_, j) => j !== i))}
+                >
+                  {describeTrigger(t)} x
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-2">
               <select value={aProject} onChange={(e) => setAProject(e.target.value)} className={input}>
                 <option value="">all projects</option>
                 {projects.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
               </select>
-              <button
-                type="submit"
-                disabled={!aName.trim() || !aUrl.trim() || (aKind === 'metric_threshold' && (!aMetric.trim() || aThreshold === '' || isNaN(Number(aThreshold))))}
-                className={btn}
-              >
+              <button type="submit" disabled={!aName.trim() || !aUrl.trim() || aTriggers.length === 0} className={btn}>
                 Add rule
               </button>
             </div>
