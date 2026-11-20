@@ -11,7 +11,7 @@ Track metrics, compare runs, and profile GPU kernels — all local, no cloud, no
   without a network and `pyrometer sync` uploads later. Retries never double-insert.
 - **Run health**: heartbeat plus statuses `running` / `completed` / `failed` / `crashed` / `killed`; a run that goes
   silent is marked `crashed` and flips back if it resumes.
-- **Resume**: `init(resume=run_id | "auto")` (or `PYROMETER_RUN_ID`) continues an existing run.
+- **Resume**: `init(resume=run_id | "auto")` (or `PYROMETER_RUN_ID`) continues an existing run; re-logged steps replace the earlier values (no duplicates) and anomaly detectors keep their history.
 - **System monitoring**: every visible GPU, plus per-process GPU memory/utilization, CPU and RAM.
 - **Anomaly events**: NaN/Inf and robust loss/gradient spike detection, tunable via `init(anomaly_detection=...)`.
 - **Dashboard charts**: log-scale, EMA smoothing and normalization per chart; selectable x-axis (step, wall time,
@@ -137,9 +137,9 @@ with run.profile(step=global_step):
     val_loss = val_step(model, batch)
 ```
 
-### `run.log_samples(step, samples, name="samples")`
+### `run.log_samples(step, samples, name="samples", mode="replace")`
 
-Log a list of JSON-able dicts (e.g. `prompt`, `completion`, `reward`, `reference`) for the dashboard Samples tab.
+Log a list of JSON-able dicts (e.g. `prompt`, `completion`, `reward`, `reference`) for the dashboard Samples tab. `mode="replace"` (default) overwrites what is stored for that `(name, step)` (so resumed runs do not duplicate); `mode="append"` adds to it.
 
 ### `run.finish()`
 

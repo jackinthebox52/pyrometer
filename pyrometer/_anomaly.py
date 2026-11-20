@@ -6,7 +6,9 @@ submits whatever :meth:`MetricDetector.observe` / :meth:`GradDetector.observe` r
 Design: NaN/Inf always fires (when detection is enabled). Spikes use a rolling median/MAD
 (robust to heavy-tailed noise), need a warmup of samples, must clear both a robust z-score and a
 relative-change floor, are rate-limited by a per-key cooldown measured in training steps, and are
-capped per key and per run.
+capped per key and per run. Metrics that are logged rarely (per epoch, per eval) would never leave the
+warmup, so detection starts earlier for them (``sparse_min_samples``) with thresholds that are
+``sparse_strictness`` times stricter and relax linearly to the normal ones as samples accumulate.
 """
 
 from __future__ import annotations
@@ -26,6 +28,10 @@ class AnomalyConfig:
     warmup: int = 50  # samples a metric needs before spike detection starts
     metric_z: float = 12.0  # robust z (0.6745*|x-median|/MAD) needed to flag a metric spike
     metric_rel_change: float = 1.0  # also |x-median| must exceed this * |median|
+    sparse_min_samples: int = 8  # sparse metrics (logged < ``warmup`` times, e.g. per epoch) are checked from here on
+    sparse_strictness: float = 2.5  # ...with z and relative-change thresholds this many times stricter at that
+    # point, relaxing linearly to the normal thresholds at ``warmup`` samples. Set ``sparse_min_samples`` >=
+    # ``warmup`` to restore "no spike detection before ``warmup`` samples".
     cooldown_steps: int = 500  # min steps between spike events for the same metric/param
     max_events_per_key: int = 5  # spike events per metric / parameter per run
     grad_warmup: int = 20  # gradient samples per parameter before spike detection
@@ -95,12 +101,34 @@ class MetricDetector:
         hist = self._hist.setdefault(name, [])
         window = hist[-cfg.window:]
         result = None
-        if len(window) >= cfg.warmup:
+        if len(window) >= min(cfg.warmup, cfg.sparse_min_samples):
             result = self._check_spike(name, value, step, window)
         hist.append(value)
         if len(hist) > cfg.window:
             del hist[0]
         return result
+
+    def seed(self, name: str, values: list[float]) -> None:
+        """Pre-load history (oldest first) for ``name``, e.g. from a resumed run's stored metrics.
+
+        Seeded values come *before* anything observed so far; they never fire events and do not
+        touch cooldowns or NaN state.
+        """
+        if not self.cfg.enabled:
+            return
+        good = [float(v) for v in values if math.isfinite(v)]
+        hist = self._hist.setdefault(name, [])
+        hist[:0] = good
+        if len(hist) > self.cfg.window:
+            del hist[: len(hist) - self.cfg.window]
+
+    def _strictness(self, n: int) -> float:
+        """Threshold multiplier for a metric with ``n`` samples: 1 once warmed up, more before."""
+        cfg = self.cfg
+        if n >= cfg.warmup or cfg.warmup <= cfg.sparse_min_samples:
+            return 1.0
+        frac = (cfg.warmup - n) / (cfg.warmup - cfg.sparse_min_samples)
+        return 1.0 + (cfg.sparse_strictness - 1.0) * min(1.0, frac)
 
     def _check_spike(
         self, name: str, value: float, step: int, window: list[float]
@@ -116,7 +144,8 @@ class MetricDetector:
         if scale <= 1e-12:
             return None
         z = 0.6745 * dev / scale
-        if z < cfg.metric_z or dev <= cfg.metric_rel_change * abs(med):
+        k = self._strictness(len(window))
+        if z < cfg.metric_z * k or dev <= cfg.metric_rel_change * k * abs(med):
             return None
         self._last_fire[name] = step
         self._fired[name] = self._fired.get(name, 0) + 1

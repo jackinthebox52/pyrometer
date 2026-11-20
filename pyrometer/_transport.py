@@ -20,8 +20,10 @@ run and ignores repeats, so a re-send after a lost response never double-inserts
 
 Files in ``<spool>/<run_id>/``: ``meta.json`` (server, run-create payload),
 ``queue.jsonl`` (journal), ``queue.pos`` (ack cursor, only while a backlog exists),
-``metrics.wal`` (metrics logged but not yet batched), ``dead.jsonl`` (poison payloads),
-``blobs/`` (media bytes referenced from the journal).
+``metrics.wal`` / ``logs.wal`` / ``param_stats.wal`` (write-ahead copies of metrics, stdout/stderr lines
+and gradient stats that were recorded but not yet batched into the journal), ``dead.jsonl`` (poison
+payloads), ``blobs/`` (media bytes referenced from the journal), ``owner.lock`` (held, with the pid, by the
+process that owns the run; ``pyrometer sync`` refuses to touch a run whose lock is held).
 """
 
 import base64
@@ -44,7 +46,14 @@ QUEUE_FILE = "queue.jsonl"
 POS_FILE = "queue.pos"
 META_FILE = "meta.json"
 DEAD_FILE = "dead.jsonl"
-WAL_FILE = "metrics.wal"
+WAL_FILE = "metrics.wal"  # kept for the original name; see WAL_KINDS
+LOCK_FILE = "owner.lock"
+# Write-ahead logs: kind -> (file, route suffix the recovered batch is POSTed to)
+WAL_KINDS: dict[str, tuple[str, str]] = {
+    "metrics": ("metrics.wal", "metrics"),
+    "logs": ("logs.wal", "logs"),
+    "param-stats": ("param_stats.wal", "param-stats"),
+}
 BLOB_DIR = "blobs"
 _BACKOFF_START = 1.0
 _BACKOFF_CAP = 60.0
@@ -109,6 +118,123 @@ def read_jsonl(path: Path, start: int = 0) -> tuple[list[dict], int]:
     return items, corrupt
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this pid exists (best effort; used where flock is unavailable)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":  # os.kill(pid, 0) would terminate the process on Windows
+        try:
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return bool(ok) and code.value == 259  # STILL_ACTIVE
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows: fall back to a pid file
+    _fcntl = None
+
+
+class SpoolLock:
+    """Ownership lock for a run's spool directory (``owner.lock``).
+
+    The process that writes a run's journal holds it for its lifetime. On Linux/macOS this is an
+    ``flock`` on the file (the kernel drops it when the process dies, so a crashed owner never leaves
+    a stale lock behind); the pid is written into the file for the message. Without ``fcntl``
+    (Windows) the file just holds the pid and a lock counts as held while that process is alive.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.path = Path(directory) / LOCK_FILE
+        self._fh = None
+
+    def acquire(self) -> bool:
+        """Take the lock; ``False`` if another live process holds it."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if _fcntl is None:
+                owner = self.owner_pid()
+                if owner is not None and owner != os.getpid() and _pid_alive(owner):
+                    return False
+                self.path.write_text(str(os.getpid()))
+                self._fh = False  # marker: held via pid file
+                return True
+            fh = open(self.path, "a+")
+            try:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except OSError:
+                fh.close()
+                return False
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(os.getpid()))
+            fh.flush()
+            self._fh = fh
+            return True
+        except OSError:
+            return True  # cannot create the lock (read-only dir): do not block the run over it
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh:
+            try:
+                fh.close()  # closing drops the flock
+            except OSError:
+                pass
+        elif fh is False:
+            try:
+                if self.owner_pid() == os.getpid():
+                    self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def owner_pid(self) -> int | None:
+        try:
+            return int(self.path.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    @classmethod
+    def held_by_other(cls, directory: Path) -> int | None:
+        """Pid of a live process that owns ``directory``'s run, else ``None`` (no lock, or a stale one)."""
+        path = Path(directory) / LOCK_FILE
+        if not path.exists():
+            return None
+        probe = cls(directory)
+        pid = probe.owner_pid()
+        if _fcntl is None:
+            return pid if pid is not None and pid != os.getpid() and _pid_alive(pid) else None
+        try:
+            fh = open(path, "a+")
+        except OSError:
+            return None
+        try:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            return pid if pid is not None else -1  # held; owner's pid unknown
+        else:
+            return None  # we could take it: nobody owns it (stale file from a dead process)
+        finally:
+            fh.close()
+
+
 class Spool:
     """On-disk state for one run (see the module docstring for the layout)."""
 
@@ -160,29 +286,33 @@ class Spool:
         return read_jsonl(self.dir / DEAD_FILE)
 
     def recover_wal(self) -> int:
-        """Turn leftover ``metrics.wal`` lines (metrics never batched, e.g. after SIGKILL) into journal entries.
+        """Turn leftover write-ahead lines (metrics, log lines, gradient stats never batched, e.g. after
+        SIGKILL) into journal entries.
 
         Entries keep the batch id they were logged under, so if that batch had in fact been
         journaled and delivered the server ignores this copy. Returns the number of batches.
         """
-        wal = self.dir / WAL_FILE
-        if not wal.exists():
-            return 0
-        lines, _ = read_jsonl(wal)
-        batches: dict[str, list] = {}
-        for line in lines:
-            if isinstance(line, dict) and "b" in line and "e" in line:
-                batches.setdefault(line["b"], []).extend(line["e"])
-        self.append([
-            {"id": b, "method": "POST", "path": f"/runs/{self.run_id}/metrics", "json": entries}
-            for b, entries in batches.items()
-        ])
-        wal.unlink(missing_ok=True)
-        return len(batches)
+        total = 0
+        for _kind, (fname, route) in WAL_KINDS.items():
+            wal = self.dir / fname
+            if not wal.exists():
+                continue
+            lines, _ = read_jsonl(wal)
+            batches: dict[str, list] = {}
+            for line in lines:
+                if isinstance(line, dict) and "b" in line and "e" in line:
+                    batches.setdefault(line["b"], []).extend(line["e"])
+            self.append([
+                {"id": b, "method": "POST", "path": f"/runs/{self.run_id}/{route}", "json": entries}
+                for b, entries in batches.items()
+            ])
+            wal.unlink(missing_ok=True)
+            total += len(batches)
+        return total
 
     def cleanup(self) -> None:
         """Delete every file of a fully delivered run and the directory itself."""
-        for name in (QUEUE_FILE, POS_FILE, DEAD_FILE, WAL_FILE, META_FILE):
+        for name in (QUEUE_FILE, POS_FILE, DEAD_FILE, META_FILE, *(f for f, _ in WAL_KINDS.values())):
             (self.dir / name).unlink(missing_ok=True)
         blobs = self.dir / BLOB_DIR
         if blobs.is_dir():
@@ -237,7 +367,9 @@ class Transport:
         self._mem: deque[dict] = deque()  # payloads the disk refused (read-only home, full disk)
         self._eph: deque[dict] = deque()  # heartbeats: memory only, never journaled
         self._fh = None  # journal, raw append-only
-        self._wal_fh = None
+        self._wal_fh: dict[str, object] = {}  # kind -> open write-ahead file
+        self._wal_closed = False
+        self._wal_last: dict[str, str] = {}  # kind -> id of the newest batch written to that file
         self._wal_lock = threading.RLock()
         self._dirty = False
         self._last_sync = time.monotonic()
@@ -251,6 +383,12 @@ class Transport:
         self.offline_saved = 0  # payloads written to disk by design (offline mode)
         self.dead = 0  # payloads moved to the dead-letter file this session
         self._meta_written = False
+
+        # Mark this process as the run's owner (``pyrometer sync`` stays away while we are alive). Taken
+        # before recovering leftovers so a concurrent sync cannot replay the same files.
+        self._owner = SpoolLock(spool.dir)
+        if not self._owner.acquire():
+            log.warning("Spool %s is owned by another live process; two writers may interleave", spool.dir)
 
         # Anything a previous process left behind is replayed first (same batch ids, so safe).
         try:
@@ -327,24 +465,40 @@ class Transport:
                 self._mem.append(item)
             self._cv.notify_all()
 
-    def wal_append(self, batch_id: str, entries: list[dict]) -> None:
-        """Append not-yet-batched metrics to ``metrics.wal`` (one cheap write, no fsync)."""
+    def wal_append(self, batch_id: str, entries: list[dict], kind: str = "metrics") -> None:
+        """Append not-yet-batched entries to the write-ahead log ``kind`` (one cheap write, no fsync).
+
+        ``kind`` is a key of :data:`WAL_KINDS`. Entries with the same ``batch_id`` are replayed as
+        one batch (and keep that id on the wire, so a batch that was in fact delivered is deduped).
+        """
         line = (json.dumps({"b": batch_id, "e": entries}) + "\n").encode("utf-8")
         with self._wal_lock:
+            if self._wal_closed:
+                return
             try:
-                if self._wal_fh is None:
+                fh = self._wal_fh.get(kind)
+                if fh is None:
                     self._spool.dir.mkdir(parents=True, exist_ok=True)
-                    self._wal_fh = open(self._spool.dir / WAL_FILE, "ab", buffering=0)
-                self._wal_fh.write(line)
+                    fh = self._wal_fh[kind] = open(self._spool.dir / WAL_KINDS[kind][0], "ab", buffering=0)
+                fh.write(line)  # type: ignore[attr-defined]
+                self._wal_last[kind] = batch_id
             except OSError:
                 self._disk_warning()
 
-    def wal_clear(self) -> None:
-        """Forget the write-ahead metrics: their batch is now journaled."""
+    def wal_clear(self, kind: str = "metrics", batch_id: str | None = None) -> None:
+        """Forget write-ahead entries of ``kind``: their batch is now journaled.
+
+        With ``batch_id`` the file is only emptied if that batch is the newest one written, so a
+        batch started concurrently (no lock shared with the caller) is never lost; older, already
+        journaled batches that stay behind are harmless (the server ignores their repeated ids).
+        """
         with self._wal_lock:
-            if self._wal_fh is not None:
+            if batch_id is not None and self._wal_last.get(kind) != batch_id:
+                return
+            fh = self._wal_fh.get(kind)
+            if fh is not None:
                 try:
-                    os.ftruncate(self._wal_fh.fileno(), 0)
+                    os.ftruncate(fh.fileno(), 0)  # type: ignore[attr-defined]
                 except OSError:
                     pass
 
@@ -372,23 +526,33 @@ class Transport:
                 self._fh.close()
                 self._fh = None
         with self._wal_lock:
-            if self._wal_fh is not None:
-                self._wal_fh.close()
-                self._wal_fh = None
-            wal = self._spool.dir / WAL_FILE
+            self._wal_closed = True
+            for kind, fh in list(self._wal_fh.items()):
+                try:
+                    fh.close()  # type: ignore[attr-defined]
+                except OSError:
+                    pass
+                wal = self._spool.dir / WAL_KINDS[kind][0]
+                try:
+                    if wal.exists() and wal.stat().st_size == 0:
+                        wal.unlink()
+                except OSError:
+                    pass
+            self._wal_fh.clear()
+        try:
+            if not self._offline and left == 0:
+                if self._tail:
+                    (self._spool.dir / QUEUE_FILE).unlink(missing_ok=True)
+                    (self._spool.dir / POS_FILE).unlink(missing_ok=True)
+                if not (self._spool.dir / DEAD_FILE).exists():
+                    self._spool.cleanup()
+        finally:
+            self._owner.release()
+            self._owner.path.unlink(missing_ok=True)
             try:
-                if wal.exists() and wal.stat().st_size == 0:
-                    wal.unlink()
+                self._spool.dir.rmdir()  # only succeeds when nothing is left in it
             except OSError:
                 pass
-        if self._offline:
-            return left
-        if left == 0:
-            if self._tail:
-                (self._spool.dir / QUEUE_FILE).unlink(missing_ok=True)
-                (self._spool.dir / POS_FILE).unlink(missing_ok=True)
-            if not (self._spool.dir / DEAD_FILE).exists():
-                self._spool.cleanup()
         return left
 
     # -- journal --

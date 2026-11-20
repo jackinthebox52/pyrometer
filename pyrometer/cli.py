@@ -107,7 +107,9 @@ def _sync(args: argparse.Namespace) -> None:
         r = sync_run_dir(d, server=args.server)
         for m in r.messages:
             print(f"  {m}")
-        if r.complete:
+        if r.skipped:
+            print(f"{r.run_id}: skipped ({r.error})")
+        elif r.complete:
             print(f"{r.run_id}: synced {r.sent} payloads")
         else:
             failed = True

@@ -214,7 +214,7 @@ One row per training run. Small table, read frequently.
 | `run_id` | `VARCHAR` | UUID primary key |
 | `name` | `VARCHAR` | Human-readable name |
 | `status` | `VARCHAR` | `running`, `completed`, `failed`, `crashed` (no heartbeat), `killed` |
-| `last_heartbeat` | `DOUBLE` | Unix timestamp of the last SDK heartbeat (null for pre-heartbeat runs) |
+| `last_heartbeat` | `DOUBLE` | Unix timestamp of the last SDK heartbeat or `running` status PATCH (null only for runs created before heartbeats that have not been migrated; the open-time migration fills it or marks them `crashed`) |
 | `created_at` | `DOUBLE` | Unix timestamp |
 | `finished_at` | `DOUBLE` | Unix timestamp (null if running) |
 | `hyperparams` | `JSON` | Arbitrary hyperparameter dict |
@@ -687,7 +687,8 @@ export function useWebSocket(handler: Handler) {
 - Network I/O happens only on the sender thread; failures are retried with exponential backoff (cap 60 s) and never block training
 - Every payload is journaled to `~/.pyrometer/spool/<run_id>/queue.jsonl` (`PYROMETER_SPOOL_DIR`) before sending and acked after;
   the 500-item memory queue is just a cache of it. The sender replays the backlog automatically after an outage; leftovers after
-  exit/SIGKILL go up with `pyrometer sync`. Media live in `blobs/`, poison payloads in `dead.jsonl`. `init()` with the server down
+  exit/SIGKILL go up with `pyrometer sync` (which skips runs whose process holds `owner.lock`). Metrics, stdout lines and gradient stats
+  buffered in memory are mirrored in `metrics.wal` / `logs.wal` / `param_stats.wal`. Media live in `blobs/`, poison payloads in `dead.jsonl`. `init()` with the server down
   degrades: the run is created by the sender once the server answers
 - Every payload has a batch id; the server's `seen_batches` table (run_id, batch_id, seen_at) discards repeats
 - `run.finish()` makes a 10 s final drain, leaves the rest in the journal, prints one warning, and doesn't raise

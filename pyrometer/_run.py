@@ -70,40 +70,77 @@ class _TeeWriter:
 HEARTBEAT_INTERVAL = 30.0
 _INLINE_MEDIA_MAX = 32 * 1024  # larger string media (histograms) go to a blob file
 
-# Runs that have not finished yet. A single excepthook / SIGTERM handler (installed on first use)
-# decides how they end: uncaught exception -> failed, Ctrl-C or SIGTERM -> killed.
+# Runs that have not finished yet. A single excepthook / sys.exit / SIGTERM handler (installed on first
+# use) decides how they end: uncaught exception or sys.exit(nonzero) -> failed, Ctrl-C or SIGTERM -> killed.
 _active_runs: "set[Run]" = set()
-_hooks_installed = False
+_excepthook_installed = False
+_our_sigterm = None  # the SIGTERM handler we installed (so a second init does not wrap it again)
+
+
+def _exit_code_status(code) -> str:
+    """Run status implied by a ``SystemExit`` code: ``None``/0 -> completed, anything else -> failed."""
+    return "completed" if code is None or code == 0 else "failed"
 
 
 def _install_exit_hooks() -> None:
-    global _hooks_installed
-    if _hooks_installed:
+    global _excepthook_installed
+    if not _excepthook_installed:
+        _excepthook_installed = True
+        prev_hook = sys.excepthook
+
+        def excepthook(exc_type, exc, tb) -> None:
+            status = "killed" if issubclass(exc_type, KeyboardInterrupt) else "failed"
+            for run in list(_active_runs):
+                run._exit_status, run._exit_from_sys_exit = status, False
+            prev_hook(exc_type, exc, tb)
+
+        sys.excepthook = excepthook
+
+        # An uncaught SystemExit never reaches excepthook, so sys.exit() is where its code is visible.
+        # (``raise SystemExit(1)`` written out by hand bypasses it and ends as completed.)
+        prev_exit = sys.exit
+
+        def exit_(status=None) -> None:
+            for run in list(_active_runs):
+                run._exit_status, run._exit_from_sys_exit = _exit_code_status(status), True
+            prev_exit(status)
+
+        sys.exit = exit_
+    _install_sigterm()
+
+
+def _install_sigterm() -> None:
+    """Chain our SIGTERM handling in front of whatever the application installed.
+
+    Ours marks every live run ``killed`` and finishes it, then hands over to the previous
+    handler (or to the default action: terminate). ``SIG_IGN`` is respected: a process that ignores
+    SIGTERM keeps running, so its runs must not be closed. Needs the main thread; a ``init()`` from
+    another thread leaves it for a later one.
+    """
+    global _our_sigterm
+    if threading.current_thread() is not threading.main_thread():
         return
-    _hooks_installed = True
-    prev_hook = sys.excepthook
-
-    def excepthook(exc_type, exc, tb) -> None:
-        status = "killed" if issubclass(exc_type, KeyboardInterrupt) else "failed"
-        for run in list(_active_runs):
-            run._exit_status = status
-        prev_hook(exc_type, exc, tb)
-
-    sys.excepthook = excepthook
-
     try:
-        prev_term = signal.getsignal(signal.SIGTERM)
-        if prev_term is signal.SIG_DFL and threading.current_thread() is threading.main_thread():
-            def on_term(signum, frame) -> None:
-                for run in list(_active_runs):
-                    run._exit_status = "killed"
-                    run._finish("killed")
+        prev = signal.getsignal(signal.SIGTERM)
+        if prev is _our_sigterm and _our_sigterm is not None:
+            return
+        if prev is signal.SIG_IGN:
+            return
+
+        def on_term(signum, frame) -> None:
+            for run in list(_active_runs):
+                run._exit_status, run._exit_from_sys_exit = "killed", False
+                run._finish("killed")
+            if callable(prev):
+                prev(signum, frame)
+            else:  # SIG_DFL (or None: handler not installed from Python): behave as if we were not here
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 os.kill(os.getpid(), signal.SIGTERM)
 
-            signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGTERM, on_term)
+        _our_sigterm = on_term
     except (ValueError, OSError, AttributeError):
-        pass  # not the main thread / platform without SIGTERM: skip
+        pass  # platform without SIGTERM, or not allowed here
 
 
 _MAX_SAMPLE_BYTES = 60 * 1024  # server limit is 64 KB per sample
@@ -170,12 +207,14 @@ class Run:
         # watch() state — gradient/weight monitoring
         self._watch_hooks: list = []
         self._param_stats_buffer: list[dict] = []
+        self._param_stats_batch = ""  # batch id of the buffered stats (and their write-ahead copy)
         self._param_stats_lock = threading.RLock()
         self._watch_grad_norm_history: dict[str, list[float]] = {}
         self._watch_low_norm_streak: dict[str, int] = {}
 
         # stdout/stderr capture
         self._log_buffer: list[dict] = []
+        self._log_batch = ""  # batch id of the buffered lines (and their write-ahead copy)
         self._log_lock = threading.RLock()
         self._original_stdout = None
         self._original_stderr = None
@@ -192,6 +231,8 @@ class Run:
         # Liveness: a heartbeat every HEARTBEAT_INTERVAL s (sent immediately at start). Never spooled.
         self._last_heartbeat = float("-inf")  # monotonic() can be < HEARTBEAT_INTERVAL right after boot
         self._exit_status = "completed"
+        self._probe_thread: threading.Thread | None = None
+        self._exit_from_sys_exit = False  # status came from sys.exit(): cleared if the program carries on
         _active_runs.add(self)
         _install_exit_hooks()
         atexit.register(self._atexit)
@@ -220,6 +261,8 @@ class Run:
         """
         if self._finished:
             return
+        if self._exit_from_sys_exit:  # a caught sys.exit(): the program is evidently still running
+            self._exit_status, self._exit_from_sys_exit = "completed", False
         self._last_step = step
         self._step_known = True
         ts = time.time()
@@ -258,8 +301,54 @@ class Run:
         """
         return self._last_step if self._step_known else None
 
+    def _start_hardware_probe(self, known: dict) -> None:
+        """Fill in the torch/NVML-dependent hardware fields in the background.
+
+        ``import torch`` and ``nvmlInit`` take seconds, so ``init`` does not wait for them: this thread runs them and
+        PATCHes the run with whatever differs from the ``known`` (cheap) fingerprint. The PATCH goes
+        through the journal like any payload, so it also works after an outage or offline.
+        """
+        def probe() -> None:
+            try:
+                from pyrometer import _hardware
+
+                found = _hardware.fingerprint_slow()
+                delta = {k: v for k, v in found.items() if v is not None and v != known.get(k)}
+                if delta and not self._finished:
+                    self._transport.submit("PATCH", f"/runs/{self.run_id}", delta)
+            except Exception:
+                log.debug("hardware probe failed", exc_info=True)
+
+        self._probe_thread = threading.Thread(target=probe, daemon=True, name="pyrometer-hwprobe")
+        self._probe_thread.start()
+
+    def _seed_detectors(self) -> None:
+        """Best-effort, non-blocking: preload metric anomaly history of a resumed run from the server.
+
+        Without it a resumed process starts every detector cold and is blind for ``warmup`` samples.
+        """
+        if self._client is None or not self._anomaly_cfg.enabled:
+            return
+
+        def seed() -> None:
+            try:
+                resp = self._client.get(  # type: ignore[union-attr]
+                    f"/runs/{self.run_id}/metrics/recent", params={"limit": self._anomaly_cfg.window}, timeout=5
+                )
+                if resp.status_code >= 300:
+                    return
+                history = resp.json().get("data") or {}
+                with self._anomaly_lock:
+                    for name, values in history.items():
+                        self._metric_detector.seed(name, [v for v in values if isinstance(v, (int, float))])
+            except Exception:
+                log.debug("could not seed anomaly detectors", exc_info=True)
+
+        threading.Thread(target=seed, daemon=True, name="pyrometer-seed").start()
+
     def _mark_resumed(self, last_step: int | None, previous_status: str | None, changes: dict | None) -> None:
         self.resumed = True
+        self._seed_detectors()
         if last_step is not None:
             self._last_step = int(last_step)
             self._step_known = True
@@ -352,7 +441,10 @@ class Run:
                     }
 
                     with self._param_stats_lock:
+                        if not self._param_stats_buffer:
+                            self._param_stats_batch = uuid.uuid4().hex
                         self._param_stats_buffer.append(stat)
+                        self._transport.wal_append(self._param_stats_batch, [stat], "param-stats")
 
                     threading.Thread(
                         target=self._check_grad_anomaly,
@@ -549,6 +641,7 @@ class Run:
         step: int,
         samples: list[dict],
         name: str = "samples",
+        mode: str = "replace",
     ) -> None:
         """Log generation samples (prompt / completion / reward ...) for a step.
 
@@ -564,6 +657,11 @@ class Run:
             step: Training step these samples belong to.
             samples: List of dicts.
             name: Sample stream name, e.g. ``"eval_generations"``.
+            mode: ``"replace"`` (default): the samples replace whatever is already stored for this
+                ``(name, step)`` - so a resumed run that re-logs a step does not duplicate it, and
+                calling ``log_samples`` again for the same step *overwrites* the earlier call.
+                ``"append"``: add to the samples already stored for the step (log one step's
+                samples in several calls).
 
         Example::
 
@@ -571,6 +669,8 @@ class Run:
         """
         if self._finished or not samples:
             return
+        if mode not in ("replace", "append"):
+            raise ValueError(f"log_samples: mode must be 'replace' or 'append', not {mode!r}")
         import json as _json
 
         cleaned: list[dict] = []
@@ -605,6 +705,8 @@ class Run:
                     "step": step,
                     "timestamp": time.time(),
                     "samples": cleaned[i:i + _MAX_SAMPLES_PER_REQUEST],
+                    # a large list is split into several requests: only the first may replace
+                    "mode": mode if i == 0 else "append",
                 },
                 timeout=30,
             )
@@ -632,6 +734,9 @@ class Run:
     def _finish(self, status: str) -> None:
         if self._finished:
             return
+        if self._probe_thread is not None and status != "killed":
+            # let a nearly finished hardware probe still report (it submits only while the run is open)
+            self._probe_thread.join(timeout=2)
         self._finished = True
         _active_runs.discard(self)
         try:
@@ -787,12 +892,16 @@ class Run:
         ts = time.time()
         should_flush = False
         with self._log_lock:
-            self._log_buffer.append({
+            entry = {
                 "timestamp": ts,
                 "stream": stream,
                 "line": line,
                 "step": self._last_step,
-            })
+            }
+            if not self._log_buffer:
+                self._log_batch = uuid.uuid4().hex
+            self._log_buffer.append(entry)
+            self._transport.wal_append(self._log_batch, [entry], "logs")
             should_flush = len(self._log_buffer) >= 50
         if should_flush:
             threading.Thread(target=self._flush_logs, daemon=True).start()
@@ -801,9 +910,10 @@ class Run:
         with self._log_lock:
             if not self._log_buffer:
                 return
-            batch = self._log_buffer[:]
+            batch, bid = self._log_buffer[:], self._log_batch
             self._log_buffer.clear()
-        self._transport.submit("POST", f"/runs/{self.run_id}/logs", batch)
+        self._transport.submit("POST", f"/runs/{self.run_id}/logs", batch, item_id=bid)
+        self._transport.wal_clear("logs", bid)
 
     # -- gradient/weight monitoring --
 
@@ -859,9 +969,10 @@ class Run:
         with self._param_stats_lock:
             if not self._param_stats_buffer:
                 return
-            batch = self._param_stats_buffer[:]
+            batch, bid = self._param_stats_buffer[:], self._param_stats_batch
             self._param_stats_buffer.clear()
-        self._transport.submit("POST", f"/runs/{self.run_id}/param-stats", batch)
+        self._transport.submit("POST", f"/runs/{self.run_id}/param-stats", batch, item_id=bid)
+        self._transport.wal_clear("param-stats", bid)
 
     def _flush(self) -> None:
         with self._lock:
@@ -876,7 +987,7 @@ class Run:
         batch = self._buffer[:]
         self._buffer.clear()
         self._transport.submit("POST", f"/runs/{self.run_id}/metrics", batch, item_id=self._wal_batch)
-        self._transport.wal_clear()
+        self._transport.wal_clear("metrics", self._wal_batch)
 
     # ------------------------------------------------------------------
     # Media helpers

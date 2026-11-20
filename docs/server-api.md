@@ -338,6 +338,9 @@ Update run status or notes.
 |-------|------|----------|-------------|
 | `status` | `string` | No | One of: `running`, `completed`, `failed`, `crashed`, `killed`. An explicit status always overwrites the current one (so a replayed `completed` from `pyrometer sync` replaces a server-detected `crashed`) |
 | `notes` | `string` | No | Updated notes text |
+| `git_hash`, `git_dirty`, `gpu_model`, `gpu_memory_total`, `cuda_version`, `pytorch_version`, `python_version`, `hostname` | various | No | Hardware/environment fields. The SDK sends these in a follow-up PATCH once its background probe (importing torch, initialising NVML; takes seconds) is done, so `init()` does not wait for it. Absent or null fields are left unchanged |
+
+Setting `status` to `running` also refreshes `last_heartbeat`, so a run revived this way is not swept straight back to `crashed`.
 
 **Response**:
 
@@ -362,7 +365,10 @@ Returns `{"data": {"alive": true}}`, or 404 for an unknown run.
 
 **Crash detection**: a `running` run whose `last_heartbeat` is older than `PYROMETER_HEARTBEAT_TIMEOUT` seconds
 (default 300) becomes `crashed` (checked on every run read and by a 30 s background sweep that broadcasts
-`run_updated`). Runs created before heartbeats existed have no timestamp and are never auto-crashed.
+`run_updated`). Runs created before heartbeats existed have no timestamp and are never swept; instead a one-time
+migration at database open handles them: a `running` run with no heartbeat whose newest data (any table) is older than
+the timeout becomes `crashed` (`finished_at` = that last data time; no alert is sent), and one with newer data gets its
+last data time as `last_heartbeat` so the normal sweep takes over.
 
 ---
 
@@ -380,6 +386,12 @@ anything. The SDK sets it on every send so retries after a lost response are saf
 ### `POST /runs/{run_id}/metrics`
 
 Ingest a batch of metric entries.
+
+**Last write wins** per `(run, name, step)`: a point whose name and step already exist replaces the stored one
+(arrival order; the later duplicate inside one batch wins too), so resumed runs and replays never duplicate. The
+dedupe happens at insert (delete the batch's keys, then insert; skipped when nothing at or after the batch's first
+step exists), which keeps every read a plain scan. `inserted` is the number of points stored after collapsing.
+Rows duplicated by older versions stay duplicated.
 
 **Request Body**:
 
@@ -419,6 +431,13 @@ Ingest a batch of metric entries.
 ```
 
 **WebSocket Event**: `{"type": "metrics", "run_id": "..."}`
+
+---
+
+### `GET /runs/{run_id}/metrics/recent`
+
+The newest `limit` (default 100, 1-1000) values of every metric, oldest first: `{"data": {"train/loss": [..], ...}}`.
+Used by the SDK to seed its anomaly detectors when a run is resumed.
 
 ---
 
@@ -677,7 +696,7 @@ Get all system snapshots for a run.
 
 ### `POST /runs/{run_id}/param-stats`
 
-Ingest gradient and weight statistics.
+Ingest gradient and weight statistics. Last write wins per `(run, param_name, step)`, like metrics.
 
 **Request Body**:
 
@@ -1004,7 +1023,7 @@ Get all artifacts for a run.
 
 ### `POST /runs/{run_id}/media`
 
-Ingest media (images, histograms, figures).
+Ingest media (images, histograms, figures). A new item replaces an existing one with the same `(run, name, step)`.
 
 **Request Body**:
 
@@ -1088,9 +1107,12 @@ Get media names in insertion order.
 Ingest generation samples (`run.log_samples`). Idempotent via `X-Pyrometer-Batch`.
 
 ```json
-{"name": "eval_generations", "step": 100, "timestamp": 1700000000.0,
+{"name": "eval_generations", "step": 100, "timestamp": 1700000000.0, "mode": "replace",
  "samples": [{"prompt": "...", "completion": "...", "reward": 0.8}]}
 ```
+
+`mode` is `replace` (default: delete what is stored for `(run, name, step)` first, so re-logging a step does not
+duplicate) or `append` (add after the existing samples); anything else is a 422.
 
 Limits: 500 samples per call, 64 KB per sample (serialized JSON), 4 MB per call; violations return HTTP 413 with
 `error` set. Response: `{"data": {"inserted": 1}, "error": null}`.

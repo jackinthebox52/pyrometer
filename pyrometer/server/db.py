@@ -298,6 +298,55 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
+    _migrate_legacy_running(conn)
+
+
+# Every table with a ``timestamp`` column per run: the evidence a run was alive at some moment.
+_ACTIVITY_TABLES = (
+    "metrics", "system_snapshots", "events", "logs", "param_stats", "profile_events",
+    "artifacts", "media", "samples",
+)
+
+
+def _migrate_legacy_running(conn: duckdb.DuckDBPyConnection) -> None:
+    """One-time cleanup of runs that predate heartbeats and are still marked ``running``.
+
+    The server never auto-crashes a run without ``last_heartbeat``, so a run whose process died
+    before heartbeats existed stays ``running`` forever. Find the newest data of each such run
+    (any table); if that is older than the heartbeat timeout the run is marked ``crashed``
+    (``finished_at`` = last data seen). Runs with recent data keep ``running`` and get their last
+    data time as ``last_heartbeat``, so the normal sweep takes over from there. No alerts are sent
+    for these transitions (they are history, not news). Idempotent: afterwards no running run has a
+    NULL heartbeat.
+    """
+    ids = [r[0] for r in conn.execute(
+        "SELECT run_id FROM runs WHERE status = 'running' AND last_heartbeat IS NULL"
+    ).fetchall()]
+    if not ids:
+        return
+    created = dict(conn.execute("SELECT run_id, created_at FROM runs WHERE run_id IN (SELECT unnest(?::VARCHAR[]))", [ids]).fetchall())
+    last = {i: created.get(i) or 0.0 for i in ids}
+    for table in _ACTIVITY_TABLES:
+        try:
+            rows = conn.execute(
+                f"SELECT run_id, max(timestamp) FROM {table} WHERE run_id IN (SELECT unnest(?::VARCHAR[])) GROUP BY run_id",
+                [ids],
+            ).fetchall()
+        except Exception:  # table without the expected shape: ignore as evidence
+            continue
+        for run_id, ts in rows:
+            if ts is not None and ts > last[run_id]:
+                last[run_id] = ts
+    cutoff = time.time() - heartbeat_timeout()
+    for run_id, ts in last.items():
+        if ts < cutoff:
+            conn.execute(
+                "UPDATE runs SET status = 'crashed', finished_at = ?, last_heartbeat = ? WHERE run_id = ?",
+                [ts, ts, run_id],
+            )
+        else:
+            conn.execute("UPDATE runs SET last_heartbeat = ? WHERE run_id = ?", [ts, run_id])
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -646,24 +695,41 @@ def db_resume_run(run_id: str) -> dict:
     }
 
 
-def db_update_run(run_id: str, status: str | None, notes: str | None) -> None:
+# Hardware/environment columns the SDK may fill in after creating the run (see PATCH /runs/{id}).
+RUN_INFO_FIELDS = (
+    "git_hash", "git_dirty", "gpu_model", "gpu_memory_total", "cuda_version",
+    "pytorch_version", "python_version", "hostname",
+)
+
+
+def db_update_run(
+    run_id: str, status: str | None, notes: str | None, info: dict | None = None
+) -> None:
+    """Update status / notes / hardware info. Setting ``running`` also counts as a heartbeat, so a
+    run revived by a status PATCH (or a resume) is not immediately swept back to ``crashed``."""
     with _lock:
         conn = get_conn()
         if status is not None:
-            finished_at = (
-                time.time()
-                if status in TERMINAL_STATUSES
-                else None
-            )
-            conn.execute(
-                "UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?",
-                [status, finished_at, run_id],
-            )
+            now = time.time()
+            finished_at = now if status in TERMINAL_STATUSES else None
+            if status == "running":
+                conn.execute(
+                    "UPDATE runs SET status = ?, finished_at = NULL, last_heartbeat = ? WHERE run_id = ?",
+                    [status, now, run_id],
+                )
+            else:
+                conn.execute(
+                    "UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?",
+                    [status, finished_at, run_id],
+                )
         if notes is not None:
             conn.execute(
                 "UPDATE runs SET notes = ? WHERE run_id = ?",
                 [notes, run_id],
             )
+        for col, val in (info or {}).items():
+            if col in RUN_INFO_FIELDS and val is not None:  # whitelist: the column name is interpolated
+                conn.execute(f"UPDATE runs SET {col} = ? WHERE run_id = ?", [val, run_id])
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +753,61 @@ def db_release_batch(run_id: str, batch_id: str) -> None:
         get_conn().execute("DELETE FROM seen_batches WHERE run_id = ? AND batch_id = ?", [run_id, batch_id])
 
 
+def _delete_keys(conn, table: str, run_id: str, name_col: str, keys: list[tuple[str, int]]) -> None:
+    """Delete the rows of ``run_id`` whose (``name_col``, step) is in ``keys`` (``table``/``name_col`` are constants).
+
+    One statement for the whole batch. Skipped when the run has nothing at or after the batch's
+    first step, which is the normal case for a run that only moves forward (DuckDB answers that
+    from its per-row-group min/max statistics without reading the data).
+    """
+    if not keys:
+        return
+    first = min(k[1] for k in keys)
+    if conn.execute(f"SELECT 1 FROM {table} WHERE run_id = ? AND step >= ? LIMIT 1", [run_id, first]).fetchone() is None:
+        return
+    conn.execute(
+        f"DELETE FROM {table} WHERE run_id = ? AND ({name_col}, step) IN "
+        "(SELECT n, s FROM (SELECT unnest(?::VARCHAR[]) AS n, unnest(?::INTEGER[]) AS s))",
+        [run_id, [k[0] for k in keys], [k[1] for k in keys]],
+    )
+
+
 def db_insert_metrics(run_id: str, metrics: list[dict]) -> int:
-    rows = [(run_id, m["step"], m["timestamp"], m["name"], m["value"]) for m in metrics]
+    """Store metric points, last write wins per (run, name, step).
+
+    A resumed run that logs a step again (or a replayed spool) replaces the earlier value instead of
+    duplicating it: the batch is collapsed to its newest point per key (arrival order), existing rows
+    with the same keys are deleted, then the batch is inserted. Deduping on write keeps every read
+    (charts, summaries, alerts) a plain scan. Returns the number of points stored. Rows duplicated
+    before this existed are not repaired.
+    """
+    latest: dict[tuple[str, int], dict] = {}
+    for m in metrics:
+        latest[(m["name"], m["step"])] = m
+    rows = [(run_id, m["step"], m["timestamp"], m["name"], m["value"]) for m in latest.values()]
     with _lock:
         conn = get_conn()
+        _delete_keys(conn, "metrics", run_id, "name", list(latest))
         conn.executemany("INSERT INTO metrics VALUES (?, ?, ?, ?, ?)", rows)
     return len(rows)
+
+
+def db_recent_metrics(run_id: str, limit: int = 100) -> dict[str, list[float]]:
+    """The newest ``limit`` values of every metric (oldest first), for seeding SDK anomaly detectors on resume."""
+    with _lock:
+        rows = get_conn().execute(
+            """
+            SELECT name, value FROM (
+                SELECT name, step, value, row_number() OVER (PARTITION BY name ORDER BY step DESC) AS rn
+                FROM metrics WHERE run_id = ?
+            ) WHERE rn <= ? ORDER BY name, step
+            """,
+            [run_id, limit],
+        ).fetchall()
+    out: dict[str, list[float]] = {}
+    for name, value in rows:
+        out.setdefault(name, []).append(value)
+    return out
 
 
 def db_get_metrics(run_id: str, name: str | None = None) -> list[dict]:
@@ -890,8 +1005,11 @@ def db_insert_param_stats(run_id: str, stats: list[dict]) -> int:
         )
         for s in stats
     ]
+    # Last write wins per (run, param_name, step), like metrics.
+    rows = list({(r[3], r[1]): r for r in rows}.values())
     with _lock:
         conn = get_conn()
+        _delete_keys(conn, "param_stats", run_id, "param_name", [(r[3], r[1]) for r in rows])
         conn.executemany(
             "INSERT INTO param_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
         )
@@ -1051,8 +1169,10 @@ def db_get_artifacts(run_id: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def db_insert_media(run_id: str, item: dict) -> None:
+    """Store a media item; replaces an earlier one with the same (run, name, step)."""
     with _lock:
         conn = get_conn()
+        _delete_keys(conn, "media", run_id, "name", [(item["name"], item["step"])])
         conn.execute(
             "INSERT INTO media VALUES (?, ?, ?, ?, ?, ?)",
             [
@@ -1101,17 +1221,27 @@ def db_get_media_names(run_id: str) -> list[str]:
 # Samples (prompt / completion / reward dicts per step)
 # ---------------------------------------------------------------------------
 
-def db_insert_samples(run_id: str, name: str, step: int, timestamp: float, samples: list[dict]) -> int:
-    """Store sample dicts for (name, step), appending after any already stored. Returns rows inserted."""
+def db_insert_samples(
+    run_id: str, name: str, step: int, timestamp: float, samples: list[dict], mode: str = "replace"
+) -> int:
+    """Store sample dicts for (name, step). Returns rows inserted.
+
+    ``replace`` (default) first deletes what is stored for this (run, name, step), so a resumed run that
+    re-logs a step does not duplicate its samples; ``append`` adds after the existing ones.
+    """
     import json as _json
 
     rows = []
     with _lock:
         conn = get_conn()
-        start = conn.execute(
-            "SELECT count(*) FROM samples WHERE run_id = ? AND name = ? AND step = ?",
-            [run_id, name, step],
-        ).fetchone()[0]
+        if mode == "replace":
+            conn.execute("DELETE FROM samples WHERE run_id = ? AND name = ? AND step = ?", [run_id, name, step])
+            start = 0
+        else:
+            start = conn.execute(
+                "SELECT count(*) FROM samples WHERE run_id = ? AND name = ? AND step = ?",
+                [run_id, name, step],
+            ).fetchone()[0]
         for i, smp in enumerate(samples):
             r = smp.get("reward")
             reward = float(r) if isinstance(r, (int, float)) and not isinstance(r, bool) else None

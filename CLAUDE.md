@@ -70,7 +70,7 @@ keeping the chat log free of live credentials.
 - `run.log_image(name, image, step)` → None  (PIL Image, numpy array, or torch.Tensor CHW/HW/NCHW)
 - `run.log_histogram(name, data, step, num_bins=32)` → None  (tensor/array → bin edges + counts)
 - `run.log_figure(name, figure, step)` → None  (matplotlib Figure → PNG)
-- `run.log_samples(step, samples, name="samples")` → None  (list of dicts: prompt/completion/reward/...; Samples tab)
+- `run.log_samples(step, samples, name="samples", mode="replace")` → None  (list of dicts: prompt/completion/reward/...; Samples tab; `mode="replace"` overwrites the (name, step), `"append"` adds)
 - `run.finish()` → None
 - System monitor thread starts automatically on init, polls pynvml every 2s
 - stdout/stderr capture installed automatically on init, restored on finish()

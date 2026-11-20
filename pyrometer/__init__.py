@@ -8,7 +8,7 @@ import uuid
 
 import httpx
 
-from pyrometer._hardware import fingerprint
+from pyrometer._hardware import fingerprint_fast
 from pyrometer._run import Run
 from pyrometer._transport import spool_root
 
@@ -31,7 +31,9 @@ def init(
     """Initialize a new training run and register it with the Pyrometer server.
 
     Captures hardware info (GPU model, VRAM, CUDA/PyTorch versions) and git
-    state (commit hash, dirty flag) automatically. Starts a background system
+    state (commit hash, dirty flag) automatically. ``init`` does not wait for the slow part
+    (importing torch / initialising NVML to read CUDA and GPU details): that is filled in a moment later by a background
+    update of the run, unless your program has imported torch already. Starts a background system
     monitor thread that polls pynvml every 2 seconds.
 
     Args:
@@ -70,8 +72,10 @@ def init(
             marks the point on the charts. The run keeps its original name, hyperparams, tags
             and notes; if you pass different ``hyperparams`` or ``tags`` a warning is printed
             and the difference is stored in the event's metadata. Check ``run.resumed`` and
-            ``run.last_step`` to continue your step counter. Anomaly detectors start fresh
-            (with a new warmup). Offline mode: the run id is trusted, ``run.last_step`` is
+            ``run.last_step`` to continue your step counter. Metric anomaly detectors are seeded
+            from the run's last ~100 stored values per metric (best effort, in the background)
+            so their warmup is not repeated. Re-logged steps replace the earlier values (last
+            write wins per metric name and step). Offline mode: the run id is trusted, ``run.last_step`` is
             ``None``, and the resume happens when you ``pyrometer sync``. Resuming into a
             different ``project`` than the run's raises ``ValueError``.
 
@@ -124,7 +128,7 @@ def init(
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", run_id):
             raise ValueError(f"Invalid run id {run_id!r}: 8-64 characters of letters, digits, '_' or '-'")
 
-    hw = fingerprint()
+    hw = fingerprint_fast()  # cheap part; the torch-dependent fields follow via a background PATCH
     payload = {
         "run_id": run_id,
         "created_at": time.time(),
@@ -149,6 +153,7 @@ def init(
                   anomaly_detection=anomaly_detection)
         if resume_mode:
             run._mark_resumed(None, None, {"offline": True})
+        _probe_hardware(run, hw)
         return run
 
     degraded: str | None = None
@@ -176,6 +181,7 @@ def init(
                   create=payload)
         if resume_mode:
             run._mark_resumed(None, None, {"deferred": True})
+        _probe_hardware(run, hw)
         return run
 
     if resume_mode == "must" and resp.status_code == 404:
@@ -209,7 +215,13 @@ def init(
                 file=sys.stderr,
             )
         run._mark_resumed(run_data.get("last_step"), run_data.get("previous_status"), changes)
+    _probe_hardware(run, hw)
     return run
+
+
+def _probe_hardware(run: Run, hw: dict) -> None:
+    """Complete the fingerprint (torch/CUDA/GPU details) in the background."""
+    run._start_hardware_probe(hw)
 
 
 def _diff_config(stored: dict, hyperparams: dict | None, tags: list[str] | None) -> dict:

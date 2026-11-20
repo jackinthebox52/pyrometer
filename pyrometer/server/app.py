@@ -62,6 +62,8 @@ from pyrometer.server.db import (
     db_set_members,
     db_set_project_visibility,
     db_update_run,
+    RUN_INFO_FIELDS,
+    db_recent_metrics,
     db_heartbeat,
     db_get_run_status,
     db_mark_stale_runs,
@@ -261,6 +263,15 @@ class CreateRunRequest(BaseModel):
 class UpdateRunRequest(BaseModel):
     status: str | None = None
     notes: str | None = None
+    # Hardware/environment fields the SDK fills in after init (probing torch takes seconds).
+    git_hash: str | None = None
+    git_dirty: bool | None = None
+    gpu_model: str | None = None
+    gpu_memory_total: int | None = None
+    cuda_version: str | None = None
+    pytorch_version: str | None = None
+    python_version: str | None = None
+    hostname: str | None = None
 
 
 class MetricEntry(BaseModel):
@@ -359,6 +370,8 @@ class SamplesEntry(BaseModel):
     step: int
     timestamp: float
     samples: list[dict]
+    # "replace" (default) overwrites what is stored for (run, name, step); "append" adds to it.
+    mode: Literal["append", "replace"] = "replace"
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +890,7 @@ async def update_run(run_id: str, req: UpdateRunRequest):
         err(f"Invalid status: {req.status!r}")
     # An explicit status always wins, including a replayed one after the sweeper marked the run crashed.
     before = db_get_run_status(run_id)
-    db_update_run(run_id, req.status, req.notes)
+    db_update_run(run_id, req.status, req.notes, req.model_dump(include=set(RUN_INFO_FIELDS), exclude_none=True))
     if req.status is not None and req.status != before:  # a replayed PATCH must not alert twice
         alerts.notify_run_status(run_id, req.status)
     # Compute derived summary stats when a run reaches a terminal state.
@@ -917,6 +930,12 @@ async def ingest_metrics(run_id: str, metrics: list[MetricEntry], request: Reque
 @app.get("/runs/{run_id}/metrics")
 def get_metrics(run_id: str, name: str | None = None):
     return ok(db_get_metrics(run_id, name))
+
+
+@app.get("/runs/{run_id}/metrics/recent")
+def get_recent_metrics(run_id: str, limit: int = 100):
+    """Newest ``limit`` values per metric, oldest first: ``{name: [values]}`` (SDK detector seeding on resume)."""
+    return ok(db_recent_metrics(run_id, max(1, min(limit, 1000))))
 
 
 @app.get("/runs/{run_id}/metric-names")
@@ -1238,7 +1257,7 @@ def ingest_samples(run_id: str, item: SamplesEntry, request: Request):
         err(f"Samples payload is {total} bytes; the limit is {MAX_SAMPLES_CALL_BYTES}", 413)
     n = _ingest_once(
         run_id, request,
-        lambda: db_insert_samples(run_id, item.name[:200], item.step, item.timestamp, item.samples),
+        lambda: db_insert_samples(run_id, item.name[:200], item.step, item.timestamp, item.samples, item.mode),
     )
     if n is None:
         return _dup()

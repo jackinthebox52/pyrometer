@@ -83,9 +83,13 @@ for step in range(start, total_steps):
   applied: a warning is printed and the differences are stored in the event's `config_changes` metadata.
 - `run.server` is the server base URL the run reports to (handy for printing a link: `f"{run.server}/#/runs/{run.run_id}"`).
 - **Steps**: `run.resumed` is `True`; `run.last_step` is the highest step stored on the server (`None` if none).
-  Pyrometer never rewrites history: if you log steps that already exist you get duplicates, so continue from
-  `last_step + 1` (or restore from your checkpoint's step and expect overlap).
-- **Anomaly detectors** start fresh (new warmup); they do not remember the earlier run's statistics.
+  Continue from `last_step + 1`, or restore from an older checkpoint and re-log: the server keeps the **last value
+  written per `(run, metric name, step)`** (and per `(param, step)` for gradient stats, `(name, step)` for images and
+  histograms, and by default per `(name, step)` for `log_samples`), so re-logged steps replace the earlier values
+  instead of duplicating them. Rows duplicated by older versions are not repaired.
+- **Anomaly detectors** are seeded from the run's last ~100 stored values per metric (one small request in a
+  background thread, best effort: if it fails or the run is offline they start fresh) so the warmup is not repeated.
+  Gradient-norm history is not carried over.
 - **Offline**: no server is consulted, so the id is trusted and `run.last_step` is `None`. The resume (status back to
   `running`, or creation if unknown) is applied when you `pyrometer sync`; with an explicit id the server returns 404
   at sync if the run does not exist there.
@@ -332,7 +336,15 @@ run.finish()
 - The SDK sends a heartbeat (`POST /runs/{id}/heartbeat`) every 30 s, starting at init. Heartbeats go through the
   transport but are *ephemeral*: never retried, spooled or saved offline, since a stale heartbeat is meaningless.
 - If `finish()` is never called the run is closed at interpreter exit: `completed` on a normal exit, `failed`
-  after an uncaught exception, `killed` on Ctrl-C or SIGTERM (a SIGTERM handler is installed only if none is set).
+  after an uncaught exception or `sys.exit(<non-zero>)` (also `sys.exit("message")`), `killed` on Ctrl-C or SIGTERM.
+  `sys.exit(0)` / `sys.exit()` end `completed`. (The exit code is read by wrapping `sys.exit`; a hand-written
+  `raise SystemExit(1)` bypasses it and ends `completed`. A `sys.exit()` you catch is forgotten once the program logs
+  again.)
+- **SIGTERM** is chained, not replaced: our handler marks every live run `killed` and finishes it, then calls the
+  handler your application had installed (or, if there was none, lets the default action terminate the process). If
+  the application ignores SIGTERM (`SIG_IGN`) nothing is installed, and the run is not closed. Installing needs the main
+  thread; an `init()` from another thread skips it and a later `init()` from the main thread retries. A handler you
+  install *after* `init()` replaces ours; call `run.finish()` from it.
 - A hard kill (SIGKILL, power loss, lost machine) cannot report anything; the server marks the run `crashed`
   after 5 minutes without a heartbeat (`PYROMETER_HEARTBEAT_TIMEOUT`, seconds, on the server).
 - Patches the run status to `"completed"` in the database.
@@ -350,10 +362,14 @@ never blocks your training loop:
 - **Guarantee.** The append is a plain `write()` on the calling thread, so it survives the process being killed
   (SIGKILL, OOM): anything `log()`, `event()`, `log_image()` etc. already returned from is replayed by the next
   `pyrometer sync` (or the next `init` of the same run id). `log()` metrics that are still in the SDK's batching buffer
-  are covered too, by a small write-ahead file (`metrics.wal`). The journal is `fsync`'d by the sender thread at most
-  once per second and at `finish()`, so a power loss or kernel crash can lose up to about a second; an application
-  crash cannot. Not covered: stdout/stderr lines and gradient statistics that were still in their (few-second)
-  buffers, and data produced while the disk refuses writes (kept in memory only, with a warning).
+  are covered too, by small write-ahead files (`metrics.wal`, `logs.wal` for captured stdout/stderr lines,
+  `param_stats.wal` for `watch()` gradient statistics), recovered with the same batch ids. The journal is `fsync`'d by
+  the sender thread at most once per second and at `finish()`, so a power loss or kernel crash can lose up to about a
+  second; an application crash cannot. Not covered: data produced while the disk refuses writes (kept in memory only,
+  with a warning).
+- **Ownership lock.** The process that owns a run holds a lock on `owner.lock` in the run's spool directory (an
+  `flock`, with the pid inside; Windows falls back to a pid file). `pyrometer sync` skips a run whose owner is alive
+  ("skipped (run is still active ...)", not an error) and takes over a stale lock left by a dead process.
 - A failed delivery is retried with exponential backoff (1 s doubling to a 60 s cap), in order. The in-memory queue is
   only a cache of the journal (500 payloads); beyond that the sender reads the backlog from disk. When the connection
   returns the sender replays the backlog by itself, oldest first, run creation before any data and the final status
@@ -381,8 +397,8 @@ pyrometer sync <run_id>              # one run
 pyrometer sync /path/to/spool-dir    # a spool root or one run directory (e.g. copied from another machine)
 ```
 
-Safe to repeat: already-delivered payloads are skipped by batch id. Run it after the producing process has exited (it
-consumes the files a live run owns).
+Safe to repeat: already-delivered payloads are skipped by batch id. It refuses to touch a run whose process is still
+alive (see the ownership lock above), so `pyrometer sync` with no argument is safe to run while jobs are training.
 
 #### Always Call This
 
@@ -538,11 +554,14 @@ run.log_samples(step, [
 | `step` | `int` | Training step the samples belong to. |
 | `samples` | `list[dict]` | Arbitrary JSON-able dicts (non-JSON values are stringified). Columns are derived from the keys; a numeric `reward` is indexed for sorting and the LLM summary. |
 | `name` | `str` | Sample stream name (default `"samples"`). |
+| `mode` | `"replace" \| "append"` | `"replace"` (default): overwrite what is stored for `(name, step)`. `"append"`: add to it. A list larger than 200 is split into several requests; only the first replaces. |
 
 Limits: 64 KB per sample (the SDK truncates the longest string values to fit, with a warning; the server
 rejects bigger ones with HTTP 413), 200 samples per request (the SDK splits larger lists; the server
 accepts up to 500 / 4 MB per call). Log a few dozen samples every N steps, not every step. Calling it again for the
-same `(name, step)` appends. Delivered through the durable transport, so it survives outages and `pyrometer sync`.
+same `(name, step)` **replaces** the earlier samples (default `mode="replace"`), so a resumed run that re-logs a step does
+not duplicate; pass `mode="append"` to add to what is stored (several calls for one step). Delivered through the
+durable transport, so it survives outages and `pyrometer sync`.
 
 ---
 
@@ -684,12 +703,16 @@ Detection is deliberately conservative: ordinary noisy training should produce z
 - **Metrics** (`run.log`): NaN/Inf always fires (once per metric until it recovers). Spikes use a
   rolling median/MAD over the last 100 values, need a 50-sample warmup per metric, a robust z-score
   of at least 12, and a deviation larger than 1x the median. Cooldown is 500 steps per metric, max 5
-  spike events per metric per run.
+  spike events per metric per run. **Sparse metrics** (per-epoch or per-eval values that would never reach 50
+  samples) are checked from `sparse_min_samples` (8) samples on, with the z threshold and the relative-change floor
+  `sparse_strictness` (2.5) times stricter at that point, relaxing linearly to the normal values at 50 samples
+  (so at 8 samples a spike needs z >= 30 and a jump of more than 2.5x the median). Set `sparse_min_samples` to
+  `warmup` or more to turn this off.
 - **Gradients** (`run.watch`): NaN/Inf, norm > 1000x rolling median (20-sample warmup), and dead
   layers (200 consecutive samples under 1e-8). Max 20 gradient events per run.
 
 Configure with `pyrometer.init(anomaly_detection=...)`: `True` (default), `False` (off), or a dict
-overriding any of: `window`, `warmup`, `metric_z`, `metric_rel_change`, `cooldown_steps`,
+overriding any of: `window`, `warmup`, `metric_z`, `metric_rel_change`, `sparse_min_samples`, `sparse_strictness`, `cooldown_steps`,
 `max_events_per_key`, `grad_warmup`, `grad_spike_factor`, `grad_z`, `dead_threshold`, `dead_streak`,
 `max_grad_events`, `nan_inf`. Unknown keys raise `ValueError`.
 

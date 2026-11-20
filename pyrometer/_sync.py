@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 
 from pyrometer._transport import (
-    BATCH_HEADER, BLOB_DIR, DEAD_FILE, META_FILE, POS_FILE, QUEUE_FILE, Spool, _retryable,
+    BATCH_HEADER, BLOB_DIR, DEAD_FILE, META_FILE, POS_FILE, QUEUE_FILE, Spool, SpoolLock, _retryable,
     materialize_body, spool_root,
 )
 
@@ -25,6 +25,7 @@ class SyncResult:
     remaining: int = 0
     error: str | None = None
     complete: bool = False
+    skipped: bool = False  # run is still being written by a live process; nothing was touched
     messages: list[str] = field(default_factory=list)
 
 
@@ -44,9 +45,25 @@ def find_spools(target: str | None) -> list[Path]:
 
 def sync_run_dir(run_dir: Path, client: httpx.Client | None = None, server: str | None = None,
                  api_key: str | None = None) -> SyncResult:
-    """Replay one run's spool. Deletes the directory when everything was accepted."""
+    """Replay one run's spool. Deletes the directory when everything was accepted.
+
+    Refuses (``result.skipped``) while a live process owns the run (``owner.lock``): replaying
+    the journal under a running SDK would double-send and then delete files it still writes. A
+    lock left by a dead process is stale and simply taken over.
+    """
     run_id = run_dir.name
     result = SyncResult(run_id)
+    owner = SpoolLock.held_by_other(run_dir)
+    if owner is not None:
+        who = f"pid {owner}" if owner > 0 else "another process"
+        result.skipped = True
+        result.error = f"run is still active ({who}); not syncing it while it is running"
+        return result
+    lock = SpoolLock(run_dir)
+    if not lock.acquire():  # lost a race with a process that just started
+        result.skipped = True
+        result.error = "run is still active; not syncing it while it is running"
+        return result
     meta = Spool(run_id, run_dir.parent).read_meta()
     own_client = client is None
     if own_client:
@@ -60,6 +77,12 @@ def sync_run_dir(run_dir: Path, client: httpx.Client | None = None, server: str 
     finally:
         if own_client:
             client.close()
+        lock.release()
+        lock.path.unlink(missing_ok=True)
+        try:
+            run_dir.rmdir()  # a fully synced run leaves nothing but the lock file
+        except OSError:
+            pass
     return result
 
 

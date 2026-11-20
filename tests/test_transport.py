@@ -55,8 +55,9 @@ def test_duplicate_batch_is_ignored(server):
     assert again == {"inserted": 0, "duplicate": True}
     assert len(server.get(f"/runs/{rid}/metrics").json()["data"]) == 1
     # a different id, or no id, still inserts
-    server.post(f"/runs/{rid}/metrics", json=batch, headers={BATCH_HEADER: "other"})
-    server.post(f"/runs/{rid}/metrics", json=batch)
+    nxt = lambda step: [{"step": step, "timestamp": 1.0, "name": "loss", "value": 0.5}]  # noqa: E731
+    server.post(f"/runs/{rid}/metrics", json=nxt(2), headers={BATCH_HEADER: "other"})
+    server.post(f"/runs/{rid}/metrics", json=nxt(3))
     assert len(server.get(f"/runs/{rid}/metrics").json()["data"]) == 3
 
 
