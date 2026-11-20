@@ -9,6 +9,12 @@ import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def isolated_spool(tmp_path_factory, monkeypatch):
+    """Runs journal to disk now, so keep every test's spool out of the real home directory."""
+    monkeypatch.setenv("PYROMETER_SPOOL_DIR", str(tmp_path_factory.mktemp("spool")))
+
+
+@pytest.fixture(autouse=True)
 def fresh_db(tmp_path, monkeypatch):
     """A brand-new DuckDB file per test, so projects and runs never leak between tests."""
     from pyrometer.server import db

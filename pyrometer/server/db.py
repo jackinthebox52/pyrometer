@@ -1132,20 +1132,59 @@ def db_get_sample_steps(run_id: str) -> list[dict]:
     return [{"name": r[0], "step": r[1], "count": r[2], "timestamp": r[3]} for r in rows]
 
 
-def db_get_samples(run_id: str, name: str, step: int, limit: int = 50, offset: int = 0) -> dict:
-    """One page of samples at (name, step): ``{"total", "items"}`` with each item's dict parsed."""
+def _norm_ws(text: str) -> str:
+    """Trim and collapse runs of whitespace (prompt matching ignores formatting differences)."""
+    return " ".join(text.split())
+
+
+def db_get_samples(
+    run_id: str,
+    name: str,
+    step: int,
+    limit: int = 50,
+    offset: int = 0,
+    sort: str | None = None,
+    desc: bool = False,
+    q: str | None = None,
+    prompt: str | None = None,
+) -> dict:
+    """One page of samples at (name, step): ``{"total", "items"}`` with each item's dict parsed.
+
+    Filtering and sorting run over the whole step, not just the page. ``q`` is a case-insensitive
+    substring match over every top-level value; ``prompt`` matches the ``prompt`` field exactly after
+    whitespace normalization; ``sort`` is a top-level key (numeric values first, ordered numerically,
+    then the rest as text; samples without the key last). The key is only ever bound as a JSON path
+    parameter, never interpolated into SQL (``desc`` is a bool mapped to a keyword).
+    """
     import json as _json
 
+    where = "run_id = ? AND name = ? AND step = ?"
+    params: list = [run_id, name, step]
+    if q:
+        where += (" AND list_bool_or(list_transform(json_extract_string(data, '$.*'), "
+                  "lambda x: contains(lower(x), lower(?))))")
+        params.append(q)
+    if prompt is not None:
+        where += " AND trim(regexp_replace(json_extract_string(data, '$.prompt'), '\\s+', ' ', 'g')) = ?"
+        params.append(_norm_ws(prompt))
+    order = "idx"
+    order_params: list = []
+    if sort:
+        path = '$."' + sort.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        direction = "DESC" if desc else "ASC"
+        order = (
+            f"(TRY_CAST(json_extract_string(data, ?) AS DOUBLE) IS NULL), "
+            f"TRY_CAST(json_extract_string(data, ?) AS DOUBLE) {direction}, "
+            f"(json_extract_string(data, ?) IS NULL), "
+            f"json_extract_string(data, ?) {direction}, idx"
+        )
+        order_params = [path] * 4
     with _lock:
         conn = get_conn()
-        total = conn.execute(
-            "SELECT count(*) FROM samples WHERE run_id = ? AND name = ? AND step = ?",
-            [run_id, name, step],
-        ).fetchone()[0]
+        total = conn.execute(f"SELECT count(*) FROM samples WHERE {where}", params).fetchone()[0]
         rows = conn.execute(
-            "SELECT idx, data FROM samples WHERE run_id = ? AND name = ? AND step = ? "
-            "ORDER BY idx LIMIT ? OFFSET ?",
-            [run_id, name, step, limit, offset],
+            f"SELECT idx, data FROM samples WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+            [*params, *order_params, limit, offset],
         ).fetchall()
     return {"total": total, "items": [{"idx": r[0], "sample": _json.loads(r[1])} for r in rows]}
 

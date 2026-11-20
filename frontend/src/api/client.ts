@@ -94,10 +94,23 @@ export const api = {
       `/runs/${id}/media${name ? `?name=${encodeURIComponent(name)}` : ''}`,
     ),
   getSampleSteps: (id: string) => apiFetch<SampleStep[]>(`/runs/${id}/samples/steps`),
-  getSamples: (id: string, name: string, step: number, offset = 0, limit = 50) =>
-    apiFetch<SamplesPage>(
-      `/runs/${id}/samples?name=${encodeURIComponent(name)}&step=${step}&offset=${offset}&limit=${limit}`,
-    ),
+  getSamples: (
+    id: string,
+    name: string,
+    step: number,
+    offset = 0,
+    limit = 50,
+    query: { sort?: string | null; desc?: boolean; q?: string; prompt?: string | null } = {},
+  ) => {
+    const p = new URLSearchParams({ name, step: String(step), offset: String(offset), limit: String(limit) })
+    if (query.sort) {
+      p.set('sort', query.sort)
+      p.set('order', query.desc ? 'desc' : 'asc')
+    }
+    if (query.q) p.set('q', query.q)
+    if (query.prompt != null) p.set('prompt', query.prompt)
+    return apiFetch<SamplesPage>(`/runs/${id}/samples?${p.toString()}`)
+  },
   getRunSummary: (id: string) => apiFetch<RunSummary>(`/runs/${id}/summary`),
   getLlmSummary: (id: string) => fetch(`/runs/${id}/llm-summary`).then((r) => {
     if (!r.ok) throw new Error(r.statusText)

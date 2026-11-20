@@ -11,8 +11,8 @@ import {
 } from 'recharts'
 import type { Metric, RunEvent } from '../api/types.ts'
 import { formatMetricValue } from '../utils/format.ts'
-import { MAX_ALPHA, processSeries, useChartOptions } from '../utils/chartOptions.ts'
-import { axisLabel, axisMetricName, eventX, formatXLabel, formatXTick, resolveXs } from '../utils/xAxis.ts'
+import { MAX_ALPHA, formatLogTick, logTicks, positiveRange, processSeries, useChartOptions } from '../utils/chartOptions.ts'
+import { axisLabel, axisMetricName, eventX, firstTimestamp, formatXLabel, formatXTick, resolveXs } from '../utils/xAxis.ts'
 import type { XSource } from '../utils/xAxis.ts'
 import ChartControls from './ChartControls.tsx'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
@@ -72,6 +72,11 @@ function Chart({
     })
   }, [events])
   const tickFmt = useMemo(() => formatXTick(axis, span), [axis, span])
+  const log = useMemo(() => {
+    if (!logY) return null
+    const r = positiveRange(data as unknown as Record<string, unknown>[])
+    return r ? logTicks(r[0], r[1]) : null
+  }, [data, logY])
 
   return (
     <ResponsiveContainer width="100%" height={height}>
@@ -91,12 +96,16 @@ function Chart({
           tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
           tickLine={false}
           axisLine={false}
-          tickFormatter={formatMetricValue}
-          width={35}
+          tickFormatter={logY ? formatLogTick : formatMetricValue}
+          width={logY ? 42 : 35}
           scale={logY ? 'log' : 'auto'}
-          domain={logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
+          domain={log ? log.domain : logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
+          ticks={log?.ticks}
           allowDataOverflow={logY}
         />
+        {log?.minor.map((y) => (
+          <ReferenceLine key={`m${y}`} y={y} stroke="#1e2128" strokeOpacity={0.6} strokeWidth={1} />
+        ))}
         <Tooltip
           contentStyle={{
             backgroundColor: '#1a1d24',
@@ -162,7 +171,7 @@ export default function MetricChart({
   expanded = false,
   source,
 }: Props) {
-  const [opts, setOpts] = useChartOptions(`metric:${name}`)
+  const [opts, setOpts, resetOpts, overridden] = useChartOptions(`metric:${name}`)
   const { alpha } = opts
   const [isExpanded, setIsExpanded] = useState(false)
   const [showLocalEvents, setShowLocalEvents] = useState(true)
@@ -195,13 +204,13 @@ export default function MetricChart({
     const markers: { x: number; severity: string }[] = []
     let unmapped = 0
     for (const ev of showLocalEvents ? (events ?? []) : []) {
-      if (ev.step == null && axis !== 'time' && axis !== 'rel') continue // step-less events never map to step axes
-      const x = eventX(ev, axis, src)
-      if (x == null) unmapped++
-      else markers.push({ x, severity: ev.severity })
+      const x = eventX(ev, axis, src, firstTimestamp(data))
+      if (x == null) {
+        if (ev.step != null) unmapped++ // step-less events simply have no place on step/metric axes
+      } else markers.push({ x, severity: ev.severity })
     }
     return { markers, unmapped }
-  }, [events, showLocalEvents, axis, src])
+  }, [events, showLocalEvents, axis, src, data])
   const last = useMemo(() => {
     for (let i = rows.length - 1; i >= 0; i--) if (rows[i].value != null) return rows[i].value
     return null
@@ -262,6 +271,8 @@ export default function MetricChart({
             onChange={setOpts}
             dropped={dropped}
             axisMetrics={source ? axisNames : undefined}
+            overridden={overridden}
+            onReset={resetOpts}
           />
         )}
         {(axisMissing || skipped > 0 || nonMonotonic || unmapped > 0) && (

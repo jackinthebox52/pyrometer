@@ -35,6 +35,13 @@ export function runHasAxis(src: XSource, axis: XAxis): boolean {
   return name == null || (src.byName?.[name]?.length ?? 0) > 0
 }
 
+/** Timestamp of the lowest-step point: the shared fallback for "run start" when `src.startTime` is unknown. */
+export function firstTimestamp(data: Metric[]): number | undefined {
+  let best: Metric | undefined
+  for (const d of data) if (best === undefined || d.step < best.step) best = d
+  return best?.timestamp
+}
+
 /**
  * Resolve each point's x for the chosen axis, sorted by x (stable). For metric axes the axis metric is
  * joined on step; points without an axis value at that step are skipped (counted in `skipped`).
@@ -58,7 +65,7 @@ export function resolveXs(
       else points.push({ x, value: d.value, step: d.step })
     }
   } else if (axis === 'time' || axis === 'rel') {
-    const start = src.startTime ?? byStep[0]?.timestamp ?? 0
+    const start = src.startTime ?? firstTimestamp(data) ?? 0
     for (const d of byStep) {
       points.push({ x: axis === 'time' ? d.timestamp : d.timestamp - start, value: d.value, step: d.step })
     }
@@ -78,12 +85,15 @@ export function resolveXs(
 
 /**
  * Map an event (by step / timestamp) to an x position, or null if it cannot be placed.
- * Metric axes use the axis value at the latest logged step <= the event's step.
+ * Time axes ('time', 'rel') place any event by its timestamp, step-less ones included. 'rel' measures from
+ * `src.startTime`, falling back to `fallbackStart` (the chart's first point timestamp, as resolveXs does).
+ * Step axes need the event's step; metric axes use the axis value at the latest logged step <= the event's step.
  */
 export function eventX(
   ev: { step: number | null; timestamp: number },
   axis: XAxis,
   src: XSource,
+  fallbackStart?: number,
 ): number | null {
   const metric = axisMetricName(axis)
   if (metric != null) {
@@ -102,7 +112,10 @@ export function eventX(
     return found >= 0 ? arr[found].value : null
   }
   if (axis === 'time') return ev.timestamp
-  if (axis === 'rel') return src.startTime != null ? ev.timestamp - src.startTime : null
+  if (axis === 'rel') {
+    const start = src.startTime ?? fallbackStart
+    return start != null ? ev.timestamp - start : null
+  }
   return ev.step
 }
 

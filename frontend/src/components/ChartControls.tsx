@@ -8,6 +8,9 @@ interface Props {
   dropped?: number
   /** Metric names usable as x-axis. When undefined, the x-axis selector is hidden. */
   axisMetrics?: string[]
+  /** True when this chart overrides the global defaults; shows a reset button. */
+  overridden?: boolean
+  onReset?: () => void
 }
 
 const pill = (active: boolean): React.CSSProperties => ({
@@ -23,7 +26,7 @@ const pill = (active: boolean): React.CSSProperties => ({
 })
 
 /** Per-chart toggles: log y-scale, EMA smoothing slider, normalization. */
-export default function ChartControls({ opts, onChange, dropped = 0, axisMetrics }: Props) {
+export default function ChartControls({ opts, onChange, dropped = 0, axisMetrics, overridden = false, onReset }: Props) {
   return (
     <div className="flex flex-wrap items-center gap-2 mb-2">
       {axisMetrics && (
@@ -80,6 +83,15 @@ export default function ChartControls({ opts, onChange, dropped = 0, axisMetrics
         />
         {opts.alpha.toFixed(2)}
       </label>
+      {overridden && onReset && (
+        <button
+          style={pill(false)}
+          onClick={onReset}
+          title="Reset this chart to the global chart defaults"
+        >
+          reset
+        </button>
+      )}
       {opts.logY && dropped > 0 && (
         <span className="text-xs font-mono" style={{ color: '#f59e0b', fontSize: 10 }}>
           {dropped} value{dropped === 1 ? '' : 's'} ≤ 0 hidden

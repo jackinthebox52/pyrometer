@@ -323,7 +323,7 @@ run.finish()
 #### Behavior
 
 - Flushes all buffered metrics, logs, and parameter statistics to the sender and makes a short (10 s) final delivery attempt.
-- Anything the server still did not accept is written to the spool and one warning names the directory (see below).
+- Anything the server still did not accept stays in the run's spool directory and one warning names it (see below).
 - Restores original stdout/stderr (if console capture was enabled).
 - Removes gradient monitoring hooks.
 
@@ -344,14 +344,33 @@ Nothing the SDK sends is dropped when the server is unreachable. All payloads (m
 media, profile data, system snapshots, parameter stats, the final status) go through one background sender that
 never blocks your training loop:
 
-- A failed delivery is retried with exponential backoff (1 s doubling to a 60 s cap), in order.
-- The in-memory queue is capped (500 payloads). Beyond that, and for anything still undelivered at `finish()`,
-  payloads are appended as JSONL to `~/.pyrometer/spool/<run_id>/queue.jsonl` (override the root with
-  `PYROMETER_SPOOL_DIR`). The API key is never written to the spool.
-- Each payload carries a client batch id (`X-Pyrometer-Batch`). The server ignores ids it has already seen for a
-  run, so a retry after a lost response never double-inserts.
+- **Write-ahead journal.** Every payload is appended to `~/.pyrometer/spool/<run_id>/queue.jsonl` (override the root
+  with `PYROMETER_SPOOL_DIR`) *before* it is sent, and acknowledged (the journal is truncated once the sender has
+  caught up) after the server accepted it. The API key is never written to the spool.
+- **Guarantee.** The append is a plain `write()` on the calling thread, so it survives the process being killed
+  (SIGKILL, OOM): anything `log()`, `event()`, `log_image()` etc. already returned from is replayed by the next
+  `pyrometer sync` (or the next `init` of the same run id). `log()` metrics that are still in the SDK's batching buffer
+  are covered too, by a small write-ahead file (`metrics.wal`). The journal is `fsync`'d by the sender thread at most
+  once per second and at `finish()`, so a power loss or kernel crash can lose up to about a second; an application
+  crash cannot. Not covered: stdout/stderr lines and gradient statistics that were still in their (few-second)
+  buffers, and data produced while the disk refuses writes (kept in memory only, with a warning).
+- A failed delivery is retried with exponential backoff (1 s doubling to a 60 s cap), in order. The in-memory queue is
+  only a cache of the journal (500 payloads); beyond that the sender reads the backlog from disk. When the connection
+  returns the sender replays the backlog by itself, oldest first, run creation before any data and the final status
+  last; no `pyrometer sync` is needed while the process is alive.
+- **Server down at `init()`**: connection errors, timeouts (3 s connect, 8 s overall) and 5xx/429 do not raise. One
+  warning is printed, the run is created locally and the sender creates it on the server (idempotent, `resume` honored)
+  as soon as it answers, then drains. `run.last_step` is `None` for a resume deferred this way. 401/403 and
+  validation errors (4xx) still raise immediately.
+- **Media** (images, figures, histograms over 32 KB) are written as separate files in `blobs/` and referenced from the
+  JSONL; they are base64-encoded only on the wire.
+- **Poison payloads.** If one payload keeps failing (6 attempts, 4xx immediately) while `GET /health` answers, it is
+  moved to `dead.jsonl` in the spool, one warning is printed, and newer data keeps flowing. If the server is
+  down (health fails) nothing is dead-lettered. `pyrometer sync` retries dead letters too.
+- Each payload carries a client batch id (`X-Pyrometer-Batch`) that stays the same in the journal, dead-letter file and
+  every replay. The server ignores ids it has already seen for a run, so a re-send never double-inserts.
 - `pyrometer.init(..., offline=True)` (or `PYROMETER_MODE=offline`) does no networking at all: run creation and every
-  payload go to the spool.
+  payload stay in the journal.
 
 Upload spooled data with the CLI (needs `PYROMETER_API_KEY`; the server comes from `--server`, `$PYROMETER_SERVER`, or
 the URL recorded in the spool). It creates the run if needed, replays the payloads, and deletes them on success:
@@ -362,8 +381,8 @@ pyrometer sync <run_id>              # one run
 pyrometer sync /path/to/spool-dir    # a spool root or one run directory (e.g. copied from another machine)
 ```
 
-Safe to repeat: already-delivered payloads are skipped by batch id. If the server is down at `init()` (not offline
-mode) `init` still raises; use offline mode for that.
+Safe to repeat: already-delivered payloads are skipped by batch id. Run it after the producing process has exited (it
+consumes the files a live run owns).
 
 #### Always Call This
 

@@ -96,7 +96,7 @@ def test_ephemeral_items_are_dropped_not_spooled(tmp_path):
     t.submit("POST", "/runs/r1/heartbeat", None, ephemeral=True)  # coalesced
     t.close(timeout=1)
     assert not (tmp_path / "r1" / QUEUE_FILE).exists()
-    assert t.spilled == 0
+    assert t.dead == 0 and t.overflowed == 0
 
 
 def test_ephemeral_items_not_saved_offline(tmp_path):

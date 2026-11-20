@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client.ts'
 import type { Metric, ProfileEvent, Run } from '../api/types.ts'
+import ChartDefaults from '../components/ChartDefaults.tsx'
 import CompareChart from '../components/CompareChart.tsx'
 import CompareOperatorBreakdown from '../components/CompareOperatorBreakdown.tsx'
 import HyperparamDiff from '../components/HyperparamDiff.tsx'
@@ -9,6 +10,7 @@ import KernelTimeline from '../components/KernelTimeline.tsx'
 import SamplesViewer from '../components/SamplesViewer.tsx'
 import StatusBadge from '../components/StatusBadge.tsx'
 import type { XSource } from '../utils/xAxis.ts'
+import { useCompareState } from '../utils/compareState.ts'
 import { groupRuns, parseIgnoreKeys } from '../utils/grouping.ts'
 import type { BandKind, GroupMode } from '../utils/grouping.ts'
 import { duration, timeAgo } from '../utils/format.ts'
@@ -43,11 +45,8 @@ export default function CompareView() {
   const [runs, setRuns] = useState<Run[]>([])
   const [metricsMap, setMetricsMap] = useState<Map<string, Metric[]>>(new Map())
   const [profileMap, setProfileMap] = useState<Map<string, ProfileEvent[]>>(new Map())
-  const [smoothing, setSmoothing] = useState(0)
   const [globalHiddenIds, setGlobalHiddenIds] = useState<Set<string>>(new Set())
-  const [groupMode, setGroupMode] = useState<GroupMode>('none')
-  const [ignoreText, setIgnoreText] = useState('seed')
-  const [band, setBand] = useState<BandKind>('std')
+  const [{ groupMode, ignoreText, band }, setCompareState] = useCompareState()
   const [profilerOpen, setProfilerOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -258,7 +257,7 @@ export default function CompareView() {
           <span>Group</span>
           <select
             value={groupMode}
-            onChange={(e) => changeGrouping(() => setGroupMode(e.target.value as GroupMode))}
+            onChange={(e) => changeGrouping(() => setCompareState({ groupMode: e.target.value as GroupMode }))}
             style={{ backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4 }}
           >
             <option value="none">none</option>
@@ -270,7 +269,7 @@ export default function CompareView() {
               <span>ignore</span>
               <input
                 value={ignoreText}
-                onChange={(e) => changeGrouping(() => setIgnoreText(e.target.value))}
+                onChange={(e) => changeGrouping(() => setCompareState({ ignoreText: e.target.value }))}
                 placeholder="seed"
                 title="Comma-separated hyperparam keys to ignore when matching runs"
                 style={{ width: 90, backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4, padding: '0 4px' }}
@@ -280,7 +279,7 @@ export default function CompareView() {
           {grouped && (
             <select
               value={band}
-              onChange={(e) => setBand(e.target.value as BandKind)}
+              onChange={(e) => setCompareState({ band: e.target.value as BandKind })}
               title="Band around the group mean"
               style={{ backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4 }}
             >
@@ -290,30 +289,7 @@ export default function CompareView() {
           )}
         </div>
 
-        {/* Smoothing slider */}
-        <div
-          className="flex items-center gap-3 px-3 py-2 rounded"
-          style={{ backgroundColor: '#111318', border: '1px solid #252830' }}
-        >
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
-            Smooth
-          </span>
-          <input
-            type="range"
-            min={0}
-            max={0.95}
-            step={0.05}
-            value={smoothing}
-            onChange={(e) => setSmoothing(parseFloat(e.target.value))}
-            style={{ width: 96, accentColor: '#f59e0b', cursor: 'pointer' }}
-          />
-          <span
-            className="text-xs font-mono w-8 text-right"
-            style={{ color: smoothing > 0 ? '#f59e0b' : '#4a4e60' }}
-          >
-            {smoothing.toFixed(2)}
-          </span>
-        </div>
+        <ChartDefaults axisMetrics={allMetricNames} />
         </div>
       </div>
 
@@ -336,7 +312,6 @@ export default function CompareView() {
                     metrics: sources.get(run.run_id)?.byName?.[name] ?? [],
                     source: sources.get(run.run_id),
                   }))}
-                  smoothing={smoothing}
                   globalHiddenIds={globalHiddenIds}
                   band={band}
                   groups={

@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import threading
+import uuid
 import time
 from contextlib import contextmanager
 
@@ -67,6 +68,7 @@ class _TeeWriter:
 
 
 HEARTBEAT_INTERVAL = 30.0
+_INLINE_MEDIA_MAX = 32 * 1024  # larger string media (histograms) go to a blob file
 
 # Runs that have not finished yet. A single excepthook / SIGTERM handler (installed on first use)
 # decides how they end: uncaught exception -> failed, Ctrl-C or SIGTERM -> killed.
@@ -116,9 +118,10 @@ class Run:
     Manages three background threads:
     - A flush thread that hands buffered metrics to the sender every 5 seconds
       (or immediately when the buffer reaches 100 entries).
-    - A sender thread that delivers payloads in order, retrying failures with
-      exponential backoff and spilling to a disk spool (``~/.pyrometer/spool``)
-      when the server stays unreachable. Replay it with ``pyrometer sync``.
+    - A sender thread that delivers payloads in order from a write-ahead journal
+      (``~/.pyrometer/spool/<run_id>/``), retrying failures with exponential backoff
+      and replaying automatically when the server comes back. Anything still
+      undelivered at exit can be uploaded with ``pyrometer sync``.
     - A system monitor thread that polls pynvml every 2 seconds and POSTs
       GPU utilization, memory, temperature, and power draw to the server.
     """
@@ -130,6 +133,7 @@ class Run:
         api_key: str | None = None,
         offline: bool = False,
         anomaly_detection: bool | dict | None = True,
+        create: dict | None = None,
     ) -> None:
         self.run_id = run_id
         self._server = server_url
@@ -147,11 +151,13 @@ class Run:
             self._client,
             self._spool,
             offline=offline,
-            meta_defaults={"server": server_url, "created": True, "run_id": run_id},
+            meta_defaults={"server": server_url, "run_id": run_id},
+            create=create,
         )
         self._stop = threading.Event()
 
         self._buffer: list[dict] = []
+        self._wal_batch = ""  # batch id of the metrics currently buffered (and in the write-ahead log)
         # Re-entrant: the SIGTERM handler runs finish() on the main thread, possibly while that very
         # thread is inside log()/print() holding one of these locks; a plain Lock would deadlock it.
         self._lock = threading.RLock()
@@ -218,13 +224,15 @@ class Run:
         self._step_known = True
         ts = time.time()
         with self._lock:
-            for name, value in metrics.items():
-                self._buffer.append({
-                    "step": step,
-                    "timestamp": ts,
-                    "name": name,
-                    "value": float(value),
-                })
+            entries = [
+                {"step": step, "timestamp": ts, "name": name, "value": float(value)}
+                for name, value in metrics.items()
+            ]
+            if entries:
+                if not self._buffer:
+                    self._wal_batch = uuid.uuid4().hex
+                self._buffer.extend(entries)
+                self._transport.wal_append(self._wal_batch, entries)
             if len(self._buffer) >= 100:
                 self._flush_locked()
         # Anomaly checks run outside the buffer lock; HTTP calls happen in spawned threads.
@@ -446,7 +454,7 @@ class Run:
         """Log an image at a given training step.
 
         Accepts PIL Images, NumPy arrays, or PyTorch tensors. Converts to PNG
-        and ships to the server as a base64-encoded string. Float tensors are
+        and is journaled to disk as a binary file and shipped to the server base64-encoded. Float tensors are
         clamped to [0, 1] and scaled to uint8 automatically.
 
         Args:
@@ -466,7 +474,7 @@ class Run:
         if self._finished:
             return
         try:
-            data = self._image_to_b64(image)
+            data = self._image_to_png(image)
         except Exception:
             log.exception("Failed to encode image '%s'", name)
             return
@@ -510,7 +518,7 @@ class Run:
     def log_figure(self, name: str, figure, step: int | None = None) -> None:
         """Log a matplotlib figure at a given training step.
 
-        Saves the figure to a PNG in memory, base64-encodes it, and ships it
+        Renders the figure to a PNG, journals it as a binary file, and ships it
         to the server. Useful for confusion matrices, precision-recall curves,
         or any custom matplotlib visualisation you want tracked over training.
 
@@ -530,7 +538,7 @@ class Run:
         if self._finished:
             return
         try:
-            data = self._figure_to_b64(figure)
+            data = self._figure_to_png(figure)
         except Exception:
             log.exception("Failed to encode figure '%s'", name)
             return
@@ -639,7 +647,7 @@ class Run:
         self._restore_stdout_capture()
         self._remove_watch_hooks()
         self._transport.submit("PATCH", f"/runs/{self.run_id}", {"status": status})
-        self._transport.close(timeout=10.0)
+        left = self._transport.close(timeout=10.0)
         if self._client is not None:
             self._client.close()
         if self._offline:
@@ -648,9 +656,10 @@ class Run:
                 "Upload it with: pyrometer sync",
                 file=sys.stderr,
             )
-        elif self._transport.spilled:
+        elif left or self._transport.dead:
+            extra = f" ({self._transport.dead} dead-lettered after repeated server errors)" if self._transport.dead else ""
             print(
-                f"pyrometer: the server did not accept {self._transport.spilled} payloads; "
+                f"pyrometer: {left} payloads were not delivered{extra}; "
                 f"saved in {self._spool.dir}. Upload them with: pyrometer sync",
                 file=sys.stderr,
             )
@@ -866,21 +875,21 @@ class Run:
             return
         batch = self._buffer[:]
         self._buffer.clear()
-        self._transport.submit("POST", f"/runs/{self.run_id}/metrics", batch)
+        self._transport.submit("POST", f"/runs/{self.run_id}/metrics", batch, item_id=self._wal_batch)
+        self._transport.wal_clear()
 
     # ------------------------------------------------------------------
     # Media helpers
     # ------------------------------------------------------------------
 
-    def _image_to_b64(self, image) -> str:
-        """Convert an image-like object to a base64-encoded PNG string."""
-        import base64
+    def _image_to_png(self, image) -> bytes:
+        """Convert an image-like object to PNG bytes."""
         import io
 
         pil_img = self._to_pil(image)
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("ascii")
+        return buf.getvalue()
 
     def _to_pil(self, image):
         """Normalise various image formats to a PIL Image."""
@@ -925,15 +934,13 @@ class Run:
                 arr = arr.clip(0, 255).astype(_np.uint8)
         return _PILImage.fromarray(arr)
 
-    def _figure_to_b64(self, figure) -> str:
-        """Render a matplotlib figure to a base64-encoded PNG string."""
-        import base64
+    def _figure_to_png(self, figure) -> bytes:
+        """Render a matplotlib figure to PNG bytes."""
         import io
 
         buf = io.BytesIO()
         figure.savefig(buf, format="png", bbox_inches="tight", dpi=96)
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode("ascii")
+        return buf.getvalue()
 
     def _compute_histogram(self, data, num_bins: int) -> dict:
         """Compute a histogram dict with keys 'edges' and 'counts'."""
@@ -955,23 +962,34 @@ class Run:
         counts, edges = _np.histogram(arr, bins=num_bins)
         return {"edges": edges.tolist(), "counts": counts.tolist()}
 
-    def _post_media(self, name: str, media_type: str, data: str, step: int | None) -> None:
-        """Queue a media item for delivery."""
+    def _post_media(self, name: str, media_type: str, data: str | bytes, step: int | None) -> None:
+        """Queue a media item for delivery.
+
+        Raw bytes (images, figures) and large strings are journaled/spooled as separate binary
+        files referenced from the JSONL; base64 happens only on the wire.
+        """
         if self._finished:
             return
         resolved_step = step if step is not None else self._last_step
-
+        body = {
+            "step": resolved_step,
+            "timestamp": time.time(),
+            "name": name,
+            "media_type": media_type,
+        }
+        blob: tuple[str, bytes, str] | None = None
+        if isinstance(data, bytes):
+            blob = ("data", data, "b64")
+        elif len(data) > _INLINE_MEDIA_MAX:
+            blob = ("data", data.encode("utf-8"), "utf8")
+        else:
+            body["data"] = data
         self._transport.submit(
             "POST",
             f"/runs/{self.run_id}/media",
-            {
-                "step": resolved_step,
-                "timestamp": time.time(),
-                "name": name,
-                "media_type": media_type,
-                "data": data,
-            },
+            body,
             timeout=30,  # images can be large; use a longer timeout
+            blob=blob,
         )
 
     def _flush_loop(self) -> None:

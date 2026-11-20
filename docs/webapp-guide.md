@@ -248,7 +248,8 @@ Line charts for all logged metrics (e.g., `train/loss`, `val/accuracy`, `lr`).
 
 Every metric chart (run detail, compare view, and the expanded modal) has a control row:
 
-- **log**: logarithmic y-axis. Values <= 0 cannot be shown and are hidden; the chart notes how many.
+- **log**: logarithmic y-axis with decade ticks (1e-3, 0.01, 0.1, 1, ...; faint minor lines at 2..9 up to six
+  decades; 1/2/5 ticks on short ranges). Values <= 0 cannot be shown and are hidden; the chart notes how many.
 - **raw / ÷ first / % of best**: normalization. `÷ first` divides by the first value (1.0 = start), which makes
   runs with different scales comparable. `% of best` expresses values as a percentage of the best value seen
   (minimum for metrics whose name contains loss/err/perplexity/latency/time/grad_norm, otherwise maximum).
@@ -264,8 +265,13 @@ Every metric chart (run detail, compare view, and the expanded modal) has a cont
   that cannot be placed are hidden with a note. In the compare view a metric axis is resolved per run (each run's
   own values); runs that never logged the metric are excluded from that chart with a note listing them.
 
-Choices are remembered per metric name (separately for run detail and compare view) in the browser's localStorage.
-In the compare view the global EMA slider still sets smoothing for all charts; a per-chart change afterwards wins.
+**Chart defaults.** The "Chart defaults" bar (metrics header on the run page, and the compare header) sets log, normalization,
+x-axis and smoothing once for every chart, shared by the run page and the compare view. A chart you change individually
+keeps its own override (remembered per metric name, separately for run detail and compare view, in the browser's
+localStorage); its **reset** button drops the overrides so it follows the defaults again, and setting a chart back to the
+current default value also drops the override. Per-chart storage from older versions is migrated automatically (values
+equal to the built-in defaults are treated as "follow the default"). Step-less events (no `step`) appear on the wall-time
+and elapsed axes, placed by timestamp.
 
 #### Event Markers
 
@@ -503,9 +509,10 @@ Lists files tracked via `run.log_artifact()`:
 
 Shown on the run detail page (and in the compare view) when `run.log_samples()` was used. Pick a stream and step;
 the table is paginated server-side (50 per page), columns come from the sample keys, click a header to sort,
-use the filter box to search the loaded page, and click "more" to expand long text. In the run view, "add pane"
+use the filter box to search, and click "more" to expand long text. Sorting (numeric-aware: 9 < 10, rows without
+the key last), filtering and pinning all run on the server over the whole step, not just the loaded page. In the run view, "add pane"
 opens another step side by side; in compare view each run gets a pane. The diamond button pins a prompt so every
-pane shows only rows with that exact prompt.
+pane shows only rows with that exact prompt (whitespace differences are ignored when matching).
 
 #### Media Gallery
 
@@ -554,7 +561,7 @@ group is interpolated linearly onto the union of its runs' x values and aggregat
 least 2 runs cover that x (no extrapolation), and the tooltip shows `n=` for the runs behind each point. Under log
 scale a band edge that would be <= 0 is clamped just above zero. Groups with one run are plain lines (no band).
 The run pills and per-chart legend toggle whole groups while grouping is on; the per-run raw faded curve is not drawn.
-Grouping is client-side and not remembered across reloads. `examples/lr_sweep.py` and `examples/optimizer_compare.py`
+Grouping is client-side; the group mode, ignored keys and band type are remembered in localStorage. `examples/lr_sweep.py` and `examples/optimizer_compare.py`
 run three seeds per arm for this.
 
 ### Metric Overlay

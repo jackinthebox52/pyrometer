@@ -685,10 +685,12 @@ export function useWebSocket(handler: Handler) {
 ### SDK
 
 - Network I/O happens only on the sender thread; failures are retried with exponential backoff (cap 60 s) and never block training
-- The in-memory queue is bounded (500); overflow and anything undelivered at `finish()` is spilled to a JSONL spool
-  (`~/.pyrometer/spool/<run_id>/`, `PYROMETER_SPOOL_DIR`) and replayed with `pyrometer sync`
+- Every payload is journaled to `~/.pyrometer/spool/<run_id>/queue.jsonl` (`PYROMETER_SPOOL_DIR`) before sending and acked after;
+  the 500-item memory queue is just a cache of it. The sender replays the backlog automatically after an outage; leftovers after
+  exit/SIGKILL go up with `pyrometer sync`. Media live in `blobs/`, poison payloads in `dead.jsonl`. `init()` with the server down
+  degrades: the run is created by the sender once the server answers
 - Every payload has a batch id; the server's `seen_batches` table (run_id, batch_id, seen_at) discards repeats
-- `run.finish()` makes a 10 s final drain, spills the rest, prints one warning, and doesn't raise
+- `run.finish()` makes a 10 s final drain, leaves the rest in the journal, prints one warning, and doesn't raise
 
 ### Server
 

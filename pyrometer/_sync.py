@@ -1,4 +1,7 @@
-"""Replay spooled payloads (see ``_transport``) to a Pyrometer server."""
+"""Replay spooled payloads (see ``_transport``) to a Pyrometer server.
+
+Run this after the producing process has exited: it consumes the same files a live run owns.
+"""
 
 import json
 import os
@@ -7,7 +10,10 @@ from pathlib import Path
 
 import httpx
 
-from pyrometer._transport import BATCH_HEADER, META_FILE, QUEUE_FILE, Spool, _retryable, spool_root
+from pyrometer._transport import (
+    BATCH_HEADER, BLOB_DIR, DEAD_FILE, META_FILE, POS_FILE, QUEUE_FILE, Spool, _retryable,
+    materialize_body, spool_root,
+)
 
 
 @dataclass
@@ -29,7 +35,7 @@ def find_spools(target: str | None) -> list[Path]:
         return sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
     path = Path(target).expanduser()
     if path.is_dir():
-        if (path / META_FILE).exists() or (path / QUEUE_FILE).exists():
+        if any((path / f).exists() for f in (META_FILE, QUEUE_FILE, DEAD_FILE)):
             return [path]
         return sorted(p for p in path.iterdir() if p.is_dir())
     by_id = spool_root() / target
@@ -58,7 +64,6 @@ def sync_run_dir(run_dir: Path, client: httpx.Client | None = None, server: str 
 
 
 def _replay(run_dir: Path, run_id: str, meta: dict, client: httpx.Client, result: SyncResult) -> None:
-    queue_path = run_dir / QUEUE_FILE
     spool = Spool(run_id, run_dir.parent)
 
     if not meta.get("created", True):
@@ -75,50 +80,63 @@ def _replay(run_dir: Path, run_id: str, meta: dict, client: httpx.Client, result
             return
         spool.write_meta(created=True)
 
-    items: list[dict] = []
-    if queue_path.exists():
-        for line in queue_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                try:
-                    items.append(json.loads(line))
-                except ValueError:
-                    result.messages.append("skipped a corrupt spool line")
+    try:
+        spool.recover_wal()
+    except OSError:
+        pass
+    queue, bad_q = spool.pending()
+    dead, bad_d = spool.dead()
+    if bad_q + bad_d:
+        result.messages.append(f"skipped {bad_q + bad_d} corrupt spool lines")
 
-    kept: list[dict] = []
+    kept_q: list[dict] = []
+    kept_d: list[dict] = []
     unreachable = False
-    for i, item in enumerate(items):
+    # Dead letters first (they are older than the journal tail), the journal (status PATCH last) after.
+    for source, item in [("dead", i) for i in dead] + [("queue", i) for i in queue]:
+        keep = kept_d if source == "dead" else kept_q
         if unreachable:
-            kept.append(item)
+            keep.append(item)
+            continue
+        body = materialize_body(item, run_dir)
+        if item.get("blob") and body is None:
+            result.messages.append(f"{item['path']}: media file missing, dropped")
             continue
         try:
             kwargs = {"timeout": item["timeout"]} if "timeout" in item else {}
-            resp = client.request(item["method"], item["path"], json=item["json"],
+            resp = client.request(item["method"], item["path"], json=body,
                                   headers={BATCH_HEADER: item["id"]}, **kwargs)
         except httpx.HTTPError as e:
             result.error = f"server unreachable: {e}"
             unreachable = True
-            kept.append(item)
+            keep.append(item)
             continue
         if resp.status_code < 300:
             result.sent += 1
+            if item.get("blob"):
+                (run_dir / BLOB_DIR / item["blob"]["file"]).unlink(missing_ok=True)
+        elif _retryable(resp.status_code):
+            result.error = f"server error (HTTP {resp.status_code})"
+            unreachable = True
+            keep.append(item)
         else:
-            kept.append(item)
-            if _retryable(resp.status_code):
-                result.error = f"server error (HTTP {resp.status_code})"
-                unreachable = True
-            else:
-                result.messages.append(f"{item['path']} rejected (HTTP {resp.status_code})")
+            kept_d.append(item)  # refused for good: park it in the dead-letter file
+            result.messages.append(f"{item['path']} rejected (HTTP {resp.status_code})")
 
-    result.remaining = len(kept)
-    if kept:
-        queue_path.write_text("".join(json.dumps(k) + "\n" for k in kept), encoding="utf-8")
+    result.remaining = len(kept_q) + len(kept_d)
+    if result.remaining:
+        _rewrite(run_dir / QUEUE_FILE, kept_q)
+        (run_dir / POS_FILE).unlink(missing_ok=True)
+        _rewrite(run_dir / DEAD_FILE, kept_d)
         if result.error is None:
-            result.error = f"{len(kept)} payloads rejected by the server; kept in {run_dir}"
+            result.error = f"{result.remaining} payloads rejected by the server; kept in {run_dir}"
         return
     result.complete = True
-    for f in (queue_path, run_dir / META_FILE):
-        f.unlink(missing_ok=True)
-    try:
-        run_dir.rmdir()
-    except OSError:
-        pass
+    spool.cleanup()
+
+
+def _rewrite(path: Path, items: list[dict]) -> None:
+    if items:
+        path.write_text("".join(json.dumps(i) + "\n" for i in items), encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)

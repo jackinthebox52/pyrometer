@@ -1099,9 +1099,18 @@ Limits: 500 samples per call, 64 KB per sample (serialized JSON), 4 MB per call;
 
 Returns `[{"name", "step", "count", "timestamp"}]` per sample stream and step.
 
-### `GET /runs/{run_id}/samples?name=&step=&limit=50&offset=0`
+### `GET /runs/{run_id}/samples?name=&step=&limit=50&offset=0&sort=&order=asc&q=&prompt=`
 
 One page (limit capped at 200) of samples: `{"data": {"total": 120, "items": [{"idx": 0, "sample": {...}}]}}`.
+Filtering and sorting apply to the whole step before paging; `total` is the filtered count.
+
+- `sort`: top-level sample key; `order` is `asc` (default) or `desc` (else 400). Numeric values (including numeric
+  strings) sort numerically and come first, other values sort as text, samples lacking the key come last. Default order
+  is insertion order (`idx`).
+- `q`: case-insensitive substring over every top-level value.
+- `prompt`: exact match on the `prompt` field after trimming and collapsing whitespace.
+
+The key and filters are bound as SQL parameters (the key as a JSON path), never interpolated.
 `GET /runs/{run_id}/llm-summary` also includes a `SAMPLES` section (latest step's top/bottom 3 by reward, truncated).
 
 ---

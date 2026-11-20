@@ -21,6 +21,11 @@ const PAGE = 50
 const CLIP = 240
 const mono = 'JetBrains Mono, monospace'
 
+/** Trim and collapse whitespace so pinned prompts match across formatting differences (server does the same). */
+export function normWs(text: string): string {
+  return text.split(/\s+/).filter(Boolean).join(' ')
+}
+
 function fmt(v: unknown): string {
   if (v == null) return ''
   if (typeof v === 'string') return v
@@ -43,44 +48,40 @@ function SamplePane({
   const [page, setPage] = useState<SamplesPage | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
+  const [q, setQ] = useState('')
   const [sortKey, setSortKey] = useState<string | null>(null)
   const [desc, setDesc] = useState(true)
   const [open, setOpen] = useState<Set<string>>(new Set())
 
-  useEffect(() => { setOffset(0) }, [pane.runId, pane.name, pane.step])
+  // Debounce the filter box; filtering/sorting/pinning run server-side over the whole step.
+  useEffect(() => {
+    const t = setTimeout(() => setQ(filter), 250)
+    return () => clearTimeout(t)
+  }, [filter])
+  useEffect(() => { setOffset(0) }, [pane.runId, pane.name, pane.step, q, sortKey, desc, pin])
   useEffect(() => {
     let live = true
     setError(null)
-    api.getSamples(pane.runId, pane.name, pane.step, offset, PAGE)
+    api.getSamples(pane.runId, pane.name, pane.step, offset, PAGE, { sort: sortKey, desc, q, prompt: pin })
       .then((p) => { if (live) setPage(p) })
       .catch((e) => { if (live) setError(String(e)) })
     return () => { live = false }
-  }, [pane.runId, pane.name, pane.step, offset])
+  }, [pane.runId, pane.name, pane.step, offset, q, sortKey, desc, pin])
 
   const items = page?.items ?? []
+  // Columns accumulate across pages so headers (and sorting) survive an empty filter result.
+  const [colState, setColState] = useState<{ id: string; cols: string[] }>({ id: '', cols: [] })
+  const colId = `${pane.runId}|${pane.name}|${pane.step}`
   const columns = useMemo(() => {
-    const keys: string[] = []
+    const keys = colState.id === colId ? [...colState.cols] : []
     for (const it of items) for (const k of Object.keys(it.sample)) if (!keys.includes(k)) keys.push(k)
     return keys
-  }, [items])
+  }, [items, colId, colState])
+  useEffect(() => {
+    setColState((prev) => (prev.id === colId && prev.cols.join('\u0000') === columns.join('\u0000') ? prev : { id: colId, cols: columns }))
+  }, [columns, colId])
 
-  const rows = useMemo(() => {
-    let out = items
-    if (pin) out = out.filter((it) => fmt(it.sample.prompt) === pin)
-    if (filter) {
-      const q = filter.toLowerCase()
-      out = out.filter((it) => Object.values(it.sample).some((v) => fmt(v).toLowerCase().includes(q)))
-    }
-    if (sortKey) {
-      const k = sortKey
-      out = [...out].sort((a, b) => {
-        const x = a.sample[k], y = b.sample[k]
-        const c = typeof x === 'number' && typeof y === 'number' ? x - y : fmt(x).localeCompare(fmt(y))
-        return desc ? -c : c
-      })
-    }
-    return out
-  }, [items, pin, filter, sortKey, desc])
+  const rows = items
 
   const myStepsForName = steps.filter((s) => s.name === pane.name)
   const total = page?.total ?? 0
@@ -102,7 +103,7 @@ function SamplePane({
           {myStepsForName.map((s) => <option key={s.step} value={s.step}>step {s.step} ({s.count})</option>)}
         </select>
         <input className="text-xs rounded px-2 py-0.5 flex-1 min-w-[80px]" style={sel}
-          placeholder="filter (this page)" value={filter} onChange={(e) => setFilter(e.target.value)} />
+          placeholder="filter (whole step)" value={filter} onChange={(e) => setFilter(e.target.value)} />
         {onRemove && (
           <button className="text-xs font-mono" style={{ color: '#6b6f85' }} onClick={onRemove}>remove</button>
         )}
@@ -124,7 +125,7 @@ function SamplePane({
           </thead>
           <tbody>
             {rows.map((it) => {
-              const prompt = fmt(it.sample.prompt)
+              const prompt = normWs(fmt(it.sample.prompt))
               return (
                 <tr key={it.idx} style={{ borderTop: '1px solid #1a1d24', verticalAlign: 'top' }}>
                   <td className="px-1 py-1">

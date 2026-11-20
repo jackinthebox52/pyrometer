@@ -6,8 +6,14 @@ import sys
 import time
 import uuid
 
+import httpx
+
 from pyrometer._hardware import fingerprint
 from pyrometer._run import Run
+from pyrometer._transport import spool_root
+
+# Connecting to a dead server must not stall the start of training; a slow one still gets a few seconds.
+_INIT_TIMEOUT = httpx.Timeout(8.0, connect=3.0)
 
 
 def init(
@@ -69,9 +75,14 @@ def init(
             ``None``, and the resume happens when you ``pyrometer sync``. Resuming into a
             different ``project`` than the run's raises ``ValueError``.
 
-    Delivery is durable: if the server is unreachable mid-run, payloads are retried in the
-    background with exponential backoff (never blocking your training loop) and, if the
-    server stays down, saved to the spool so ``pyrometer sync`` can upload them.
+    Delivery is durable. Every payload is appended to an on-disk journal
+    (``~/.pyrometer/spool/<run_id>/``) before it is sent and acknowledged after, so a hard kill
+    loses at most the last few milliseconds. If the server is unreachable (also right here at
+    ``init``: connection refused, timeout or a 5xx after at most ~3-8 s) this does not raise: one
+    warning is printed, the run is created locally, and a background sender retries with
+    exponential backoff, creates the run once the server answers and then drains the journal in
+    order (never blocking your training loop). ``pyrometer sync`` uploads whatever is left after
+    the process exited. Authentication and validation errors still raise immediately.
 
     Raises:
         PermissionError: If the server rejects the API key (missing, invalid,
@@ -91,8 +102,6 @@ def init(
             tags=["baseline"],
         )
     """
-    import httpx
-
     if offline is None:
         offline = os.environ.get("PYROMETER_MODE", "").strip().lower() == "offline"
 
@@ -142,12 +151,33 @@ def init(
             run._mark_resumed(None, None, {"offline": True})
         return run
 
-    resp = httpx.post(
-        f"{server}/runs",
-        json=payload,
-        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-        timeout=10,
-    )
+    degraded: str | None = None
+    resp = None
+    try:
+        resp = httpx.post(
+            f"{server}/runs",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+            timeout=_INIT_TIMEOUT,
+        )
+        if resp.status_code >= 500 or resp.status_code in (408, 425, 429):
+            degraded = f"HTTP {resp.status_code}"
+    except httpx.TransportError as e:  # unreachable, DNS failure, timeout: never fail training over it
+        degraded = type(e).__name__
+
+    if degraded is not None:
+        print(
+            f"pyrometer: server at {server} is not available ({degraded}); the run continues and its data is "
+            f"journaled in {spool_root() / run_id}. It will be uploaded automatically once the server answers "
+            "(or with: pyrometer sync).",
+            file=sys.stderr,
+        )
+        run = Run(run_id=run_id, server_url=server, api_key=api_key, anomaly_detection=anomaly_detection,
+                  create=payload)
+        if resume_mode:
+            run._mark_resumed(None, None, {"deferred": True})
+        return run
+
     if resume_mode == "must" and resp.status_code == 404:
         raise LookupError(f"Cannot resume run {run_id!r}: not found on {server}, or this key cannot use it.")
     if resp.status_code == 409:

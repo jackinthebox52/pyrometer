@@ -37,8 +37,11 @@ def make_transport(handler, tmp_path, **kw) -> Transport:
 
 
 def queue_lines(tmp_path) -> list[dict]:
-    p = tmp_path / RUN_ID / QUEUE_FILE
-    return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+    return Spool(RUN_ID, tmp_path).pending()[0]
+
+
+def dead_lines(tmp_path) -> list[dict]:
+    return Spool(RUN_ID, tmp_path).dead()[0]
 
 
 # --- server: idempotent ingestion ------------------------------------------------
@@ -139,7 +142,7 @@ def test_queue_cap_spills_overflow_and_never_blocks(tmp_path):
     for i in range(20):
         t.submit("POST", "/m", [i])
     assert time.time() - start < 1.0
-    assert t.spilled >= 17
+    assert t.overflowed >= 17
     t.close(0.2)
     assert len(queue_lines(tmp_path)) == 20  # nothing lost: spilled + drained remainder
 
@@ -155,7 +158,7 @@ def test_permanent_rejection_is_spilled_not_retried(tmp_path):
     t.submit("POST", "/x", [1])
     t.close(5)
     assert calls["n"] == 1
-    assert len(queue_lines(tmp_path)) == 1
+    assert len(dead_lines(tmp_path)) == 1 and queue_lines(tmp_path) == []
 
 
 def test_offline_transport_never_touches_network(tmp_path):
@@ -163,7 +166,7 @@ def test_offline_transport_never_touches_network(tmp_path):
     t.submit("POST", "/m", [1])
     t.close(5)
     assert len(queue_lines(tmp_path)) == 1
-    assert t.spilled == 0 and t.offline_saved == 1
+    assert t.offline_saved == 1
 
 
 # --- offline run + sync end to end ----------------------------------------------

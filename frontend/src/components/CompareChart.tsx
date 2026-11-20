@@ -4,6 +4,7 @@ import {
   CartesianGrid,
   ComposedChart,
   Line,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -11,7 +12,7 @@ import {
 } from 'recharts'
 import type { Metric } from '../api/types.ts'
 import { formatMetricValue } from '../utils/format.ts'
-import { MAX_ALPHA, processSeries, useChartOptions } from '../utils/chartOptions.ts'
+import { MAX_ALPHA, formatLogTick, logTicks, positiveRange, processSeries, useChartOptions } from '../utils/chartOptions.ts'
 import type { ChartOptions } from '../utils/chartOptions.ts'
 import { axisLabel, axisMetricName, formatXLabel, formatXTick, resolveXs, runHasAxis } from '../utils/xAxis.ts'
 import type { XSource } from '../utils/xAxis.ts'
@@ -40,7 +41,6 @@ export interface GroupSeries {
 interface Props {
   metricName: string
   series: RunSeries[]
-  smoothing: number   // global slider value from CompareView
   globalHiddenIds?: Set<string>
   expanded?: boolean
   /** When set, runs are aggregated per group (mean line + band) instead of drawn individually. */
@@ -141,13 +141,12 @@ function mergeGroupedData(
 export default function CompareChart({
   metricName,
   series,
-  smoothing,
   globalHiddenIds,
   expanded = false,
   groups,
   band = 'std',
 }: Props) {
-  const [opts, setOpts] = useChartOptions(`compare:${metricName}`, smoothing)
+  const [opts, setOpts, resetOpts, overridden] = useChartOptions(`compare:${metricName}`)
   const { alpha } = opts
 
   const [isExpanded, setIsExpanded] = useState(false)
@@ -202,6 +201,11 @@ export default function CompareChart({
     [series, groups, band, localHiddenIds, globalHiddenIds, opts, metricName, axis],
   )
   const tickFmt = useMemo(() => formatXTick(axis, span), [axis, span])
+  const log = useMemo(() => {
+    if (!opts.logY) return null
+    const r = positiveRange(data as Record<string, unknown>[])
+    return r ? logTicks(r[0], r[1]) : null
+  }, [data, opts.logY])
   const legendEntries = groups
     ? groups.map((g) => ({
         id: g.id,
@@ -241,6 +245,8 @@ export default function CompareChart({
           onChange={setOpts}
           dropped={dropped}
           axisMetrics={hasAxisSelector ? axisNames : undefined}
+          overridden={overridden}
+          onReset={resetOpts}
         />
         {(excluded.length > 0 || skipped > 0 || nonMonotonic.length > 0) && (
           <div className="text-xs font-mono mb-2" style={{ color: '#f59e0b', fontSize: 10 }}>
@@ -297,12 +303,16 @@ export default function CompareChart({
                   tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
                   tickLine={false}
                   axisLine={false}
-                  tickFormatter={formatMetricValue}
-                  width={35}
+                  tickFormatter={opts.logY ? formatLogTick : formatMetricValue}
+                  width={opts.logY ? 42 : 35}
                   scale={opts.logY ? 'log' : 'auto'}
-                  domain={opts.logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
+                  domain={log ? log.domain : opts.logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
+                  ticks={log?.ticks}
                   allowDataOverflow={opts.logY}
                 />
+                {log?.minor.map((y) => (
+                  <ReferenceLine key={`m${y}`} y={y} stroke="#1e2128" strokeOpacity={0.6} strokeWidth={1} />
+                ))}
                 <Tooltip
                   contentStyle={{
                     backgroundColor: '#1a1d24',
@@ -401,7 +411,6 @@ export default function CompareChart({
           <CompareChart
             metricName={metricName}
             series={series}
-            smoothing={alpha}
             globalHiddenIds={globalHiddenIds}
             groups={groups}
             band={band}

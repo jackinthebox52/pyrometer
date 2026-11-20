@@ -9,6 +9,7 @@ import SamplesViewer from '../components/SamplesViewer.tsx'
 import MemoryDeltaChart from '../components/MemoryDeltaChart.tsx'
 import HyperparamTable from '../components/HyperparamTable.tsx'
 import KernelTimeline from '../components/KernelTimeline.tsx'
+import ChartDefaults from '../components/ChartDefaults.tsx'
 import MetricChart from '../components/MetricChart.tsx'
 import CompareChart from '../components/CompareChart.tsx'
 import type { RunSeries } from '../components/CompareChart.tsx'
@@ -743,6 +744,7 @@ export default function RunDetailPage() {
             >
               Metrics
             </h2>
+            <ChartDefaults axisMetrics={metricNames} />
             <button
               onClick={() => setShowEvents((v) => !v)}
               className="text-xs font-mono px-2 py-0.5 rounded"
@@ -821,7 +823,7 @@ export default function RunDetailPage() {
                 )
               }
               return (
-                <CompareChart key={key} metricName={displayLabel} series={nonEmpty} smoothing={0} />
+                <CompareChart key={key} metricName={displayLabel} series={nonEmpty} />
               )
             })}
           </div>

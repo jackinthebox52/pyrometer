@@ -7,7 +7,7 @@ Track metrics, compare runs, and profile GPU kernels — all local, no cloud, no
 
 - **SDK**: `run.log`, `watch` (gradient/weight stats), `profile` (torch.profiler), `event`, `log_artifact`,
   `log_image` / `log_histogram` / `log_figure`, and `log_samples` (prompt/completion/reward tables).
-- **Durable delivery**: failed uploads retry with backoff and spill to a local spool; `init(offline=True)` records
+- **Durable delivery**: payloads are journaled to disk before sending (a SIGKILL loses ~nothing), retried with backoff and replayed automatically after outages, `init()` works with the server down; `init(offline=True)` records
   without a network and `pyrometer sync` uploads later. Retries never double-insert.
 - **Run health**: heartbeat plus statuses `running` / `completed` / `failed` / `crashed` / `killed`; a run that goes
   silent is marked `crashed` and flips back if it resumes.

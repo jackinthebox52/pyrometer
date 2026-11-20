@@ -1251,9 +1251,25 @@ def get_sample_steps(run_id: str):
 
 
 @app.get("/runs/{run_id}/samples")
-def get_samples(run_id: str, name: str = "samples", step: int = 0, limit: int = 50, offset: int = 0):
+def get_samples(
+    run_id: str,
+    name: str = "samples",
+    step: int = 0,
+    limit: int = 50,
+    offset: int = 0,
+    sort: str | None = None,
+    order: str = "asc",
+    q: str | None = None,
+    prompt: str | None = None,
+):
+    """Page of samples at (name, step). Optional whole-step ``sort`` key + ``order`` (asc|desc),
+    ``q`` substring filter and exact (whitespace-normalized) ``prompt`` filter."""
     limit = max(1, min(limit, 200))
-    return ok(db_get_samples(run_id, name, step, limit, max(0, offset)))
+    if order not in ("asc", "desc"):
+        err("order must be 'asc' or 'desc'", 400)
+    sort = sort[:200] if sort else None
+    q = q[:500] if q else None
+    return ok(db_get_samples(run_id, name, step, limit, max(0, offset), sort, order == "desc", q, prompt))
 
 
 # ---------------------------------------------------------------------------

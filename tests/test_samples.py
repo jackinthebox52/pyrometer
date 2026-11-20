@@ -107,3 +107,67 @@ def test_sdk_truncates_and_offline_sync_replays(server, tmp_path, monkeypatch):
     assert res.complete, res.messages
     steps = server.get(f"/runs/{run.run_id}/samples/steps").json()["data"]
     assert {(s["step"], s["count"]) for s in steps} == {(2, 1), (3, 450)}
+
+
+def _seed(server):
+    rid = server.post("/runs", json={}).json()["data"]["run_id"]
+    smp = [
+        {"prompt": "What is  2+2?", "completion": "Four", "reward": 10},
+        {"prompt": "What is 2+2?\n", "completion": "héllo wörld", "reward": 9},
+        {"prompt": "Other", "completion": "FOUR again", "reward": 100},
+        {"prompt": "No reward", "completion": "x"},
+        {"prompt": "Str", "completion": "y", "reward": "n/a"},
+        {"prompt": "Quote", "completion": "z", 'we"ird': 5, "back\\slash": 1},
+    ]
+    server.post(f"/runs/{rid}/samples", json=body(1, smp))
+    return rid
+
+
+def _prompts(server, rid, **params):
+    page = server.get(f"/runs/{rid}/samples", params={"step": 1, **params}).json()["data"]
+    return page["total"], [i["sample"]["prompt"] for i in page["items"]]
+
+
+def test_sort_numeric_aware_over_whole_step(server):
+    rid = _seed(server)
+    # numeric ordering (10 > 9, not lexicographic), non-numeric/missing last, paging applies after sort
+    _, asc = _prompts(server, rid, sort="reward", order="asc")
+    assert asc[:3] == ["What is 2+2?\n", "What is  2+2?", "Other"]
+    _, desc = _prompts(server, rid, sort="reward", order="desc")
+    assert desc[:3] == ["Other", "What is  2+2?", "What is 2+2?\n"]
+    _, page2 = _prompts(server, rid, sort="reward", order="desc", limit=2, offset=2)
+    assert page2 == desc[2:4]
+    assert _prompts(server, rid, sort="completion", order="asc")[1][0] == "Other"  # "FOUR again" < "Four"
+    assert _prompts(server, rid, sort='we"ird', order="desc")[1][0] == "Quote"
+    assert _prompts(server, rid, sort="back\\slash")[1][0] == "Quote"
+    assert server.get(f"/runs/{rid}/samples", params={"step": 1, "order": "sideways"}).status_code == 400
+
+
+def test_filter_q_and_prompt(server):
+    rid = _seed(server)
+    assert _prompts(server, rid, q="four")[0] == 2 + 0  # "Four" and "FOUR again"
+    assert _prompts(server, rid, q="HÉLLO")[1] == ["What is 2+2?\n"]
+    assert _prompts(server, rid, q="100")[0] == 1
+    total, ps = _prompts(server, rid, prompt="What is 2+2?")
+    assert total == 2  # whitespace-normalized exact match
+    assert _prompts(server, rid, prompt="  What   is 2+2? ")[0] == 2
+    assert _prompts(server, rid, prompt="What is")[0] == 0
+    assert _prompts(server, rid, prompt="What is 2+2?", q="four", sort="reward")[1] == ["What is  2+2?"]
+
+
+@pytest.mark.parametrize("evil", [
+    "reward') ; DROP TABLE samples; --", "$.reward\"] OR 1=1 --", "' OR '1'='1", "\\", '"', "$..*", "%", "*",
+])
+def test_injection_attempts_are_inert(server, evil):
+    rid = _seed(server)
+    for params in ({"sort": evil}, {"q": evil}, {"prompt": evil}, {"sort": evil, "q": evil, "prompt": evil}):
+        r = server.get(f"/runs/{rid}/samples", params={"step": 1, **params})
+        assert r.status_code == 200, (evil, params, r.text)
+    assert _prompts(server, rid, sort=evil)[0] == 6  # sorting never filters
+    assert _prompts(server, rid)[0] == 6  # table intact
+
+
+def test_sample_query_visibility(server):
+    rid = _seed(server)
+    anon = TestClient(app)
+    assert anon.get(f"/runs/{rid}/samples", params={"step": 1, "sort": "reward", "q": "x"}).status_code == 401
