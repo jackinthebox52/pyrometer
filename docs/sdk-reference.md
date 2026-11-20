@@ -40,6 +40,7 @@ run = pyrometer.init(
     notes="Initial baseline with default hyperparameters",
     server="http://localhost:8321",
     api_key="pyro_...",   # or set PYROMETER_API_KEY (preferred)
+    project="team-a",     # optional; see auth.md
 )
 ```
 
@@ -52,9 +53,54 @@ run = pyrometer.init(
 | `tags` | `list[str]` | `[]` | List of string tags for filtering runs in the dashboard. |
 | `notes` | `str \| None` | `None` | Free-text notes attached to the run. |
 | `server` | `str \| None` | `$PYROMETER_SERVER`, else `"http://localhost:8321"` | Base URL of the Pyrometer API server. |
-| `api_key` | `str \| None` | `$PYROMETER_API_KEY` | API key with the `ingest` scope (`pyrometer keys create`). Not needed against a `--no-auth` local server. Prefer the environment variable so the key stays out of source control. |
+| `api_key` | `str \| None` | `$PYROMETER_API_KEY` | API key (create one in the dashboard under **API keys**, or `pyrometer keys create`). Not needed against a `--no-auth` local server. Prefer the environment variable so the key stays out of source control. |
 
-Raises `PermissionError` if the server rejects the key. See [auth.md](auth.md).
+| `project` | `str \| None` | `None` | Project for the run. A global key registers an unknown project as public on first use; a project key defaults to its own project; otherwise runs go to the public `default` project. |
+| `offline` | `bool \| None` | `$PYROMETER_MODE == "offline"` | Record to the local spool without touching the network (including run creation); upload later with `pyrometer sync`. See [Durable delivery](#durable-delivery-offline-mode-and-pyrometer-sync). |
+| `resume` | `str \| None` | `$PYROMETER_RUN_ID` implies `"auto"` | Continue an existing run: a run id, or `"auto"` (use `$PYROMETER_RUN_ID`; resume if it exists, create it with that id otherwise). See [Resuming a run](#resuming-a-run). |
+| `anomaly_detection` | `bool \| dict` | `True` | `False` disables automatic anomaly events; a dict overrides thresholds. See [Anomaly Detection](#anomaly-detection). |
+
+Raises `PermissionError` if the server rejects the key, `LookupError` if the project doesn't exist or the key can't use it (or `resume` names an unknown run), `ValueError` if `resume` is malformed or the run belongs to another project. See [auth.md](auth.md).
+
+#### Resuming a run
+
+`init(resume=run_id)` reattaches to an existing run instead of creating one (build on the client-chosen run id:
+`run.run_id` of the first run). `init(resume="auto")` reads `$PYROMETER_RUN_ID` and resumes the run if it exists,
+creating it under that id otherwise; just setting `PYROMETER_RUN_ID` implies `"auto"`. Handy for restartable jobs.
+
+```python
+run = pyrometer.init(name="llm", hyperparams=cfg, resume="auto")   # export PYROMETER_RUN_ID=my-llm-run-1
+start = run.last_step + 1 if run.resumed and run.last_step is not None else 0
+for step in range(start, total_steps):
+    ...
+    run.log({"loss": loss}, step=step)
+```
+
+- **Status**: the run returns to `running`, also from `completed`, `failed`, `crashed` or `killed` (resuming a
+  finished run is allowed; its summary is recomputed at the next `finish()`). A `run_resumed` event
+  (metadata: `previous_status`, `last_step`) marks the point on the charts.
+- **Config**: the original name, hyperparams, tags and notes are kept. Hyperparams/tags you pass that differ are not
+  applied: a warning is printed and the differences are stored in the event's `config_changes` metadata.
+- **Steps**: `run.resumed` is `True`; `run.last_step` is the highest step stored on the server (`None` if none).
+  Pyrometer never rewrites history: if you log steps that already exist you get duplicates, so continue from
+  `last_step + 1` (or restore from your checkpoint's step and expect overlap).
+- **Anomaly detectors** start fresh (new warmup); they do not remember the earlier run's statistics.
+- **Offline**: no server is consulted, so the id is trusted and `run.last_step` is `None`. The resume (status back to
+  `running`, or creation if unknown) is applied when you `pyrometer sync`; with an explicit id the server returns 404
+  at sync if the run does not exist there.
+- **Access**: the key must be able to write the run's project (a project key bound to another project is refused,
+  answered as "not found"). Passing a `project` that differs from the run's raises `ValueError`.
+- Spooling, retries and heartbeats work as for any run.
+
+### `pyrometer.create_project()`
+
+```python
+info = pyrometer.create_project("team-a", private=True)
+info["key"]   # the project's own API key (private projects only), shown once
+```
+
+Registers a project. Needs a **global** API key. Parameters: `name`, `private=False`, `server=None`, `api_key=None`.
+Raises `PermissionError` (not a global key), `ValueError` (bad or taken name).
 
 #### Returns
 
@@ -135,6 +181,19 @@ for epoch in range(100):
     run.log({"val/loss": val_loss}, step=step)
 ```
 
+#### Custom x-axes: log your axis as a metric
+
+Charts default to `step`, but the dashboard can plot against wall time, elapsed time, or **any logged metric**.
+To get e.g. an env-steps or tokens axis, just log it as an ordinary metric at the same step as the values you want to
+plot against it (the dashboard joins on `step`):
+
+```python
+run.log({"train/loss": loss, "tokens_seen": tokens_seen}, step=step)
+```
+
+Log it on every step (or at least wherever you log the metrics you want on that axis, including validation).
+Points whose step has no axis value are hidden, and the axis metric should be non-decreasing in step.
+
 ---
 
 ### `run.watch()`
@@ -160,9 +219,9 @@ run.watch(model, log_freq=100)
   - Weight: L2 norm, min, max, mean, 32-bin histogram
 - Ships statistics to the server in a background thread.
 - **Anomaly detection** automatically fires alerts for:
-  - Gradient norm spikes (>100× rolling median)
-  - Dead layers (<1e-8 norm for 50 consecutive samples)
-  - NaN/Inf in gradients or weights
+  - Gradient norm spikes (>1000× rolling median, after a 20-sample warmup, rate-limited)
+  - Dead layers (<1e-8 norm for 200 consecutive samples)
+  - NaN/Inf in gradients or weights (once per parameter until it recovers)
 
 #### Example
 
@@ -262,11 +321,48 @@ run.finish()
 
 #### Behavior
 
-- Flushes all buffered metrics, logs, and parameter statistics to the server.
+- Flushes all buffered metrics, logs, and parameter statistics to the sender and makes a short (10 s) final delivery attempt.
+- Anything the server still did not accept is written to the spool and one warning names the directory (see below).
 - Restores original stdout/stderr (if console capture was enabled).
 - Removes gradient monitoring hooks.
+
+#### Heartbeat and exit status
+
+- The SDK sends a heartbeat (`POST /runs/{id}/heartbeat`) every 30 s, starting at init. Heartbeats go through the
+  transport but are *ephemeral*: never retried, spooled or saved offline, since a stale heartbeat is meaningless.
+- If `finish()` is never called the run is closed at interpreter exit: `completed` on a normal exit, `failed`
+  after an uncaught exception, `killed` on Ctrl-C or SIGTERM (a SIGTERM handler is installed only if none is set).
+- A hard kill (SIGKILL, power loss, lost machine) cannot report anything; the server marks the run `crashed`
+  after 5 minutes without a heartbeat (`PYROMETER_HEARTBEAT_TIMEOUT`, seconds, on the server).
 - Patches the run status to `"completed"` in the database.
 - Closes the HTTP client connection.
+
+#### Durable delivery, offline mode and `pyrometer sync`
+
+Nothing the SDK sends is dropped when the server is unreachable. All payloads (metrics, logs, events, artifacts,
+media, profile data, system snapshots, parameter stats, the final status) go through one background sender that
+never blocks your training loop:
+
+- A failed delivery is retried with exponential backoff (1 s doubling to a 60 s cap), in order.
+- The in-memory queue is capped (500 payloads). Beyond that, and for anything still undelivered at `finish()`,
+  payloads are appended as JSONL to `~/.pyrometer/spool/<run_id>/queue.jsonl` (override the root with
+  `PYROMETER_SPOOL_DIR`). The API key is never written to the spool.
+- Each payload carries a client batch id (`X-Pyrometer-Batch`). The server ignores ids it has already seen for a
+  run, so a retry after a lost response never double-inserts.
+- `pyrometer.init(..., offline=True)` (or `PYROMETER_MODE=offline`) does no networking at all: run creation and every
+  payload go to the spool.
+
+Upload spooled data with the CLI (needs `PYROMETER_API_KEY`; the server comes from `--server`, `$PYROMETER_SERVER`, or
+the URL recorded in the spool). It creates the run if needed, replays the payloads, and deletes them on success:
+
+```bash
+pyrometer sync                       # every run in the spool
+pyrometer sync <run_id>              # one run
+pyrometer sync /path/to/spool-dir    # a spool root or one run directory (e.g. copied from another machine)
+```
+
+Safe to repeat: already-delivered payloads are skipped by batch id. If the server is down at `init()` (not offline
+mode) `init` still raises; use offline mode for that.
 
 #### Always Call This
 
@@ -407,6 +503,29 @@ plt.close(fig)
 
 ---
 
+### `run.log_samples()`
+
+Log generation samples (prompt / completion / reward ...) for a step; shown in the dashboard's Samples section.
+
+```python
+run.log_samples(step, [
+    {"prompt": p, "completion": c, "reward": r, "reference": ref},
+], name="eval_generations")
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `step` | `int` | Training step the samples belong to. |
+| `samples` | `list[dict]` | Arbitrary JSON-able dicts (non-JSON values are stringified). Columns are derived from the keys; a numeric `reward` is indexed for sorting and the LLM summary. |
+| `name` | `str` | Sample stream name (default `"samples"`). |
+
+Limits: 64 KB per sample (the SDK truncates the longest string values to fit, with a warning; the server
+rejects bigger ones with HTTP 413), 200 samples per request (the SDK splits larger lists; the server
+accepts up to 500 / 4 MB per call). Log a few dozen samples every N steps, not every step. Calling it again for the
+same `(name, step)` appends. Delivered through the durable transport, so it survives outages and `pyrometer sync`.
+
+---
+
 ## Events & Tracking
 
 ### `run.event()`
@@ -527,7 +646,7 @@ All buffers are flushed immediately on `run.finish()`.
 On `pyrometer.init()`, two daemon threads are started:
 
 1. **Flush thread**: Wakes every 5 seconds to flush buffered metrics.
-2. **System monitor thread**: Polls pynvml every 2 seconds for GPU stats (utilization, temperature, power, memory).
+2. **System monitor thread**: Polls pynvml every 2 seconds for **every GPU visible to the process** (honours `CUDA_VISIBLE_DEVICES`, indices or UUIDs; `gpu_index` is the CUDA ordinal) and reports utilization, temperature, power and memory per GPU. It also attributes VRAM and SM utilization to this process (plus its child processes when `psutil` is installed); the `process_*`/`attributed_*` fields are null on GPUs where the process has no context or the driver does not support it.
 
 ### Console Capture
 
@@ -540,12 +659,26 @@ This behavior is always on; there's no way to disable it in v0.1.
 
 ### Anomaly Detection
 
-The SDK performs automatic anomaly detection on:
+Detection is deliberately conservative: ordinary noisy training should produce zero events.
 
-- **Gradient norms**: Rolling z-score for spikes, streak detection for dead layers
-- **Metric values**: NaN/Inf detection, rolling z-score for loss spikes
+- **Metrics** (`run.log`): NaN/Inf always fires (once per metric until it recovers). Spikes use a
+  rolling median/MAD over the last 100 values, need a 50-sample warmup per metric, a robust z-score
+  of at least 12, and a deviation larger than 1x the median. Cooldown is 500 steps per metric, max 5
+  spike events per metric per run.
+- **Gradients** (`run.watch`): NaN/Inf, norm > 1000x rolling median (20-sample warmup), and dead
+  layers (200 consecutive samples under 1e-8). Max 20 gradient events per run.
 
-When an anomaly is detected, a warning event is logged to the server in a daemon thread (non-blocking).
+Configure with `pyrometer.init(anomaly_detection=...)`: `True` (default), `False` (off), or a dict
+overriding any of: `window`, `warmup`, `metric_z`, `metric_rel_change`, `cooldown_steps`,
+`max_events_per_key`, `grad_warmup`, `grad_spike_factor`, `grad_z`, `dead_threshold`, `dead_streak`,
+`max_grad_events`, `nan_inf`. Unknown keys raise `ValueError`.
+
+```python
+run = pyrometer.init(name="x", anomaly_detection={"warmup": 100, "metric_z": 15})
+```
+
+Events are sent as `anomaly_detected` via the normal durable transport. The server's
+`anomaly_count` (and the stability score) simply counts those events, so tuning applies automatically.
 
 ### Error Handling
 

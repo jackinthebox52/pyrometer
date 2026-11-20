@@ -9,6 +9,7 @@ import { useWebSocket } from '../hooks/useWebSocket.ts'
 const STATUS_COLOR: Record<string, string> = {
   running: '#22c55e',
   completed: '#60a5fa',
+  failed: '#f97316',
   crashed: '#ef4444',
   killed: '#eab308',
 }
@@ -22,6 +23,7 @@ interface Props {
 export default function RunSidebar({ selectedIds, onToggleSelect, onClearSelection }: Props) {
   const [runs, setRuns] = useState<Run[]>([])
   const [query, setQuery] = useState('')
+  const [project, setProject] = useState('')
   const [serverDown, setServerDown] = useState(false)
   const navigate = useNavigate()
   const loadRef = useRef<() => void>()
@@ -68,7 +70,10 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onClearSelecti
     }
   })
 
+  const projects = [...new Set(runs.map((r) => r.project))].sort()
+
   const filtered = runs.filter((r) => {
+    if (project && r.project !== project) return false
     if (!query) return true
     const q = query.toLowerCase()
     return r.name.toLowerCase().includes(q) || r.tags.some((t) => t.toLowerCase().includes(q))
@@ -99,6 +104,25 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onClearSelecti
           Pyrometer
         </span>
       </div>
+
+      {/* Project filter (only when there is more than one project to choose from) */}
+      {projects.length > 1 && (
+        <div className="px-3 pt-2.5">
+          <select
+            value={project}
+            onChange={(e) => setProject(e.target.value)}
+            className="w-full px-2 py-1.5 rounded text-xs outline-none"
+            style={{ backgroundColor: '#0a0b0e', border: '1px solid #252830', color: '#e8eaf0' }}
+          >
+            <option value="">All projects</option>
+            {projects.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {/* Search */}
       <div className="px-3 py-2.5 border-b" style={{ borderColor: '#252830' }}>
@@ -257,6 +281,22 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onClearSelecti
             )}
           </div>
         )}
+      </div>
+
+      {/* Account */}
+      <div
+        className="flex items-center justify-between px-4 py-2 border-t text-xs font-mono"
+        style={{ borderColor: '#252830', color: '#4a4e60' }}
+      >
+        <NavLink to="/settings" style={{ color: '#8b8fa8' }}>
+          Settings
+        </NavLink>
+        <button
+          onClick={() => api.logout().finally(() => window.location.reload())}
+          style={{ background: 'none', border: 'none', color: '#8b8fa8', cursor: 'pointer' }}
+        >
+          Sign out
+        </button>
       </div>
     </aside>
   )

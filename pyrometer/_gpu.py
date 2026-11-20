@@ -1,0 +1,147 @@
+"""NVML sampling for the system monitor: every GPU visible to the process, plus per-process attribution."""
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Any
+
+
+def _resolve_handles(nvml: Any, visible: str | None) -> list[tuple[int, Any]]:
+    """Return ``(position, handle)`` for each GPU the process can use.
+
+    ``position`` is the CUDA ordinal (what the user sees as ``cuda:N``), not the NVML index, so a process
+    started with ``CUDA_VISIBLE_DEVICES=2,3`` reports GPUs 0 and 1. Entries may be NVML indices or UUIDs;
+    like CUDA, parsing stops at the first entry that does not exist. An empty value means no GPUs.
+    """
+    if visible is None:
+        return [(i, nvml.nvmlDeviceGetHandleByIndex(i)) for i in range(nvml.nvmlDeviceGetCount())]
+    handles: list[tuple[int, Any]] = []
+    for pos, token in enumerate(t.strip() for t in visible.split(",") if t.strip()):
+        try:
+            if token.isdigit():
+                handle = nvml.nvmlDeviceGetHandleByIndex(int(token))
+            else:
+                handle = nvml.nvmlDeviceGetHandleByUUID(token)
+        except Exception:
+            break
+        handles.append((pos, handle))
+    return handles
+
+
+def resolve_handles(nvml: Any) -> list[tuple[int, Any]]:
+    """Handles for the GPUs visible to this process (honours ``CUDA_VISIBLE_DEVICES``)."""
+    return _resolve_handles(nvml, os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+
+def process_pids(own_pid: int) -> set[int]:
+    """This PID plus its descendants (when psutil is installed; otherwise just this PID)."""
+    pids = {own_pid}
+    try:
+        import psutil
+
+        pids.update(c.pid for c in psutil.Process(own_pid).children(recursive=True))
+    except Exception:
+        pass
+    return pids
+
+
+def sample_gpu(nvml: Any, handle: Any, gpu_index: int, pids: set[int]) -> dict[str, Any]:
+    """One snapshot of a device. ``process_*`` / ``attributed_*`` fields are None when unavailable.
+
+    Per-process numbers: VRAM from nvmlDeviceGetComputeRunningProcesses, SM utilization from
+    nvmlDeviceGetProcessUtilization, both summed over ``pids``. Without per-process utilization the
+    device value is used when we are the only process, else scaled by our share of VRAM (an estimate).
+    """
+    mem = nvml.nvmlDeviceGetMemoryInfo(handle)
+    util = nvml.nvmlDeviceGetUtilizationRates(handle)
+    temp = nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
+    power = nvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW -> W
+
+    fan: float | None = None
+    try:
+        fan = float(nvml.nvmlDeviceGetFanSpeed(handle))
+    except Exception:
+        pass
+
+    sm_clock: int | None = None
+    mem_clock: int | None = None
+    try:
+        sm_clock = nvml.nvmlDeviceGetClockInfo(handle, nvml.NVML_CLOCK_SM)
+        mem_clock = nvml.nvmlDeviceGetClockInfo(handle, nvml.NVML_CLOCK_MEM)
+    except Exception:
+        pass
+
+    process_memory_used: int | None = None
+    process_exclusive: bool | None = None
+    attributed_utilization: float | None = None
+    attributed_power: float | None = None
+    device_util = float(util.gpu)
+
+    our_vram = 0
+    total_vram = 0
+    try:
+        procs = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        ours = [p for p in procs if p.pid in pids]
+        if ours:
+            our_vram = sum(p.usedGpuMemory or 0 for p in ours)
+            total_vram = sum(p.usedGpuMemory or 0 for p in procs)
+            process_memory_used = our_vram
+            process_exclusive = len(ours) == len(procs)
+    except Exception:
+        pass
+
+    try:
+        samples = nvml.nvmlDeviceGetProcessUtilization(handle, 0)
+        latest: dict[int, Any] = {}
+        for s in samples:
+            if s.pid in pids and (s.pid not in latest or s.timeStamp > latest[s.pid].timeStamp):
+                latest[s.pid] = s
+        if latest:
+            attributed_utilization = min(100.0, float(sum(s.smUtil for s in latest.values())))
+    except Exception:
+        pass
+
+    if attributed_utilization is None:
+        if process_exclusive:
+            attributed_utilization = device_util
+        elif our_vram > 0 and total_vram > 0:
+            attributed_utilization = device_util * our_vram / total_vram
+
+    if process_exclusive:
+        attributed_power = power
+    elif attributed_utilization is not None and device_util > 0:
+        attributed_power = power * min(1.0, attributed_utilization / device_util)
+    elif our_vram > 0 and total_vram > 0:
+        attributed_power = power * our_vram / total_vram
+
+    return {
+        "gpu_index": gpu_index,
+        "gpu_utilization": device_util,
+        "memory_used": mem.used,
+        "memory_total": mem.total,
+        "temperature": float(temp),
+        "power_draw": power,
+        "fan_speed": fan,
+        "sm_clock_mhz": sm_clock,
+        "memory_clock_mhz": mem_clock,
+        "process_memory_used": process_memory_used,
+        "process_exclusive": process_exclusive,
+        "attributed_utilization": attributed_utilization,
+        "attributed_power": attributed_power,
+    }
+
+
+def sample_all(nvml: Any, handles: list[tuple[int, Any]], own_pid: int) -> list[dict[str, Any]]:
+    """Snapshot every GPU with one shared timestamp; a failing device is skipped, not fatal."""
+    pids = process_pids(own_pid)
+    now = time.time()
+    out: list[dict[str, Any]] = []
+    for index, handle in handles:
+        try:
+            snap = sample_gpu(nvml, handle, index, pids)
+        except Exception:
+            continue
+        snap["timestamp"] = now
+        out.append(snap)
+    return out

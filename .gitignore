@@ -46,7 +46,8 @@ scratch/
 local/
 
 # API key stores
-keys.json
+auth.json
+auth.json.lock
 
 # Scratch / screenshots
 /*.png

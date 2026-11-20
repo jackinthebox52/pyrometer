@@ -5,10 +5,13 @@ import type { Artifact, Metric, ParamStat, ProfileEvent, Run, RunEvent, RunLog, 
 import GradientHeatmap from '../components/GradientHeatmap.tsx'
 import LogViewer from '../components/LogViewer.tsx'
 import MediaGallery from '../components/MediaGallery.tsx'
+import SamplesViewer from '../components/SamplesViewer.tsx'
 import MemoryDeltaChart from '../components/MemoryDeltaChart.tsx'
 import HyperparamTable from '../components/HyperparamTable.tsx'
 import KernelTimeline from '../components/KernelTimeline.tsx'
 import MetricChart from '../components/MetricChart.tsx'
+import CompareChart from '../components/CompareChart.tsx'
+import type { RunSeries } from '../components/CompareChart.tsx'
 import OperatorBreakdown from '../components/OperatorBreakdown.tsx'
 import StatusBadge from '../components/StatusBadge.tsx'
 import { duration, formatBytes, formatMicroseconds, timeAgo } from '../utils/format.ts'
@@ -21,6 +24,10 @@ const EFFICIENCY_COLOR: Record<string, string> = {
   D: '#f97316',
   F: '#ef4444',
 }
+
+const GPU_COLORS = ['#22c55e', '#60a5fa', '#f97316', '#a78bfa', '#eab308', '#ec4899', '#14b8a6', '#ef4444']
+// Muted variants for whole-device series (same hue as the matching process series)
+const GPU_COLORS_DEVICE = ['#2f6b46', '#3a5f8f', '#8a4f25', '#5d4f8f', '#8a7a20', '#8a3a68', '#1f7a70', '#8a3030']
 
 // System metrics shown as charts.
 // preferKey: use this column when non-null (per-process attributed value);
@@ -434,8 +441,9 @@ export default function RunDetailPage() {
         setSummary(summaryData)
         setLoading(false)
 
-        // Only poll for running runs — completed runs never change
-        if (runData.status === 'running') {
+        // Only poll for live runs — finished runs never change. A crashed run keeps polling
+        // because a late heartbeat revives it to running.
+        if (runData.status === 'running' || runData.status === 'crashed') {
           intervalRef.current = setInterval(async () => {
             await Promise.all([
               fetchRun(), fetchMetrics(), fetchSystem(), fetchParamStats(),
@@ -475,7 +483,7 @@ export default function RunDetailPage() {
         else if (msg.type === 'run_updated') {
           fetchRun().then(() => {
             const status = runRef.current?.status
-            if (status && status !== 'running') {
+            if (status && status !== 'running' && status !== 'crashed') {
               // Run just finished — clear poll interval and grab final summary
               if (intervalRef.current) {
                 clearInterval(intervalRef.current)
@@ -525,6 +533,18 @@ export default function RunDetailPage() {
     () => [...snapshots].sort((a, b) => a.timestamp - b.timestamp),
     [snapshots],
   )
+  const gpuIndices = useMemo(
+    () => [...new Set(sortedSnapshots.map((s) => s.gpu_index ?? 0))].sort((a, b) => a - b),
+    [sortedSnapshots],
+  )
+
+  const axisSource = useMemo(
+    () => ({
+      byName: metricsByName,
+      startTime: run ? Date.parse(run.created_at) / 1000 : undefined,
+    }),
+    [metricsByName, run],
+  )
 
   if (loading) {
     return <RunDetailSkeleton />
@@ -553,7 +573,7 @@ export default function RunDetailPage() {
     .filter(Boolean)
     .join(' · ')
 
-  // X-axis for system charts: elapsed seconds from first snapshot
+  // GPUs that reported snapshots (CUDA ordinals); X-axis is elapsed seconds from the first snapshot
   const t0 = sortedSnapshots[0]?.timestamp ?? 0
 
   return (
@@ -746,6 +766,7 @@ export default function RunDetailPage() {
                 name={name}
                 data={metricsByName[name]}
                 events={showEvents ? runEvents : []}
+                source={axisSource}
               />
             ))}
           </div>
@@ -761,27 +782,46 @@ export default function RunDetailPage() {
             style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}
           >
             {SYSTEM_SERIES.map(({ key, preferKey, label, color, transform }) => {
-              // Use per-process attributed value when available, fall back to device-wide.
-              const hasAttributed = preferKey != null &&
-                sortedSnapshots.some((s) => s[preferKey as keyof SystemSnapshot] != null)
-              const activeKey = (hasAttributed && preferKey) ? preferKey : key
-              // If device-wide data is being shown (old run), note it in the label.
-              const displayLabel = preferKey && !hasAttributed ? `${label} (device)` : label
-
-              const chartData: Metric[] = sortedSnapshots
-                .filter((s) => s[activeKey as keyof SystemSnapshot] != null)
-                .map((s) => {
-                  const raw = s[activeKey as keyof SystemSnapshot] as number
-                  return {
+              const conv = (v: number) => (transform ? transform(v) : v)
+              const toMetrics = (gpu: number, k: keyof SystemSnapshot, name: string): Metric[] =>
+                sortedSnapshots
+                  .filter((s) => s.gpu_index === gpu && s[k] != null)
+                  .map((s) => ({
                     step: Math.round(s.timestamp - t0), // elapsed seconds
                     timestamp: s.timestamp,
-                    name: displayLabel,
-                    value: transform ? transform(raw) : raw,
-                  }
-                })
-              if (chartData.length === 0) return null
+                    name,
+                    value: conv(s[k] as number),
+                  }))
+
+              // One line per GPU; "process" (this run's own usage) and "device" (whole GPU, incl. other
+              // processes) are drawn separately when per-process numbers exist.
+              const hasProcess = preferKey != null &&
+                sortedSnapshots.some((s) => s[preferKey] != null)
+              const multi = gpuIndices.length > 1
+              const series: RunSeries[] = []
+              gpuIndices.forEach((gpu, i) => {
+                const base = GPU_COLORS[i % GPU_COLORS.length]
+                const tag = multi ? `GPU ${gpu}` : ''
+                if (hasProcess && preferKey) {
+                  const n = multi ? `${tag} process` : 'process'
+                  series.push({ runId: `${gpu}-p`, name: n, color: base, metrics: toMetrics(gpu, preferKey, n) })
+                  const d = multi ? `${tag} device` : 'device'
+                  series.push({ runId: `${gpu}-d`, name: d, color: GPU_COLORS_DEVICE[i % GPU_COLORS.length], metrics: toMetrics(gpu, key, d) })
+                } else {
+                  const n = multi ? tag : label
+                  series.push({ runId: `${gpu}-d`, name: n, color: base, metrics: toMetrics(gpu, key, n) })
+                }
+              })
+              const nonEmpty = series.filter((s) => s.metrics.length > 0)
+              if (nonEmpty.length === 0) return null
+              const displayLabel = preferKey && !hasProcess ? `${label} (device)` : label
+              if (nonEmpty.length === 1) {
+                return (
+                  <MetricChart key={key} name={displayLabel} data={nonEmpty[0].metrics} lineColor={color} />
+                )
+              }
               return (
-                <MetricChart key={key} name={displayLabel} data={chartData} lineColor={color} />
+                <CompareChart key={key} metricName={displayLabel} series={nonEmpty} smoothing={0} />
               )
             })}
           </div>
@@ -870,6 +910,9 @@ export default function RunDetailPage() {
         </h2>
         <MediaGallery runId={run.run_id} />
       </div>
+
+      {/* ── Samples (renders nothing when the run logged none) ── */}
+      <SamplesViewer runs={[{ runId: run.run_id, label: run.name }]} />
 
       {/* ── Profiler ── */}
       {profileSteps.length > 0 && (

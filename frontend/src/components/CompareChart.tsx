@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import {
+  Area,
   CartesianGrid,
+  ComposedChart,
   Line,
-  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -10,6 +11,13 @@ import {
 } from 'recharts'
 import type { Metric } from '../api/types.ts'
 import { formatMetricValue } from '../utils/format.ts'
+import { MAX_ALPHA, processSeries, useChartOptions } from '../utils/chartOptions.ts'
+import type { ChartOptions } from '../utils/chartOptions.ts'
+import { axisLabel, axisMetricName, formatXLabel, formatXTick, resolveXs, runHasAxis } from '../utils/xAxis.ts'
+import type { XSource } from '../utils/xAxis.ts'
+import { aggregate } from '../utils/grouping.ts'
+import type { BandKind } from '../utils/grouping.ts'
+import ChartControls from './ChartControls.tsx'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 export interface RunSeries {
@@ -17,6 +25,16 @@ export interface RunSeries {
   name: string
   color: string
   metrics: Metric[]
+  /** Enables the x-axis selector; resolved per run (each run's own axis metric / start time). */
+  source?: XSource
+}
+
+/** A set of runs drawn as one mean line (+ band when it has >= 2 runs). `id` must be a safe dataKey (no dots). */
+export interface GroupSeries {
+  id: string
+  name: string
+  color: string
+  runs: RunSeries[]
 }
 
 interface Props {
@@ -25,34 +43,99 @@ interface Props {
   smoothing: number   // global slider value from CompareView
   globalHiddenIds?: Set<string>
   expanded?: boolean
+  /** When set, runs are aggregated per group (mean line + band) instead of drawn individually. */
+  groups?: GroupSeries[]
+  band?: BandKind
 }
 
-/** Exponential moving average. alpha=0 → raw, alpha→1 → very smooth. */
-function applyEMA(values: number[], alpha: number): number[] {
-  if (alpha === 0 || values.length === 0) return values
-  const result: number[] = []
-  let ema = values[0]
-  for (const v of values) {
-    ema = alpha * ema + (1 - alpha) * v
-    result.push(ema)
-  }
-  return result
+interface Merged {
+  rows: Record<string, number | null>[]
+  dropped: number
+  skipped: number
+  nonMonotonic: string[]
+  span: number
 }
 
-/** Merge multiple run series into [{step, runId1: value, runId2: value, …}] for Recharts. */
+/** Merge run series into [{x, runId: smoothed, runId__raw: raw, …}] for Recharts. Each run resolves its own x. */
 function mergeSeriesData(
   series: RunSeries[],
-  alpha: number,
-): Record<string, number | string>[] {
-  const stepMap = new Map<number, Record<string, number | string>>()
+  opts: ChartOptions,
+  axis: string,
+  metricName: string,
+): Merged {
+  const xMap = new Map<number, Record<string, number | null>>()
+  let dropped = 0
+  let skipped = 0
+  const nonMonotonic: string[] = []
   for (const run of series) {
-    const smoothed = applyEMA(run.metrics.map((m) => m.value), alpha)
-    run.metrics.forEach((m, i) => {
-      if (!stepMap.has(m.step)) stepMap.set(m.step, { step: m.step })
-      stepMap.get(m.step)![run.runId] = smoothed[i]
+    const r = resolveXs(run.metrics, axis, run.source ?? {})
+    skipped += r.skipped
+    if (r.nonMonotonic) nonMonotonic.push(run.name)
+    // r.points is sorted by x, so EMA runs in x order.
+    const p = processSeries(r.points.map((pt) => pt.value), opts, metricName)
+    dropped += p.dropped
+    r.points.forEach((pt, i) => {
+      if (!xMap.has(pt.x)) xMap.set(pt.x, { x: pt.x })
+      const row = xMap.get(pt.x)!
+      row[run.runId] = p.smooth[i]
+      row[`${run.runId}__raw`] = p.raw[i]
     })
   }
-  return [...stepMap.values()].sort((a, b) => (a.step as number) - (b.step as number))
+  const rows = [...xMap.values()].sort((a, b) => (a.x as number) - (b.x as number))
+  const span = rows.length > 1 ? (rows[rows.length - 1].x as number) - (rows[0].x as number) : 0
+  return { rows, dropped, skipped, nonMonotonic, span }
+}
+
+/**
+ * Grouped variant of mergeSeriesData. Per run: resolve x, normalize/EMA/log-clip; per group: aggregate onto a
+ * common grid. Rows hold `<id>` (mean), `<id>__band` ([lo, hi]) and `<id>__n` (runs covering that x).
+ * Single-run groups are drawn as plain lines.
+ */
+function mergeGroupedData(
+  groups: GroupSeries[],
+  opts: ChartOptions,
+  axis: string,
+  metricName: string,
+  band: BandKind,
+): Merged {
+  const xMap = new Map<number, Record<string, number | number[] | null>>()
+  let dropped = 0
+  let skipped = 0
+  const nonMonotonic: string[] = []
+  const put = (x: number, key: string, v: number | number[] | null) => {
+    if (!xMap.has(x)) xMap.set(x, { x })
+    xMap.get(x)![key] = v
+  }
+  for (const g of groups) {
+    const perRun: { x: number; y: number }[][] = []
+    for (const run of g.runs) {
+      const r = resolveXs(run.metrics, axis, run.source ?? {})
+      skipped += r.skipped
+      if (r.nonMonotonic) nonMonotonic.push(run.name)
+      const p = processSeries(r.points.map((pt) => pt.value), opts, metricName)
+      dropped += p.dropped
+      const pts: { x: number; y: number }[] = []
+      r.points.forEach((pt, i) => {
+        const v = p.smooth[i]
+        if (v != null && Number.isFinite(v)) pts.push({ x: pt.x, y: v })
+      })
+      perRun.push(pts)
+    }
+    if (perRun.length === 1) {
+      for (const pt of perRun[0]) put(pt.x, g.id, pt.y)
+      continue
+    }
+    for (const a of aggregate(perRun, band)) {
+      put(a.x, g.id, a.mean)
+      // Log scale cannot draw a band reaching <= 0: keep it just above zero.
+      const lo = opts.logY && a.lo <= 0 ? a.mean * 0.01 : a.lo
+      put(a.x, `${g.id}__band`, [lo, a.hi])
+      put(a.x, `${g.id}__n`, a.n)
+    }
+  }
+  const rows = [...xMap.values()].sort((a, b) => (a.x as number) - (b.x as number)) as Record<string, number | null>[]
+  const span = rows.length > 1 ? (rows[rows.length - 1].x as number) - (rows[0].x as number) : 0
+  return { rows, dropped, skipped, nonMonotonic, span }
 }
 
 export default function CompareChart({
@@ -61,9 +144,11 @@ export default function CompareChart({
   smoothing,
   globalHiddenIds,
   expanded = false,
+  groups,
+  band = 'std',
 }: Props) {
-  const [alpha, setAlpha] = useState(smoothing)
-  useEffect(() => { setAlpha(smoothing) }, [smoothing])
+  const [opts, setOpts] = useChartOptions(`compare:${metricName}`, smoothing)
+  const { alpha } = opts
 
   const [isExpanded, setIsExpanded] = useState(false)
   const [localHiddenIds, setLocalHiddenIds] = useState<Set<string>>(new Set())
@@ -83,13 +168,56 @@ export default function CompareChart({
   const onWheel = useCallback((e: React.WheelEvent) => {
     if (!e.shiftKey) return
     e.preventDefault()
-    setAlpha((a) => Math.min(0.97, Math.max(0, a + (e.deltaY < 0 ? 0.05 : -0.05))))
-  }, [])
+    setOpts({ alpha: Math.min(MAX_ALPHA, Math.max(0, alpha + (e.deltaY < 0 ? 0.05 : -0.05))) })
+  }, [alpha, setOpts])
 
-  const visibleSeries = series.filter((s) => !isHidden(s.runId))
-  const hasData = visibleSeries.some((s) => s.metrics.length > 0)
-  const data = hasData ? mergeSeriesData(visibleSeries, alpha) : []
-  const smoothPct = Math.round(alpha * 100)
+  const hasAxisSelector = series.some((s) => s.source)
+  const axisNames = useMemo(() => {
+    const names = new Set<string>()
+    for (const s of series) for (const n of Object.keys(s.source?.byName ?? {})) names.add(n)
+    return [...names].sort()
+  }, [series])
+  const axis = hasAxisSelector ? opts.xAxis : 'step'
+  // Runs lacking the chosen axis metric cannot be placed: excluded with a note.
+  const excluded = series.filter((s) => !runHasAxis(s.source ?? {}, axis))
+  const visibleSeries = series.filter(
+    (s) => !isHidden(s.runId) && runHasAxis(s.source ?? {}, axis),
+  )
+  // Grouped mode: per-group visibility; runs lacking the axis are dropped from their group.
+  const visibleGroups = (groups ?? [])
+    .filter((g) => !isHidden(g.id))
+    .map((g) => ({ ...g, runs: g.runs.filter((r) => runHasAxis(r.source ?? {}, axis)) }))
+    .filter((g) => g.runs.length > 0)
+  const hasData = groups
+    ? visibleGroups.some((g) => g.runs.some((r) => r.metrics.length > 0))
+    : visibleSeries.some((s) => s.metrics.length > 0)
+  const { rows: data, dropped, skipped, nonMonotonic, span } = useMemo(
+    () =>
+      hasData
+        ? groups
+          ? mergeGroupedData(visibleGroups, opts, axis, metricName, band)
+          : mergeSeriesData(visibleSeries, opts, axis, metricName)
+        : { rows: [] as Record<string, number | null>[], dropped: 0, skipped: 0, nonMonotonic: [] as string[], span: 0 },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [series, groups, band, localHiddenIds, globalHiddenIds, opts, metricName, axis],
+  )
+  const tickFmt = useMemo(() => formatXTick(axis, span), [axis, span])
+  const legendEntries = groups
+    ? groups.map((g) => ({
+        id: g.id,
+        name: g.name,
+        color: g.color,
+        badge: g.runs.length > 1 ? `n=${g.runs.length}` : null,
+      }))
+    : series.map((s) => ({
+        id: s.runId,
+        name: s.name,
+        color: s.color,
+        badge:
+          !isHidden(s.runId) && s.metrics.length > 0
+            ? formatMetricValue(s.metrics[s.metrics.length - 1].value)
+            : null,
+      }))
   const chartHeight = expanded ? 440 : 200
 
   return (
@@ -105,25 +233,33 @@ export default function CompareChart({
             <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
               {metricName}
             </span>
-            {alpha > 0 && (
-              <span className="text-xs font-mono" style={{ color: '#4a4e60' }}
-                title="Shift+scroll to adjust smoothing">
-                smooth {smoothPct}%
-              </span>
-            )}
           </div>
           {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
         </div>
+        <ChartControls
+          opts={opts}
+          onChange={setOpts}
+          dropped={dropped}
+          axisMetrics={hasAxisSelector ? axisNames : undefined}
+        />
+        {(excluded.length > 0 || skipped > 0 || nonMonotonic.length > 0) && (
+          <div className="text-xs font-mono mb-2" style={{ color: '#f59e0b', fontSize: 10 }}>
+            {excluded.length > 0 &&
+              `Excluded (no ${axisMetricName(axis)} logged): ${excluded.map((s) => s.name).join(', ')}. `}
+            {skipped > 0 && `${skipped} point${skipped === 1 ? '' : 's'} without ${axisLabel(axis)} hidden. `}
+            {nonMonotonic.length > 0 &&
+              `${axisLabel(axis)} is not monotonic in step for ${nonMonotonic.join(', ')}; points sorted by x.`}
+          </div>
+        )}
         <div className="flex flex-wrap gap-3 mb-3">
-          {series.map((s) => {
-            const hidden = isHidden(s.runId)
-            const last = !hidden && s.metrics.length > 0 ? s.metrics[s.metrics.length - 1].value : null
+          {legendEntries.map((s) => {
+            const hidden = isHidden(s.id)
             return (
               <span
-                key={s.runId}
+                key={s.id}
                 className="text-xs font-mono flex items-center gap-1.5 cursor-pointer select-none"
                 style={{ opacity: hidden ? 0.35 : 1 }}
-                onClick={() => toggleLocal(s.runId)}
+                onClick={() => toggleLocal(s.id)}
                 title={hidden ? 'Click to show' : 'Click to hide'}
               >
                 <span style={{
@@ -131,9 +267,7 @@ export default function CompareChart({
                   backgroundColor: s.color, borderRadius: 1, flexShrink: 0,
                 }} />
                 <span style={{ color: '#8b8fa8' }}>{s.name}</span>
-                {last !== null && (
-                  <span style={{ color: s.color }}>{formatMetricValue(last)}</span>
-                )}
+                {s.badge != null && <span style={{ color: s.color }}>{s.badge}</span>}
               </span>
             )
           })}
@@ -147,10 +281,13 @@ export default function CompareChart({
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={chartHeight}>
-              <LineChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+              <ComposedChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" vertical={false} />
                 <XAxis
-                  dataKey="step"
+                  dataKey="x"
+                  type="number"
+                  domain={['dataMin', 'dataMax']}
+                  tickFormatter={tickFmt}
                   tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
                   tickLine={false}
                   axisLine={false}
@@ -162,6 +299,9 @@ export default function CompareChart({
                   axisLine={false}
                   tickFormatter={formatMetricValue}
                   width={35}
+                  scale={opts.logY ? 'log' : 'auto'}
+                  domain={opts.logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
+                  allowDataOverflow={opts.logY}
                 />
                 <Tooltip
                   contentStyle={{
@@ -173,15 +313,63 @@ export default function CompareChart({
                     padding: '6px 10px',
                   }}
                   labelStyle={{ color: '#8b8fa8', marginBottom: 4 }}
-                  labelFormatter={(v) => `step ${v}`}
-                  formatter={(v: number, runId: string) => {
-                    const run = series.find((s) => s.runId === runId)
-                    return [formatMetricValue(v), run?.name ?? runId]
+                  labelFormatter={(v) => formatXLabel(axis, Number(v))}
+                  formatter={(v: number, key: string, item: { payload?: Record<string, number | null> }) => {
+                    const g = groups?.find((x) => x.id === key)
+                    if (g) {
+                      const n = item.payload?.[`${key}__n`]
+                      return [v == null ? '—' : formatMetricValue(v), n != null ? `${g.name} (n=${n})` : g.name]
+                    }
+                    const run = series.find((s) => s.runId === key)
+                    return [v == null ? '—' : formatMetricValue(v), run?.name ?? key]
                   }}
                   itemStyle={{ padding: '1px 0' }}
                   cursor={{ stroke: '#353840', strokeWidth: 1 }}
                 />
-                {visibleSeries.map((s) => (
+                {groups && visibleGroups.map((g) => (
+                  <Area
+                    key={`${g.id}__band`}
+                    type="monotone"
+                    dataKey={`${g.id}__band`}
+                    stroke="none"
+                    fill={g.color}
+                    fillOpacity={0.18}
+                    dot={false}
+                    activeDot={false}
+                    isAnimationActive={false}
+                    tooltipType="none"
+                    connectNulls
+                  />
+                ))}
+                {groups && visibleGroups.map((g) => (
+                  <Line
+                    key={g.id}
+                    type="monotone"
+                    dataKey={g.id}
+                    stroke={g.color}
+                    strokeWidth={1.5}
+                    dot={false}
+                    activeDot={{ r: 3, fill: g.color, strokeWidth: 0 }}
+                    isAnimationActive={false}
+                    connectNulls
+                  />
+                ))}
+                {!groups && alpha > 0 && visibleSeries.map((s) => (
+                  <Line
+                    key={`${s.runId}__raw`}
+                    type="monotone"
+                    dataKey={`${s.runId}__raw`}
+                    stroke={s.color}
+                    strokeOpacity={0.25}
+                    strokeWidth={1}
+                    dot={false}
+                    activeDot={false}
+                    isAnimationActive={false}
+                    tooltipType="none"
+                    connectNulls
+                  />
+                ))}
+                {!groups && visibleSeries.map((s) => (
                   <Line
                     key={s.runId}
                     type="monotone"
@@ -194,7 +382,7 @@ export default function CompareChart({
                     connectNulls
                   />
                 ))}
-              </LineChart>
+              </ComposedChart>
             </ResponsiveContainer>
           )}
 
@@ -215,6 +403,8 @@ export default function CompareChart({
             series={series}
             smoothing={alpha}
             globalHiddenIds={globalHiddenIds}
+            groups={groups}
+            band={band}
             expanded
           />
         </ExpandModal>

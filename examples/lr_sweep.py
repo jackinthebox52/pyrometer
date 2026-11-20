@@ -4,7 +4,8 @@ Uses sklearn's digits dataset: 1797 samples of 8x8 scanned digit images
 (flattened to 64 features), 10 classes. An MLP needs several epochs to converge
 and different LRs produce visibly different trajectories.
 
-Three runs: too high (unstable early, higher final loss), baseline (clean
+Three LR arms x three seeds (nine runs, EPOCHS shrunk to keep runtime similar). In the compare view,
+use "Group by hyperparams" (ignoring `seed`) to get one mean +/- std band per LR. Arms: too high (unstable early, higher final loss), baseline (clean
 convergence), too low (still descending at the last epoch).
 
 Usage:
@@ -12,6 +13,7 @@ Usage:
     python examples/lr_sweep.py  # terminal 2
 """
 
+import itertools
 import os
 import sys
 from contextlib import nullcontext
@@ -42,7 +44,8 @@ N_FEATURES = 64
 N_CLASSES = 10
 
 # ── Training ──────────────────────────────────────────────────────────────────
-EPOCHS = 40
+EPOCHS = 14
+SEEDS = [0, 1, 2]
 BATCH_SIZE = 32
 
 LR_CONFIGS = [
@@ -78,6 +81,7 @@ def build_model() -> nn.Module:
 def train_one_run(
     run: pyrometer.Run,
     lr: float,
+    seed: int,
     X_train_np: np.ndarray,
     y_train_np: np.ndarray,
     X_val_np: np.ndarray,
@@ -91,6 +95,7 @@ def train_one_run(
     X_val = torch.from_numpy(X_val_np).to(device)
     y_val = torch.from_numpy(y_val_np).to(device)
 
+    torch.manual_seed(seed)
     model = build_model().to(device)
     run.watch(model, log_freq=20)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -136,6 +141,8 @@ def train_one_run(
                     "train/accuracy": (logits.argmax(1) == yb).float().mean().item(),
                     "train/grad_norm": grad_norm,
                     "lr": scheduler.get_last_lr()[0],
+                    # Log your own x-axis as a metric; pick it in the chart's x-axis selector.
+                    "samples_seen": (global_step + 1) * BATCH_SIZE,
                 },
                 step=global_step,
             )
@@ -151,11 +158,22 @@ def train_one_run(
             val_loss = criterion(val_logits, y_val).item()
             val_acc = (val_logits.argmax(1) == y_val).float().mean().item()
 
-        run.log({"val/loss": val_loss, "val/accuracy": val_acc}, step=global_step)
+        run.log(
+            {"val/loss": val_loss, "val/accuracy": val_acc, "samples_seen": global_step * BATCH_SIZE},
+            step=global_step,
+        )
 
         # Log class-confidence heatmap: rows=classes, cols=16 val samples
         conf_img = torch.softmax(val_logits[:16], dim=1).T.unsqueeze(0).cpu()
         run.log_image("class_confidence", conf_img, step=global_step)
+
+        # Synthetic prompt/completion/reward samples (stand-in for LLM generations), low cadence
+        if (epoch + 1) % 5 == 0:
+            run.log_samples(global_step, [
+                {"prompt": f"What is {a} + {b}?", "completion": f"The answer is {a + b + (i % 2)}.",
+                 "reward": round(float(max(0.0, 1.0 - val_loss / 3 - 0.3 * (i % 2))), 3), "reference": str(a + b)}
+                for i, (a, b) in enumerate([(2, 3), (7, 5), (12, 9), (4, 4)])
+            ], name="eval_generations")
 
         print(
             f"  epoch {epoch + 1:2d}/{EPOCHS} — "
@@ -178,15 +196,20 @@ def main() -> None:
     print(f"  {len(X_train)} train / {len(X_val)} val — 64 features, 10 classes\n")
 
     steps_per_epoch = len(X_train) // BATCH_SIZE
-    print(f"Running LR sweep: {len(LR_CONFIGS)} runs × {EPOCHS} epochs × {steps_per_epoch} steps/epoch\n")
+    print(
+        f"Running LR sweep: {len(LR_CONFIGS)} LRs × {len(SEEDS)} seeds × {EPOCHS} epochs × "
+        f"{steps_per_epoch} steps/epoch\n"
+    )
 
-    for config in LR_CONFIGS:
+    for config, seed in itertools.product(LR_CONFIGS, SEEDS):
         lr = config["lr"]
+        run_name = f"{config['name']}-s{seed}"
         run = pyrometer.init(
-            name=config["name"],
+            name=run_name,
             hyperparams={
                 "optimizer": "AdamW",
                 "lr": lr,
+                "seed": seed,
                 "weight_decay": 0.01,
                 "batch_size": BATCH_SIZE,
                 "hidden_dims": [256, 128],
@@ -198,16 +221,16 @@ def main() -> None:
                 "lr_schedule": "cosine",
             },
             tags=config["tags"],
-            notes=f"LR sweep arm: lr={lr}. Same AdamW+cosine setup, same train/val split.",
+            notes=f"LR sweep arm: lr={lr}, seed={seed}. Same AdamW+cosine setup, same train/val split.",
         )
-        print(f"[{config['name']}] run_id={run.run_id}")
+        print(f"[{run_name}] run_id={run.run_id}")
 
-        train_one_run(run, lr, X_train, y_train, X_val, y_val)
+        train_one_run(run, lr, seed, X_train, y_train, X_val, y_val)
 
         run.finish()
-        print(f"[{config['name']}] done\n")
+        print(f"[{run_name}] done\n")
 
-    print("LR sweep complete. Open the dashboard and select all three runs to compare.")
+    print("LR sweep complete. Open the dashboard and select all runs and group by hyperparams (ignore seed).")
 
 
 if __name__ == "__main__":

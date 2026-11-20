@@ -66,9 +66,9 @@ The Pyrometer server is a FastAPI application that:
 
 ## Authentication
 
-Every endpoint except `GET /health` and the `/auth/*` endpoints below requires a
-credential (see [auth.md](auth.md)). Reads (`GET`, WebSocket `/ws`) need the `read`
-scope; writes (`POST`/`PATCH`) need `ingest`.
+Every endpoint except `GET /health` and the `/auth/*` endpoints below requires a credential (see
+[auth.md](auth.md)). Run data is also scoped by **project**: callers only see runs in projects they can read, and
+requests for anything else return `404`.
 
 ```bash
 curl -H "Authorization: Bearer $PYROMETER_API_KEY" http://localhost:8321/runs
@@ -77,13 +77,69 @@ curl -H "Authorization: Bearer $PYROMETER_API_KEY" http://localhost:8321/runs
 | Status | Meaning |
 |--------|---------|
 | `401` | Missing or invalid credentials (`WWW-Authenticate: Bearer`) |
-| `403` | Valid key, but it lacks the required scope |
+| `403` | Authenticated, but not allowed: e.g. an API key on `/admin/*`, a project key registering a project, a dashboard session writing run data, or a cross-origin browser request |
+| `404` | Also returned for runs/projects the caller may not see |
+| `429` | Too many failed login/setup attempts |
+
+### Session
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/auth/session` | `{"auth": "required"\|"off", "authenticated": bool, "user": str\|null}` |
-| `POST` | `/auth/login` | Body `{"key": "..."}`. Exchanges a `read` key for an HttpOnly session cookie |
-| `POST` | `/auth/logout` | Clears the session cookie |
+| `GET` | `/auth/session` | `{"auth": "required"\|"off", "state": "setup_required"\|"login"\|"ready", "authenticated": bool, "user": str\|null, "role": "admin"\|"user"\|"global"\|"project"\|null}` |
+| `POST` | `/auth/setup` | First run. Body `{"token", "username", "password"}` (6+ chars). Creates the first admin and signs in |
+| `POST` | `/auth/login` | Body `{"username", "password"}`. Sets an HttpOnly session cookie |
+| `POST` | `/auth/logout` | Ends the session and clears the cookie |
+| `POST` | `/auth/password` | Body `{"current", "new"}`. Dashboard users only; same-origin |
+
+### Projects
+
+| Method | Path | Who | Description |
+|---|---|---|---|
+| `GET` | `/projects` | any | Projects the caller can see, with `visibility`, `runs`, `created_by` |
+| `POST` | `/projects` | global key, admin | Body `{"name", "visibility": "public"\|"private"}`. Returns `{"project", "key"}`; for a private project `key` is its own API key, shown once. `409` if the name exists |
+
+Names are 1-64 characters: letters, digits, `.`, `_`, `-`. `POST /runs` takes an optional `"project"`; a global
+key registers an unknown project as public, a project key defaults to its own project.
+
+### Admin only
+
+Session or trusted proxy; state changes must be same-origin.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` / `POST` | `/admin/keys` | List keys / create one. Body `{"name", "project"?}`; the key is returned only on creation |
+| `DELETE` | `/admin/keys/{id}` | Revoke a key |
+| `GET` / `POST` | `/admin/users` | List users / create `{"username", "password", "role": "user"\|"admin"}` |
+| `PATCH` | `/admin/users/{username}` | `{"role"?, "password"?}` |
+| `DELETE` | `/admin/users/{username}` | Delete (not yourself, not the last admin); ends their sessions and memberships |
+| `GET` | `/admin/projects/{name}` | Project plus `members` |
+| `PATCH` | `/admin/projects/{name}` | `{"visibility"?, "members"?: [usernames]}` |
+| `GET` / `POST` | `/admin/alerts` | List / create webhook alert rules (see [Alerts](#alerts)) |
+| `PATCH` / `DELETE` | `/admin/alerts/{id}` | Update (e.g. `{"enabled": false}`) / delete a rule |
+| `POST` | `/admin/alerts/{id}/test` | Send a test message to the rule's webhook now (`502` if delivery fails) |
+
+In `--no-auth` local mode all endpoints are open. A WebSocket without valid credentials is rejected at the handshake, and
+events are only delivered for runs the connected user may see.
+
+--------|---------|
+| `401` | Missing or invalid credentials (`WWW-Authenticate: Bearer`) |
+| `403` | Authenticated, but not allowed: an API key on `/admin/*`, a browser session writing run data, or a cross-origin admin request |
+| `429` | Too many failed login/setup attempts |
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/auth/session` | `{"auth": "required"\|"off", "state": "setup_required"\|"login"\|"ready", "authenticated": bool, "user": str\|null}` |
+| `POST` | `/auth/setup` | First run. Body `{"token": "...", "password": "..."}` (6+ chars). Sets the admin password, signs in |
+| `POST` | `/auth/login` | Body `{"password": "..."}`. Sets an HttpOnly session cookie |
+| `POST` | `/auth/logout` | Ends the session and clears the cookie |
+
+Admin only (session or trusted proxy; state changes must be same-origin):
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/keys` | List API keys (id, name, created_at) |
+| `POST` | `/admin/keys` | Body `{"name": "..."}`. Returns `{"id", "name", "key"}`; the key is shown only here |
+| `DELETE` | `/admin/keys/{id}` | Revoke a key |
 
 In `--no-auth` local mode all endpoints are open. A WebSocket without valid credentials is rejected at the handshake.
 
@@ -176,6 +232,9 @@ Create a new training run.
 | `pytorch_version` | `string` | No | PyTorch version string. |
 | `python_version` | `string` | No | Python version string. |
 | `hostname` | `string` | No | Machine hostname. |
+| `run_id` | `string` | No | Client-chosen id (`[A-Za-z0-9_-]`, 8-64 chars). The SDK always sends one. Repeating a create for an existing id returns that run unchanged (idempotent), so offline runs can be synced safely. Minted by the server if absent. |
+| `created_at` | `number` | No | Unix timestamp of run creation (offline runs keep their original start time). |
+| `resume` | `"must" \| "auto"` | No | Needs `run_id`. If the run exists, reattach: status back to `running` (from any status), heartbeat refreshed, name/hyperparams/tags kept. `"must"` returns 404 if the run is unknown, `"auto"` creates it. Requires write access to the run's project (otherwise 404); a `project` different from the run's gives 409. Response adds `resumed: true`, `previous_status`, `last_step` (max logged step or null), `hyperparams`, `tags`. Without `resume`, an existing id is returned unchanged. |
 
 **Response** (201 Created):
 
@@ -277,7 +336,7 @@ Update run status or notes.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | `string` | No | One of: `running`, `completed`, `crashed`, `killed` |
+| `status` | `string` | No | One of: `running`, `completed`, `failed`, `crashed`, `killed`. An explicit status always overwrites the current one (so a replayed `completed` from `pyrometer sync` replaces a server-detected `crashed`) |
 | `notes` | `string` | No | Updated notes text |
 
 **Response**:
@@ -292,6 +351,27 @@ Update run status or notes.
 ```
 
 **WebSocket Event**: `{"type": "run_updated", "run_id": "..."}`
+
+---
+
+### POST /runs/{run_id}/heartbeat
+
+Liveness ping, sent by the SDK every 30 s. Updates `last_heartbeat` (also returned by `GET /runs` and
+`GET /runs/{id}`). A `crashed` run goes back to `running`; `completed`/`failed`/`killed` are never changed.
+Returns `{"data": {"alive": true}}`, or 404 for an unknown run.
+
+**Crash detection**: a `running` run whose `last_heartbeat` is older than `PYROMETER_HEARTBEAT_TIMEOUT` seconds
+(default 300) becomes `crashed` (checked on every run read and by a 30 s background sweep that broadcasts
+`run_updated`). Runs created before heartbeats existed have no timestamp and are never auto-crashed.
+
+---
+
+### Idempotent ingestion (`X-Pyrometer-Batch`)
+
+Every `POST /runs/{run_id}/...` ingest route (metrics, profile, system, param-stats, events, logs, artifacts, media)
+accepts an optional `X-Pyrometer-Batch` header: a client-generated id, unique per payload. The server remembers ids
+per run (30 days) and answers a repeat with `{"data": {"inserted": 0, "duplicate": true}}` without inserting
+anything. The SDK sets it on every send so retries after a lost response are safe.
 
 ---
 
@@ -525,7 +605,8 @@ Ingest a GPU system snapshot.
   "process_memory_used": 30064771072,
   "process_exclusive": false,
   "attributed_utilization": 85.2,
-  "attributed_power": 245.0
+  "attributed_power": 245.0,
+  "gpu_index": 0
 }
 ```
 
@@ -544,6 +625,7 @@ Ingest a GPU system snapshot.
 | `process_exclusive` | `boolean` | True if process has exclusive context |
 | `attributed_utilization` | `float` | Process-attributed GPU utilization (%) |
 | `attributed_power` | `float` | Process-attributed power draw (W) |
+| `gpu_index` | `integer` | CUDA ordinal of the GPU (default 0). The SDK posts one snapshot per visible GPU per poll, sharing a timestamp. `GET` always returns `gpu_index` (old rows = 0). |
 
 **Response** (201 Created):
 
@@ -1001,6 +1083,29 @@ Get media names in insertion order.
 
 ---
 
+### `POST /runs/{run_id}/samples`
+
+Ingest generation samples (`run.log_samples`). Idempotent via `X-Pyrometer-Batch`.
+
+```json
+{"name": "eval_generations", "step": 100, "timestamp": 1700000000.0,
+ "samples": [{"prompt": "...", "completion": "...", "reward": 0.8}]}
+```
+
+Limits: 500 samples per call, 64 KB per sample (serialized JSON), 4 MB per call; violations return HTTP 413 with
+`error` set. Response: `{"data": {"inserted": 1}, "error": null}`.
+
+### `GET /runs/{run_id}/samples/steps`
+
+Returns `[{"name", "step", "count", "timestamp"}]` per sample stream and step.
+
+### `GET /runs/{run_id}/samples?name=&step=&limit=50&offset=0`
+
+One page (limit capped at 200) of samples: `{"data": {"total": 120, "items": [{"idx": 0, "sample": {...}}]}}`.
+`GET /runs/{run_id}/llm-summary` also includes a `SAMPLES` section (latest step's top/bottom 3 by reward, truncated).
+
+---
+
 ## Run Summaries
 
 ### `GET /runs/{run_id}/summary`
@@ -1146,3 +1251,33 @@ The server does not implement rate limiting in v0.1. All endpoints are designed 
 ## CORS
 
 CORS is enabled for all origins (`*`) to allow development from different ports. This is intentional for the self-hosted, single-user use case.
+
+---
+
+## Alerts
+
+Admin only. Rules send a webhook when something happens. Delivery is asynchronous (a worker thread with a
+bounded queue and a 5 second timeout) and never delays ingestion.
+
+`POST /admin/alerts` body:
+
+```json
+{"name": "loss blew up", "kind": "metric_threshold", "url": "https://hooks.example.com/abc",
+ "format": "slack", "project": null, "metric": "loss", "op": ">", "threshold": 5.0, "enabled": true}
+```
+
+| Field | Values |
+|---|---|
+| `kind` | `run_crashed`, `run_failed`, `event` (needs `min_severity`: `info`/`warning`/`error`/`critical`, default `error`), `anomaly` (`anomaly_detected` events, including NaN/Inf), `metric_threshold` (needs `metric`, `op` in `>` `>=` `<` `<=`, `threshold`) |
+| `format` | `generic` (JSON `{title, message, severity, rule, link}`), `slack`, `discord`, `ntfy` (plain body, `Title`/`Priority`/`Click` headers) |
+| `project` | Restrict to one project; `null` = all |
+
+The webhook URL is a secret: it is stored server-side, never logged, never shown to non-admins, and every
+response masks it to `scheme://host/…`. To change it, `PATCH` a new `url`.
+
+Behaviour: `run_crashed` fires once when the server marks a run crashed (sweeper or lazy check);
+`run_failed` on the PATCH transition to `failed` (a replayed PATCH does not alert again); events alert once
+per ingested batch (a duplicate `X-Pyrometer-Batch` does not); metric rules fire when a metric **crosses** the
+threshold, not on every point beyond it. Alerts carry only run name, project and an optional link. Each rule is
+limited to `PYROMETER_ALERT_RATE` alerts per minute (default 10) and identical alerts are suppressed for 5 minutes.
+Set `PYROMETER_PUBLIC_URL` (e.g. `https://pyrometer.example.com`) to include `<url>/#/runs/<id>` links.

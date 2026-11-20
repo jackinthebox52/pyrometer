@@ -77,7 +77,7 @@ The fixed left panel lists all runs, sorted newest-first.
 Each row displays:
 
 - **Checkbox**: Select for comparison (color-coded)
-- **Status dot**: Green (running), blue (completed), red (crashed/killed)
+- **Status dot**: Green (running), blue (completed), orange (failed), red (crashed: no heartbeat from the SDK), yellow (killed)
 - **Run name**: Click to navigate to run detail
 - **Time ago**: When the run was created (e.g., "2 hours ago")
 - **Tags**: Hashtag pills for filtering
@@ -242,6 +242,30 @@ Line charts for all logged metrics (e.g., `train/loss`, `val/accuracy`, `lr`).
 | **No animation** | `isAnimationActive={false}` prevents jank on rapid polls |
 | **Tooltip** | Hover for exact step and value |
 | **Event markers** | Vertical lines for logged events (toggle on/off) |
+| **Chart options** | Per-chart log y-scale, EMA smoothing slider and normalization (see below) |
+
+#### Chart Options
+
+Every metric chart (run detail, compare view, and the expanded modal) has a control row:
+
+- **log**: logarithmic y-axis. Values <= 0 cannot be shown and are hidden; the chart notes how many.
+- **raw / ÷ first / % of best**: normalization. `÷ first` divides by the first value (1.0 = start), which makes
+  runs with different scales comparable. `% of best` expresses values as a percentage of the best value seen
+  (minimum for metrics whose name contains loss/err/perplexity/latency/time/grad_norm, otherwise maximum).
+- **smooth**: EMA smoothing, 0 to 0.99 (Shift+scroll over a chart also adjusts it). The raw curve is drawn faded
+  behind the smoothed one. Normalization is applied before smoothing, log clipping after.
+
+- **x: step / wall time / elapsed / any metric**: x-axis selector (run detail and compare view). Wall time shows clock
+  times, elapsed is time since the run was created, and any logged metric (e.g. `tokens_seen`, `env_steps`) can be the
+  axis; see "log your axis as a metric" in the SDK reference. Metric axes are joined on step. If the axis is not
+  monotonic in step the points are sorted by x and the chart says so; points with no axis value at their step are
+  hidden (counted in a note). EMA smoothing runs in x order. Event markers are moved to the matching x (event
+  timestamp for time axes, the axis value at the latest logged step <= the event's step for a metric axis); markers
+  that cannot be placed are hidden with a note. In the compare view a metric axis is resolved per run (each run's
+  own values); runs that never logged the metric are excluded from that chart with a note listing them.
+
+Choices are remembered per metric name (separately for run detail and compare view) in the browser's localStorage.
+In the compare view the global EMA slider still sets smoothing for all charts; a per-chart change afterwards wins.
 
 #### Event Markers
 
@@ -256,6 +280,11 @@ Toggle event markers with the **"events on/off"** button in the metrics header. 
 ### GPU Stats
 
 Time-series charts for GPU system metrics captured by the pynvml polling thread.
+
+Every GPU visible to the training process is monitored. With more than one GPU, each chart has one line per GPU
+(`GPU 0`, `GPU 1`, ...). Where per-process numbers are available, utilization, power and VRAM show two lines per
+GPU: **process** (what this run uses) and **device** (the whole GPU, including other processes), in a muted shade of
+the same colour. Runs recorded before multi-GPU support appear as a single GPU 0.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -470,6 +499,14 @@ Lists files tracked via `run.log_artifact()`:
 | checkpoint | `/ckpt/model_epoch50.pt` | 256 MB | 5000 | `{"epoch": 50, "val_loss": 0.23}` |
 | config | `config.yaml` | 2 KB | 0 | `{"format": "yaml"}` |
 
+#### Samples
+
+Shown on the run detail page (and in the compare view) when `run.log_samples()` was used. Pick a stream and step;
+the table is paginated server-side (50 per page), columns come from the sample keys, click a header to sort,
+use the filter box to search the loaded page, and click "more" to expand long text. In the run view, "add pane"
+opens another step side by side; in compare view each run gets a pane. The diamond button pins a prompt so every
+pane shows only rows with that exact prompt.
+
 #### Media Gallery
 
 Grid of logged images with a step slider:
@@ -502,6 +539,23 @@ Compare multiple runs side-by-side with metric overlays and hyperparameter diffs
 2. Each selected run gets a unique color from the palette
 3. Click the "Compare N runs →" button in the sidebar footer
 4. Navigate to `#/compare?ids=id1,id2,id3`
+
+### Grouping runs (seeds)
+
+The **Group** control in the compare header aggregates runs into groups, drawn as one mean line with a band:
+
+- **hyperparams**: runs whose hyperparams are equal once the ignored keys are dropped (default `seed`; the "ignore"
+  box takes a comma-separated list). Group labels show the hyperparams that differ between groups (e.g. `lr=0.01`).
+- **tags**: runs with the same tags after dropping tags that every compared run shares.
+- Band: mean +/- sample std, or mean with min/max.
+
+Each run is first resolved onto the chart's x-axis, normalized, smoothed (EMA) and log-clipped as usual; then each
+group is interpolated linearly onto the union of its runs' x values and aggregated. A point is only drawn where at
+least 2 runs cover that x (no extrapolation), and the tooltip shows `n=` for the runs behind each point. Under log
+scale a band edge that would be <= 0 is clamped just above zero. Groups with one run are plain lines (no band).
+The run pills and per-chart legend toggle whole groups while grouping is on; the per-run raw faded curve is not drawn.
+Grouping is client-side and not remembered across reloads. `examples/lr_sweep.py` and `examples/optimizer_compare.py`
+run three seeds per arm for this.
 
 ### Metric Overlay
 
@@ -662,3 +716,12 @@ Use the **"Copy for LLM"** button to export a run summary for:
 2. Open the **Profiler View** and look at the Operator Breakdown
 3. Check **Optimization Hints** for suggestions
 4. Review the **Kernel Timeline** for CPU bottlenecks
+
+---
+
+## Alerts (Settings)
+
+Admins see an **Alerts** section in Settings. Add a rule with a name, a webhook URL (generic JSON, ntfy,
+Discord or Slack), a trigger (run crashed, run failed, event at or above a severity, anomaly/NaN, or a metric
+threshold such as `loss > 5`) and an optional project. **Send test** posts a test message; rules can be
+disabled or deleted. After saving, the URL is shown masked (host only). See [server-api.md](server-api.md#alerts).

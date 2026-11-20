@@ -1,4 +1,4 @@
-import type { ApiResponse, Artifact, MediaItem, Metric, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, Session, SystemSnapshot } from './types.ts'
+import type { AlertRule, AlertRuleInput, ApiKey, ApiResponse, Artifact, CreatedApiKey, CreatedProject, Project, UserAccount, MediaItem, Metric, SampleStep, SamplesPage, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, Session, SystemSnapshot } from './types.ts'
 
 async function apiFetch<T>(path: string): Promise<T> {
   const res = await fetch(path)
@@ -21,9 +21,9 @@ async function apiFetch<T>(path: string): Promise<T> {
   return json.data
 }
 
-async function authPost<T>(path: string, body?: unknown): Promise<T> {
+async function authSend<T>(method: 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
@@ -34,8 +34,38 @@ async function authPost<T>(path: string, body?: unknown): Promise<T> {
 
 export const api = {
   getSession: () => apiFetch<Session>('/auth/session'),
-  login: (key: string) => authPost<{ user: string }>('/auth/login', { key }),
-  logout: () => authPost<{ logged_out: boolean }>('/auth/logout'),
+  setup: (token: string, username: string, password: string) =>
+    authSend<{ user: string }>('POST', '/auth/setup', { token, username, password }),
+  login: (username: string, password: string) =>
+    authSend<{ user: string }>('POST', '/auth/login', { username, password }),
+  logout: () => authSend<{ logged_out: boolean }>('POST', '/auth/logout'),
+  changePassword: (current: string, next: string) =>
+    authSend<{ changed: boolean }>('POST', '/auth/password', { current, new: next }),
+
+  listProjects: () => apiFetch<Project[]>('/projects'),
+  createProject: (name: string, visibility: 'public' | 'private') =>
+    authSend<CreatedProject>('POST', '/projects', { name, visibility }),
+  getProjectAdmin: (name: string) => apiFetch<Project>(`/admin/projects/${encodeURIComponent(name)}`),
+  updateProject: (name: string, patch: { visibility?: 'public' | 'private'; members?: string[] }) =>
+    authSend<Project>('PATCH', `/admin/projects/${encodeURIComponent(name)}`, patch),
+
+  listUsers: () => apiFetch<UserAccount[]>('/admin/users'),
+  createUser: (username: string, password: string, role: 'admin' | 'user') =>
+    authSend<{ username: string }>('POST', '/admin/users', { username, password, role }),
+  updateUser: (username: string, patch: { password?: string; role?: 'admin' | 'user' }) =>
+    authSend<{ updated: string }>('PATCH', `/admin/users/${encodeURIComponent(username)}`, patch),
+  deleteUser: (username: string) =>
+    authSend<{ deleted: string }>('DELETE', `/admin/users/${encodeURIComponent(username)}`),
+
+  listKeys: () => apiFetch<ApiKey[]>('/admin/keys'),
+  createKey: (name: string, project?: string) =>
+    authSend<CreatedApiKey>('POST', '/admin/keys', { name, project: project ?? null }),
+  listAlerts: () => apiFetch<AlertRule[]>('/admin/alerts'),
+  createAlert: (rule: AlertRuleInput) => authSend<AlertRule>('POST', '/admin/alerts', rule),
+  updateAlert: (id: string, patch: Partial<AlertRuleInput>) => authSend<AlertRule>('PATCH', `/admin/alerts/${id}`, patch),
+  deleteAlert: (id: string) => authSend<{ deleted: string }>('DELETE', `/admin/alerts/${id}`),
+  testAlert: (id: string) => authSend<{ sent: boolean }>('POST', `/admin/alerts/${id}/test`),
+  revokeKey: (id: string) => authSend<{ revoked: string }>('DELETE', `/admin/keys/${id}`),
   listRuns: () => apiFetch<Run[]>('/runs'),
   getRun: (id: string) => apiFetch<Run>(`/runs/${id}`),
   getMetricNames: (id: string) => apiFetch<string[]>(`/runs/${id}/metric-names`),
@@ -62,6 +92,11 @@ export const api = {
   getMedia: (id: string, name?: string) =>
     apiFetch<MediaItem[]>(
       `/runs/${id}/media${name ? `?name=${encodeURIComponent(name)}` : ''}`,
+    ),
+  getSampleSteps: (id: string) => apiFetch<SampleStep[]>(`/runs/${id}/samples/steps`),
+  getSamples: (id: string, name: string, step: number, offset = 0, limit = 50) =>
+    apiFetch<SamplesPage>(
+      `/runs/${id}/samples?name=${encodeURIComponent(name)}&step=${step}&offset=${offset}&limit=${limit}`,
     ),
   getRunSummary: (id: string) => apiFetch<RunSummary>(`/runs/${id}/summary`),
   getLlmSummary: (id: string) => fetch(`/runs/${id}/llm-summary`).then((r) => {

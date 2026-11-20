@@ -5,6 +5,7 @@ import RunSidebar from './components/RunSidebar.tsx'
 import CompareView from './pages/CompareView.tsx'
 import EmptyState from './pages/EmptyState.tsx'
 import RunDetailPage from './pages/RunDetailPage.tsx'
+import SettingsPage from './pages/SettingsPage.tsx'
 
 export default function App() {
   const [selectedIds, setSelectedIds] = useState<string[]>([])
@@ -33,6 +34,7 @@ export default function App() {
             <Route path="/" element={<EmptyState />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />
             <Route path="/compare" element={<CompareView />} />
+            <Route path="/settings" element={<SettingsPage />} />
           </Routes>
         </main>
       </div>

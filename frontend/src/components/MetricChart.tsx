@@ -11,6 +11,10 @@ import {
 } from 'recharts'
 import type { Metric, RunEvent } from '../api/types.ts'
 import { formatMetricValue } from '../utils/format.ts'
+import { MAX_ALPHA, processSeries, useChartOptions } from '../utils/chartOptions.ts'
+import { axisLabel, axisMetricName, eventX, formatXLabel, formatXTick, resolveXs } from '../utils/xAxis.ts'
+import type { XSource } from '../utils/xAxis.ts'
+import ChartControls from './ChartControls.tsx'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 interface Props {
@@ -21,19 +25,14 @@ interface Props {
   events?: RunEvent[]
   /** When true, renders taller (for use inside ExpandModal). */
   expanded?: boolean
+  /** Enables the x-axis selector: the run's metrics by name (for metric-as-x) and start time. */
+  source?: XSource
 }
 
-/** Apply exponential moving average. alpha=0 → no smoothing, alpha→1 → heavy smoothing. */
-function applyEMA(data: Metric[], alpha: number): Metric[] {
-  if (alpha === 0 || data.length === 0) return data
-  const out: Metric[] = []
-  let prev = data[0].value
-  for (const d of data) {
-    const v = alpha * prev + (1 - alpha) * d.value
-    out.push({ ...d, value: v })
-    prev = v
-  }
-  return out
+interface Row {
+  x: number
+  value: number | null
+  raw: number | null
 }
 
 function eventColor(severity: string): string {
@@ -47,30 +46,42 @@ function Chart({
   lineColor,
   height,
   events,
+  logY,
+  showRaw,
+  axis,
+  span,
 }: {
-  data: Metric[]
+  axis: string
+  span: number
+  data: Row[]
+  logY: boolean
+  showRaw: boolean
   lineColor: string
   height: number
-  events?: RunEvent[]
+  /** Events already mapped to x positions. */
+  events?: { x: number; severity: string }[]
 }) {
-  // Deduplicate events by step (keep first per step to avoid overlapping lines)
+  // Deduplicate by x (keep first per position to avoid overlapping lines)
   const eventMarkers = useMemo(() => {
     if (!events || events.length === 0) return []
     const seen = new Set<number>()
     return events.filter((e) => {
-      if (e.step == null) return false
-      if (seen.has(e.step)) return false
-      seen.add(e.step)
+      if (seen.has(e.x)) return false
+      seen.add(e.x)
       return true
     })
   }, [events])
+  const tickFmt = useMemo(() => formatXTick(axis, span), [axis, span])
 
   return (
     <ResponsiveContainer width="100%" height={height}>
       <LineChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" vertical={false} />
         <XAxis
-          dataKey="step"
+          dataKey="x"
+          type="number"
+          domain={['dataMin', 'dataMax']}
+          tickFormatter={tickFmt}
           tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
           tickLine={false}
           axisLine={false}
@@ -82,6 +93,9 @@ function Chart({
           axisLine={false}
           tickFormatter={formatMetricValue}
           width={35}
+          scale={logY ? 'log' : 'auto'}
+          domain={logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
+          allowDataOverflow={logY}
         />
         <Tooltip
           contentStyle={{
@@ -94,14 +108,14 @@ function Chart({
           }}
           labelStyle={{ color: '#8b8fa8', marginBottom: 2 }}
           itemStyle={{ color: lineColor }}
-          labelFormatter={(v) => `step ${v}`}
+          labelFormatter={(v) => formatXLabel(axis, Number(v))}
           formatter={(v: number) => [formatMetricValue(v), '']}
           cursor={{ stroke: '#353840', strokeWidth: 1 }}
         />
         {eventMarkers.map((ev, i) => (
           <ReferenceLine
             key={i}
-            x={ev.step!}
+            x={ev.x}
             stroke={eventColor(ev.severity)}
             strokeWidth={1}
             strokeDasharray="3 3"
@@ -113,6 +127,19 @@ function Chart({
             }}
           />
         ))}
+        {showRaw && (
+          <Line
+            type="monotone"
+            dataKey="raw"
+            stroke={lineColor}
+            strokeOpacity={0.25}
+            strokeWidth={1}
+            dot={false}
+            activeDot={false}
+            isAnimationActive={false}
+            tooltipType="none"
+          />
+        )}
         <Line
           type="monotone"
           dataKey="value"
@@ -133,23 +160,60 @@ export default function MetricChart({
   lineColor = '#f59e0b',
   events,
   expanded = false,
+  source,
 }: Props) {
-  const [alpha, setAlpha] = useState(0)
+  const [opts, setOpts] = useChartOptions(`metric:${name}`)
+  const { alpha } = opts
   const [isExpanded, setIsExpanded] = useState(false)
   const [showLocalEvents, setShowLocalEvents] = useState(true)
   const containerRef = useRef<HTMLDivElement>(null)
 
-  const smoothed = useMemo(() => applyEMA(data, alpha), [data, alpha])
-  const last = smoothed.length > 0 ? smoothed[smoothed.length - 1].value : null
+  const src: XSource = useMemo(() => source ?? {}, [source])
+  const axisNames = useMemo(
+    () => (source?.byName ? Object.keys(source.byName).sort() : []),
+    [source],
+  )
+  // A stored metric axis this run does not have falls back to step (with a note).
+  const wanted = source ? opts.xAxis : 'step'
+  const axisMissing = axisMetricName(wanted) != null && !(src.byName?.[axisMetricName(wanted)!]?.length)
+  const axis = axisMissing ? 'step' : wanted
+
+  const { rows, dropped, skipped, nonMonotonic, span } = useMemo(() => {
+    const { points, skipped, nonMonotonic } = resolveXs(data, axis, src)
+    // Points are sorted by x, so EMA runs in x order.
+    const { raw, smooth, dropped } = processSeries(
+      points.map((p) => p.value),
+      opts,
+      name,
+    )
+    const rows: Row[] = points.map((p, i) => ({ x: p.x, value: smooth[i], raw: raw[i] }))
+    const span = points.length > 1 ? points[points.length - 1].x - points[0].x : 0
+    return { rows, dropped, skipped, nonMonotonic, span }
+  }, [data, opts, name, axis, src])
+
+  const { markers, unmapped } = useMemo(() => {
+    const markers: { x: number; severity: string }[] = []
+    let unmapped = 0
+    for (const ev of showLocalEvents ? (events ?? []) : []) {
+      if (ev.step == null && axis !== 'time' && axis !== 'rel') continue // step-less events never map to step axes
+      const x = eventX(ev, axis, src)
+      if (x == null) unmapped++
+      else markers.push({ x, severity: ev.severity })
+    }
+    return { markers, unmapped }
+  }, [events, showLocalEvents, axis, src])
+  const last = useMemo(() => {
+    for (let i = rows.length - 1; i >= 0; i--) if (rows[i].value != null) return rows[i].value
+    return null
+  }, [rows])
 
   const onWheel = useCallback((e: React.WheelEvent) => {
     if (!e.shiftKey) return
     e.preventDefault()
-    setAlpha((a) => Math.min(0.97, Math.max(0, a + (e.deltaY < 0 ? 0.05 : -0.05))))
-  }, [])
+    setOpts({ alpha: Math.min(MAX_ALPHA, Math.max(0, alpha + (e.deltaY < 0 ? 0.05 : -0.05))) })
+  }, [alpha, setOpts])
 
   const chartHeight = expanded ? 440 : 160
-  const smoothPct = Math.round(alpha * 100)
 
   return (
     <>
@@ -164,15 +228,6 @@ export default function MetricChart({
             <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
               {name}
             </span>
-            {alpha > 0 && (
-              <span
-                className="text-xs font-mono"
-                style={{ color: '#4a4e60' }}
-                title="Shift+scroll to adjust smoothing"
-              >
-                smooth {smoothPct}%
-              </span>
-            )}
           </div>
           <div className="flex items-center gap-2">
             {last !== null && (
@@ -201,6 +256,23 @@ export default function MetricChart({
           </div>
         </div>
 
+        {data.length > 0 && (
+          <ChartControls
+            opts={opts}
+            onChange={setOpts}
+            dropped={dropped}
+            axisMetrics={source ? axisNames : undefined}
+          />
+        )}
+        {(axisMissing || skipped > 0 || nonMonotonic || unmapped > 0) && (
+          <div className="text-xs font-mono mb-1" style={{ color: '#f59e0b', fontSize: 10 }}>
+            {axisMissing && `no ${axisMetricName(wanted)} logged for this run, showing step. `}
+            {skipped > 0 && `${skipped} point${skipped === 1 ? '' : 's'} without ${axisLabel(axis)} hidden. `}
+            {nonMonotonic && `${axisLabel(axis)} is not monotonic in step; points sorted by x. `}
+            {unmapped > 0 && `${unmapped} event marker${unmapped === 1 ? '' : 's'} hidden (no ${axisLabel(axis)} at that step).`}
+          </div>
+        )}
+
         {data.length === 0 ? (
           <div
             className="flex items-center justify-center text-xs font-mono"
@@ -209,7 +281,16 @@ export default function MetricChart({
             no data
           </div>
         ) : (
-          <Chart data={smoothed} lineColor={lineColor} height={chartHeight} events={showLocalEvents ? events : []} />
+          <Chart
+            data={rows}
+            lineColor={lineColor}
+            height={chartHeight}
+            events={markers}
+            axis={axis}
+            span={span}
+            logY={opts.logY}
+            showRaw={alpha > 0}
+          />
         )}
 
         {!expanded && (
@@ -228,6 +309,7 @@ export default function MetricChart({
             data={data}
             lineColor={lineColor}
             events={events}
+            source={source}
             expanded
           />
         </ExpandModal>

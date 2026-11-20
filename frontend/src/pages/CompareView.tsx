@@ -6,7 +6,11 @@ import CompareChart from '../components/CompareChart.tsx'
 import CompareOperatorBreakdown from '../components/CompareOperatorBreakdown.tsx'
 import HyperparamDiff from '../components/HyperparamDiff.tsx'
 import KernelTimeline from '../components/KernelTimeline.tsx'
+import SamplesViewer from '../components/SamplesViewer.tsx'
 import StatusBadge from '../components/StatusBadge.tsx'
+import type { XSource } from '../utils/xAxis.ts'
+import { groupRuns, parseIgnoreKeys } from '../utils/grouping.ts'
+import type { BandKind, GroupMode } from '../utils/grouping.ts'
 import { duration, timeAgo } from '../utils/format.ts'
 
 export const RUN_COLORS = [
@@ -41,6 +45,9 @@ export default function CompareView() {
   const [profileMap, setProfileMap] = useState<Map<string, ProfileEvent[]>>(new Map())
   const [smoothing, setSmoothing] = useState(0)
   const [globalHiddenIds, setGlobalHiddenIds] = useState<Set<string>>(new Set())
+  const [groupMode, setGroupMode] = useState<GroupMode>('none')
+  const [ignoreText, setIgnoreText] = useState('seed')
+  const [band, setBand] = useState<BandKind>('std')
   const [profilerOpen, setProfilerOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -96,6 +103,31 @@ export default function CompareView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runIdsKey])
 
+  // Per-run x-axis sources (each run's metrics by name + start time), so metric axes resolve per run.
+  const sources = useMemo(() => {
+    const out = new Map<string, XSource>()
+    for (const run of runs) {
+      const byName: Record<string, Metric[]> = {}
+      for (const m of metricsMap.get(run.run_id) ?? []) (byName[m.name] ??= []).push(m)
+      for (const k of Object.keys(byName)) byName[k].sort((a, b) => a.step - b.step)
+      out.set(run.run_id, { byName, startTime: Date.parse(run.created_at) / 1000 })
+    }
+    return out
+  }, [runs, metricsMap])
+
+  const grouped = groupMode !== 'none'
+  const groups = useMemo(
+    () => groupRuns(runs, groupMode, parseIgnoreKeys(ignoreText)),
+    [runs, groupMode, ignoreText],
+  )
+  const groupColor = (i: number) => RUN_COLORS[i % RUN_COLORS.length]
+
+  // Group ids are positional, so drop stale group visibility whenever the grouping changes.
+  const changeGrouping = (fn: () => void) => {
+    fn()
+    setGlobalHiddenIds((prev) => new Set([...prev].filter((id) => !id.startsWith('g'))))
+  }
+
   const allMetricNames = useMemo(() => {
     const names = new Set<string>()
     for (const metrics of metricsMap.values()) {
@@ -147,7 +179,35 @@ export default function CompareView() {
           </div>
           {/* Run pills */}
           <div className="flex flex-wrap gap-2">
-            {runs.map((run, i) => {
+            {grouped && groups.map((g, i) => {
+              const hidden = globalHiddenIds.has(g.id)
+              return (
+                <div
+                  key={g.id}
+                  className="flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded cursor-pointer select-none"
+                  style={{
+                    backgroundColor: '#111318',
+                    border: `1px solid ${groupColor(i)}33`,
+                    color: groupColor(i),
+                    opacity: hidden ? 0.35 : 1,
+                  }}
+                  onClick={() => setGlobalHiddenIds((prev) => {
+                    const next = new Set(prev)
+                    if (next.has(g.id)) next.delete(g.id)
+                    else next.add(g.id)
+                    return next
+                  })}
+                  title={hidden ? 'Click to show' : 'Click to hide'}
+                >
+                  <span style={{ display: 'inline-block', width: 20, height: 2, backgroundColor: groupColor(i), borderRadius: 1 }} />
+                  <span>{g.label}</span>
+                  <span style={{ color: '#4a4e60' }}>
+                    {g.runIds.length} run{g.runIds.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+              )
+            })}
+            {!grouped && runs.map((run, i) => {
               const hidden = globalHiddenIds.has(run.run_id)
               return (
               <div
@@ -189,6 +249,47 @@ export default function CompareView() {
           </div>
         </div>
 
+        <div className="flex items-center gap-3 flex-wrap">
+        {/* Grouping */}
+        <div
+          className="flex items-center gap-2 px-3 py-2 rounded text-xs font-mono"
+          style={{ backgroundColor: '#111318', border: '1px solid #252830', color: '#4a4e60' }}
+        >
+          <span>Group</span>
+          <select
+            value={groupMode}
+            onChange={(e) => changeGrouping(() => setGroupMode(e.target.value as GroupMode))}
+            style={{ backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4 }}
+          >
+            <option value="none">none</option>
+            <option value="hyperparams">hyperparams</option>
+            <option value="tag">tags</option>
+          </select>
+          {groupMode === 'hyperparams' && (
+            <>
+              <span>ignore</span>
+              <input
+                value={ignoreText}
+                onChange={(e) => changeGrouping(() => setIgnoreText(e.target.value))}
+                placeholder="seed"
+                title="Comma-separated hyperparam keys to ignore when matching runs"
+                style={{ width: 90, backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4, padding: '0 4px' }}
+              />
+            </>
+          )}
+          {grouped && (
+            <select
+              value={band}
+              onChange={(e) => setBand(e.target.value as BandKind)}
+              title="Band around the group mean"
+              style={{ backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4 }}
+            >
+              <option value="std">mean ± std</option>
+              <option value="minmax">mean, min/max</option>
+            </select>
+          )}
+        </div>
+
         {/* Smoothing slider */}
         <div
           className="flex items-center gap-3 px-3 py-2 rounded"
@@ -213,6 +314,7 @@ export default function CompareView() {
             {smoothing.toFixed(2)}
           </span>
         </div>
+        </div>
       </div>
 
       {/* ── Metric overlay charts ── */}
@@ -231,12 +333,33 @@ export default function CompareView() {
                     runId: run.run_id,
                     name: run.name,
                     color: RUN_COLORS[i % RUN_COLORS.length],
-                    metrics: (metricsMap.get(run.run_id) ?? [])
-                      .filter((m) => m.name === name)
-                      .sort((a, b) => a.step - b.step),
+                    metrics: sources.get(run.run_id)?.byName?.[name] ?? [],
+                    source: sources.get(run.run_id),
                   }))}
                   smoothing={smoothing}
                   globalHiddenIds={globalHiddenIds}
+                  band={band}
+                  groups={
+                    grouped
+                      ? groups.map((g, gi) => ({
+                          id: g.id,
+                          name: g.label,
+                          color: groupColor(gi),
+                          runs: g.runIds.flatMap((id) => {
+                            const run = runs.find((r) => r.run_id === id)
+                            return run
+                              ? [{
+                                  runId: id,
+                                  name: run.name,
+                                  color: groupColor(gi),
+                                  metrics: sources.get(id)?.byName?.[name] ?? [],
+                                  source: sources.get(id),
+                                }]
+                              : []
+                          }),
+                        }))
+                      : undefined
+                  }
                 />
               </div>
             ))}
@@ -299,6 +422,9 @@ export default function CompareView() {
           )}
         </div>
       )}
+
+      {/* ── Samples (nothing rendered if no run logged any) ── */}
+      <SamplesViewer runs={runs.map((r, i) => ({ runId: r.run_id, label: r.name, color: RUN_COLORS[i % RUN_COLORS.length] }))} />
 
       {/* ── Hyperparameter diff ── */}
       <div>

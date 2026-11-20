@@ -1,17 +1,57 @@
+export type Role = 'admin' | 'user' | 'global' | 'project'
+
 export interface Session {
   auth: 'required' | 'off'
+  state: 'setup_required' | 'login' | 'ready'
   authenticated: boolean
   user: string | null
+  role: Role | null
 }
 
-export type RunStatus = 'running' | 'completed' | 'crashed' | 'killed'
+export interface ApiKey {
+  id: string
+  name: string
+  project: string | null
+  created_at: number
+}
+
+export interface CreatedApiKey {
+  id: string
+  name: string
+  project: string | null
+  key: string
+}
+
+export interface Project {
+  name: string
+  visibility: 'public' | 'private'
+  created_at: string | null
+  created_by: string
+  runs: number | null
+  members?: string[]
+}
+
+export interface CreatedProject {
+  project: Project
+  key: string | null
+}
+
+export interface UserAccount {
+  username: string
+  role: 'admin' | 'user'
+  created_at: number
+}
+
+export type RunStatus = 'running' | 'completed' | 'failed' | 'crashed' | 'killed'
 
 export interface Run {
   run_id: string
+  project: string
   name: string
   status: RunStatus
   created_at: string
   finished_at: string | null
+  last_heartbeat?: string | null
   hyperparams: Record<string, unknown>
   tags: string[]
   notes: string | null
@@ -47,6 +87,8 @@ export interface SystemSnapshot {
   process_exclusive: boolean | null
   attributed_utilization: number | null
   attributed_power: number | null
+  /** CUDA ordinal within the run's visible GPUs (0 for runs predating multi-GPU monitoring) */
+  gpu_index: number
 }
 
 export interface ProfileEvent {
@@ -136,3 +178,34 @@ export interface ApiResponse<T> {
   data: T
   error: string | null
 }
+
+export interface SampleStep {
+  name: string
+  step: number
+  count: number
+  timestamp: number
+}
+
+export interface SamplesPage {
+  total: number
+  items: { idx: number; sample: Record<string, unknown> }[]
+}
+
+export type AlertKind = 'run_crashed' | 'run_failed' | 'event' | 'anomaly' | 'metric_threshold'
+export type AlertFormat = 'generic' | 'ntfy' | 'discord' | 'slack'
+
+export interface AlertRule {
+  id: string
+  name: string
+  kind: AlertKind
+  url: string // masked by the server: scheme and host only
+  format: AlertFormat
+  project: string | null
+  min_severity: string | null
+  metric: string | null
+  op: string | null
+  threshold: number | null
+  enabled: boolean
+}
+
+export type AlertRuleInput = Omit<AlertRule, 'id'>

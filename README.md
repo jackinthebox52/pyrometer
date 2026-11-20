@@ -3,7 +3,23 @@
 Self-hosted PyTorch experiment dashboard with integrated GPU profiling.
 Track metrics, compare runs, and profile GPU kernels — all local, no cloud, no accounts.
 
-**Status: Phase 1 complete** — SDK + API server + DuckDB storage. Frontend coming in Phase 2.
+**Features**
+
+- **SDK**: `run.log`, `watch` (gradient/weight stats), `profile` (torch.profiler), `event`, `log_artifact`,
+  `log_image` / `log_histogram` / `log_figure`, and `log_samples` (prompt/completion/reward tables).
+- **Durable delivery**: failed uploads retry with backoff and spill to a local spool; `init(offline=True)` records
+  without a network and `pyrometer sync` uploads later. Retries never double-insert.
+- **Run health**: heartbeat plus statuses `running` / `completed` / `failed` / `crashed` / `killed`; a run that goes
+  silent is marked `crashed` and flips back if it resumes.
+- **Resume**: `init(resume=run_id | "auto")` (or `PYROMETER_RUN_ID`) continues an existing run.
+- **System monitoring**: every visible GPU, plus per-process GPU memory/utilization, CPU and RAM.
+- **Anomaly events**: NaN/Inf and robust loss/gradient spike detection, tunable via `init(anomaly_detection=...)`.
+- **Dashboard charts**: log-scale, EMA smoothing and normalization per chart; selectable x-axis (step, wall time,
+  relative time, or any logged metric such as `tokens_seen`); compare view with grouping by hyperparams/tag
+  (e.g. ignore `seed`) showing mean +/- std bands; Samples tab to browse and compare generations across steps/runs.
+- **Alerts**: admin-configured webhooks (generic JSON, ntfy, Discord, Slack) for crashes, failures, event severity,
+  anomalies and metric thresholds.
+- **Auth and projects**: accounts, API keys, public/private projects ([docs/auth.md](docs/auth.md)).
 
 ---
 
@@ -19,12 +35,13 @@ uv sync
 uv run pyrometer serve --no-auth
 ```
 
-Auth is on by default. To run with auth, create a key and export it for your scripts
-(see [docs/auth.md](docs/auth.md)):
+Auth is on by default. Start the server, open the dashboard, and enter the one-time setup token
+from the server log to create the first admin. Then create an API key under **Settings** and
+export it for your scripts. Runs can be filed under public or private **projects** with their own
+keys and per-user access (see [docs/auth.md](docs/auth.md)):
 
 ```bash
 uv run pyrometer serve
-uv run pyrometer keys create --name my-project --scopes ingest   # shown once
 export PYROMETER_API_KEY=pyro_...
 export PYROMETER_SERVER=http://localhost:8321                      # optional
 ```
@@ -48,6 +65,9 @@ run = pyrometer.init(
         "batch_size": 64,
     },
     tags=["baseline"],
+    # resume="auto",                 # continue the run named by $PYROMETER_RUN_ID
+    # offline=True,                  # no network; upload later with `pyrometer sync`
+    # anomaly_detection={...},       # or False to disable
 )
 
 for step, batch in enumerate(dataloader):
@@ -56,10 +76,24 @@ for step, batch in enumerate(dataloader):
     run.log({
         "train/loss": loss.item(),
         "lr": scheduler.get_last_lr()[0],
+        "tokens_seen": tokens_seen,   # log an axis as a metric to chart against it
     }, step=step)
+
+# Generation samples for the Samples tab
+run.log_samples(step, [{"prompt": "2+2=", "completion": "4", "reward": 1.0}])
 
 run.finish()
 ```
+
+Upload data saved offline or left undelivered:
+
+```bash
+uv run pyrometer sync                                   # every run in ~/.pyrometer/spool
+uv run pyrometer sync --server https://pyrometer.example.com
+```
+
+Webhook alerts (crash, failure, event severity, anomaly, metric thresholds) are configured by admins under
+**Settings**; see [docs/server-api.md](docs/server-api.md#alerts).
 
 ---
 
@@ -78,6 +112,13 @@ Registers a new run with the server. Automatically captures:
 | `tags` | `list[str]` | `[]` | Tags for filtering in the dashboard |
 | `notes` | `str \| None` | `None` | Free-text notes |
 | `server` | `str` | `http://localhost:8321` | API server base URL |
+| `offline` | `bool` | `False` (or `PYROMETER_MODE=offline`) | Write everything to a local spool, no network; upload later with `pyrometer sync` |
+| `resume` | `str \| None` | `None` (or `PYROMETER_RUN_ID`) | Run id to continue, or `"auto"` |
+| `anomaly_detection` | `bool \| dict` | `True` | Disable or tune automatic anomaly events |
+
+Delivery is durable: if the server is unreachable, data is retried in the background and spilled to
+`~/.pyrometer/spool/<run_id>/` (`PYROMETER_SPOOL_DIR`) instead of being lost. Run `pyrometer sync` to upload it;
+retries never double-insert.
 
 ### `run.log(metrics, step)`
 
@@ -95,6 +136,10 @@ Profile a single training step. *(Phase 1: stub — full `torch.profiler` integr
 with run.profile(step=global_step):
     val_loss = val_step(model, batch)
 ```
+
+### `run.log_samples(step, samples, name="samples")`
+
+Log a list of JSON-able dicts (e.g. `prompt`, `completion`, `reward`, `reference`) for the dashboard Samples tab.
 
 ### `run.finish()`
 

@@ -22,8 +22,9 @@ ask first.
 1. `pip install pyrometer` (torch is a peer dependency, not installed for you).
 2. Make sure a server is reachable. Locally: `pyrometer serve --no-auth`
    (loopback only, `http://localhost:8321`). Shared/remote servers require
-   auth: `pyrometer serve`, then `pyrometer keys create --name <project>
-   --scopes ingest` on the server.
+   auth: open the dashboard, finish first-run setup, and create a key under
+   Settings (or `pyrometer keys create --name <name>` on the server). Prefer a
+   project-bound key (`--project`) for anything shared or automated.
 3. Point the SDK at it through the environment, not source code:
    `PYROMETER_SERVER=http://host:8321` and `PYROMETER_API_KEY=pyro_...`
    (or `pyrometer.init(..., server=, api_key=)`).
@@ -66,17 +67,20 @@ and the run is marked complete.
   comparable. Nested dicts are fine.
 - **Profile sparingly.** Default to every ~100 steps; profiling every step
   slows training substantially.
+- **File runs under a project** (`project="my-model"`) on shared servers. A global key registers it on
+  first use; use `pyrometer.create_project(name, private=True)` for a private one (it returns that
+  project's own key, shown once). A project key alone implies its project.
 - **Name and tag runs meaningfully** (`tags=["lr-sweep"]`) — the dashboard's
   compare view groups by these.
 - Use `run.event()` for milestones (LR drops, checkpoints, divergence) and
   `run.log_artifact()` to record saved files (nothing is uploaded).
+- Samples: `run.log_samples(step, [{"prompt":..., "completion":..., "reward":...}], name=...)` for LLM/RL generations.
 - Media: `run.log_image`, `run.log_histogram`, `run.log_figure`.
 - Log from one process only in distributed training (rank 0).
 
 ## Reading results
 
-REST API (send `Authorization: Bearer $PYROMETER_API_KEY`; reads need a
-key with the `read` scope), all responses shaped `{"data": ..., "error": null}`:
+REST API (send `Authorization: Bearer $PYROMETER_API_KEY`), all responses shaped `{"data": ..., "error": null}`:
 
 - `GET /runs` — list runs
 - `GET /runs/{id}` — run detail

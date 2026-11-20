@@ -213,7 +213,8 @@ One row per training run. Small table, read frequently.
 |--------|------|-------------|
 | `run_id` | `VARCHAR` | UUID primary key |
 | `name` | `VARCHAR` | Human-readable name |
-| `status` | `VARCHAR` | `running`, `completed`, `crashed`, `killed` |
+| `status` | `VARCHAR` | `running`, `completed`, `failed`, `crashed` (no heartbeat), `killed` |
+| `last_heartbeat` | `DOUBLE` | Unix timestamp of the last SDK heartbeat (null for pre-heartbeat runs) |
 | `created_at` | `DOUBLE` | Unix timestamp |
 | `finished_at` | `DOUBLE` | Unix timestamp (null if running) |
 | `hyperparams` | `JSON` | Arbitrary hyperparameter dict |
@@ -286,6 +287,7 @@ Periodic GPU/system state from pynvml polling.
 | `process_exclusive` | `BOOLEAN` | Exclusive context flag |
 | `attributed_utilization` | `DOUBLE` | Process-attributed GPU util |
 | `attributed_power` | `DOUBLE` | Process-attributed power |
+| `gpu_index` | `INTEGER` | CUDA ordinal of the GPU within the run's visible devices (NULL on old rows = GPU 0); one row per GPU per poll |
 
 ---
 
@@ -311,6 +313,13 @@ Gradient and weight statistics from `run.watch()`.
 | `weight_histogram` | `JSON` | 32-bin weight histogram |
 
 ---
+
+#### `alert_rules`
+
+Admin-managed webhook alert rules: `id`, `name`, `kind`, `url` (secret), `format`, `project` (NULL = all),
+`min_severity`, `metric`, `op`, `threshold`, `enabled`, `created_at`, `created_by`. Delivery logic lives in
+`pyrometer/server/alerts.py` (one worker thread, bounded queue; hooks in the ingest routes and
+`db_mark_stale_runs`). See [server-api.md](server-api.md#alerts).
 
 #### `events`
 
@@ -373,6 +382,22 @@ Images, histograms, figures.
 
 ---
 
+#### `samples`
+
+Generation samples from `run.log_samples`, one row per sample dict.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | `VARCHAR` | Foreign key to `runs` |
+| `step` | `INTEGER` | Training step |
+| `timestamp` | `DOUBLE` | Unix timestamp |
+| `name` | `VARCHAR` | Sample stream name |
+| `idx` | `INTEGER` | Order within (name, step) |
+| `reward` | `DOUBLE` | Numeric `reward` key if present, else NULL |
+| `data` | `VARCHAR` | The sample dict as JSON text |
+
+---
+
 #### `run_summaries`
 
 Derived statistics computed when a run finishes.
@@ -384,8 +409,8 @@ Derived statistics computed when a run finishes.
 | `total_training_time_s` | `DOUBLE` | Wall-clock duration |
 | `total_steps` | `INTEGER` | Total training steps |
 | `steps_per_sec` | `DOUBLE` | Throughput |
-| `avg_gpu_utilization` | `DOUBLE` | Average GPU utilization |
-| `peak_process_memory_bytes` | `BIGINT` | Peak VRAM usage |
+| `avg_gpu_utilization` | `DOUBLE` | Average GPU utilization: per-process values over the GPUs this run uses when available, else device-wide across all monitored GPUs |
+| `peak_process_memory_bytes` | `BIGINT` | Peak VRAM usage (process-attributed if available, else device), summed over GPUs per poll |
 | `anomaly_count` | `INTEGER` | Number of anomaly events |
 | `final_metrics` | `JSON` | Final metric values |
 | `best_metrics` | `JSON` | Best metric values with direction |
@@ -475,9 +500,14 @@ Main Thread (training loop)
     │   ├── Flush param stats buffer
     │   └── Flush log buffer
     │
+    ├── Sender Thread (daemon) — the only thread that talks HTTP
+    │   └── Ordered queue → POST with batch id, retry w/ backoff, spill to ~/.pyrometer/spool
+    │
     └── System Monitor Thread (daemon, 2s interval)
-        └── Poll pynvml → POST system snapshot
+        └── Poll pynvml → enqueue system snapshot
 ```
+
+All payloads are enqueued on a `Transport` (`pyrometer/_transport.py`); callers never perform network I/O.
 
 #### Buffer Management
 
@@ -650,10 +680,11 @@ export function useWebSocket(handler: Handler) {
 
 ### SDK
 
-- All network operations wrapped in try/except
-- Failures logged at DEBUG level, never block training
-- Buffers continue accumulating even if server is down
-- `run.finish()` attempts final flush but doesn't raise
+- Network I/O happens only on the sender thread; failures are retried with exponential backoff (cap 60 s) and never block training
+- The in-memory queue is bounded (500); overflow and anything undelivered at `finish()` is spilled to a JSONL spool
+  (`~/.pyrometer/spool/<run_id>/`, `PYROMETER_SPOOL_DIR`) and replayed with `pyrometer sync`
+- Every payload has a batch id; the server's `seen_batches` table (run_id, batch_id, seen_at) discards repeats
+- `run.finish()` makes a 10 s final drain, spills the rest, prints one warning, and doesn't raise
 
 ### Server
 

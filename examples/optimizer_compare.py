@@ -4,6 +4,9 @@ Uses sklearn's digits dataset: 1797 samples of 8x8 scanned digit images,
 10 classes. The same architecture, data split, and base LR are shared across
 all three runs — only the optimizer and its specific parameters differ.
 
+Each optimizer runs with three seeds (EPOCHS shrunk to keep runtime similar); in the compare view use
+"Group by hyperparams" (ignoring `seed`) for one mean +/- std band per optimizer.
+
 Gradient norm is logged as an extra diagnostic. SGD's gradient norms behave
 differently from adaptive-method norms and reveal how differently each optimizer
 traverses the loss landscape.
@@ -13,6 +16,7 @@ Usage:
     python examples/optimizer_compare.py  # terminal 2
 """
 
+import itertools
 import os
 import sys
 from contextlib import nullcontext
@@ -43,7 +47,8 @@ N_FEATURES = 64
 N_CLASSES = 10
 
 # ── Training ──────────────────────────────────────────────────────────────────
-EPOCHS = 40
+EPOCHS = 14
+SEEDS = [0, 1, 2]
 BATCH_SIZE = 32
 
 OPTIMIZER_CONFIGS = [
@@ -154,6 +159,7 @@ def build_optimizer(model: nn.Module, hp: dict) -> torch.optim.Optimizer:
 def train_one_run(
     run: pyrometer.Run,
     hp: dict,
+    seed: int,
     X_train_np: np.ndarray,
     y_train_np: np.ndarray,
     X_val_np: np.ndarray,
@@ -167,6 +173,7 @@ def train_one_run(
     X_val = torch.from_numpy(X_val_np).to(device)
     y_val = torch.from_numpy(y_val_np).to(device)
 
+    torch.manual_seed(seed)
     model = build_model(device)
     run.watch(model, log_freq=20)
     optimizer = build_optimizer(model, hp)
@@ -220,6 +227,8 @@ def train_one_run(
                     "train/accuracy": (logits.argmax(1) == yb).float().mean().item(),
                     "train/grad_norm": grad_norm,
                     "lr": scheduler.get_last_lr()[0],
+                    # Log your own x-axis as a metric; pick it in the chart's x-axis selector.
+                    "samples_seen": (global_step + 1) * BATCH_SIZE,
                 },
                 step=global_step,
             )
@@ -235,11 +244,22 @@ def train_one_run(
             val_loss = criterion(val_logits, y_val).item()
             val_acc = (val_logits.argmax(1) == y_val).float().mean().item()
 
-        run.log({"val/loss": val_loss, "val/accuracy": val_acc}, step=global_step)
+        run.log(
+            {"val/loss": val_loss, "val/accuracy": val_acc, "samples_seen": global_step * BATCH_SIZE},
+            step=global_step,
+        )
 
         # Log class-confidence heatmap: rows=classes, cols=16 val samples
         conf_img = torch.softmax(val_logits[:16], dim=1).T.unsqueeze(0).cpu()
         run.log_image("class_confidence", conf_img, step=global_step)
+
+        # Synthetic prompt/completion/reward samples (stand-in for LLM generations), low cadence
+        if (epoch + 1) % 5 == 0:
+            run.log_samples(global_step, [
+                {"prompt": f"What is {a} + {b}?", "completion": f"The answer is {a + b + (i % 2)}.",
+                 "reward": round(float(max(0.0, 1.0 - val_loss / 3 - 0.3 * (i % 2))), 3), "reference": str(a + b)}
+                for i, (a, b) in enumerate([(2, 3), (7, 5), (12, 9), (4, 4)])
+            ], name="eval_generations")
 
         print(
             f"  epoch {epoch + 1:2d}/{EPOCHS} — "
@@ -263,30 +283,32 @@ def main() -> None:
 
     steps_per_epoch = len(X_train) // BATCH_SIZE
     print(
-        f"Running optimizer comparison: {len(OPTIMIZER_CONFIGS)} runs "
+        f"Running optimizer comparison: {len(OPTIMIZER_CONFIGS)} optimizers × {len(SEEDS)} seeds "
         f"× {EPOCHS} epochs × {steps_per_epoch} steps/epoch\n"
     )
 
-    for config in OPTIMIZER_CONFIGS:
+    for config, seed in itertools.product(OPTIMIZER_CONFIGS, SEEDS):
+        run_name = f"{config['name']}-s{seed}"
+        hp = {**config["hyperparams"], "seed": seed}
         run = pyrometer.init(
-            name=config["name"],
-            hyperparams=config["hyperparams"],
+            name=run_name,
+            hyperparams=hp,
             tags=config["tags"],
             notes=(
                 f"Optimizer comparison arm: {config['hyperparams']['optimizer']}. "
                 "Same architecture, dataset, and train/val split across all arms."
             ),
         )
-        print(f"[{config['name']}] run_id={run.run_id}")
+        print(f"[{run_name}] run_id={run.run_id}")
 
-        train_one_run(run, config["hyperparams"], X_train, y_train, X_val, y_val)
+        train_one_run(run, hp, seed, X_train, y_train, X_val, y_val)
 
         run.finish()
-        print(f"[{config['name']}] done\n")
+        print(f"[{run_name}] done\n")
 
     print(
         "Optimizer comparison complete. "
-        "Select all three runs in the dashboard to compare loss curves and hyperparams."
+        "Select all runs in the dashboard and group by hyperparams (ignore seed) to compare optimizers."
     )
 
 

@@ -1,33 +1,41 @@
 """FastAPI application — route handlers only. All DB access goes through db.py."""
 
+import asyncio
 import json
 import logging
+import os
+import threading
 import time
+from typing import Literal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from pyrometer.server.auth import (
-    COOKIE_NAME,
-    auth_enabled,
-    authenticate,
-    is_https,
-    list_keys,
-    require_auth,
-    verify_key,
-)
+from pyrometer.server import alerts, auth
+from pyrometer.server.auth import COOKIE_NAME, RateLimited, auth_enabled, require_auth
 from pyrometer.server.db import (
+    db_claim_batch,
     db_compute_run_summary,
+    db_create_project,
     db_create_run,
     db_get_artifacts,
     db_get_events,
     db_get_logs,
+    db_get_members,
+    db_get_project,
+    db_get_run_project,
+    db_resume_run,
+    db_release_batch,
     db_get_media,
     db_get_media_names,
+    db_get_samples,
+    db_get_sample_steps,
+    db_get_sample_extremes,
+    db_insert_samples,
     db_get_metric_names,
     db_get_metrics,
     db_get_param_stat_names,
@@ -37,6 +45,7 @@ from pyrometer.server.db import (
     db_get_run,
     db_get_run_summary,
     db_get_system_snapshots,
+    db_gpu_count,
     db_insert_artifact,
     db_insert_event,
     db_insert_logs,
@@ -45,23 +54,61 @@ from pyrometer.server.db import (
     db_insert_param_stats,
     db_insert_profile_events,
     db_insert_system_snapshot,
+    db_list_projects,
     db_list_runs,
+    db_set_members,
+    db_set_project_visibility,
     db_update_run,
+    db_heartbeat,
+    db_get_run_status,
+    db_mark_stale_runs,
+    db_create_alert_rule,
+    db_delete_alert_rule,
+    db_get_alert_rule,
+    db_list_alert_rules,
+    db_update_alert_rule,
+    set_status_hook,
+    TERMINAL_STATUSES,
 )
 
 _log = logging.getLogger("pyrometer.server")
+
+# Every path that turns a run crashed (sweeper, lazy checks on read) goes through db_mark_stale_runs.
+set_status_hook(alerts.notify_run_status)
 
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     if not auth_enabled():
         _log.warning("AUTH DISABLED (PYROMETER_AUTH=off) — local mode only, do not expose this server")
-    elif not list_keys():
-        _log.warning(
-            "No API keys configured, so SDK clients cannot connect. "
-            "Create one with: pyrometer keys create --name <name>"
-        )
-    yield
+    else:
+        token = auth.setup_token()
+        if token is not None:
+            if os.environ.get("PYROMETER_BOOTSTRAP_TOKEN"):
+                _log.warning("Pyrometer is not set up. Open the dashboard and enter PYROMETER_BOOTSTRAP_TOKEN.")
+            else:
+                _log.warning(
+                    "Pyrometer is not set up. Open the dashboard and enter this one-time setup token: %s "
+                    "(or run `pyrometer admin set-password` on the host)",
+                    token,
+                )
+    task = asyncio.create_task(_crash_sweeper())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+async def _crash_sweeper() -> None:
+    """Periodically mark runs that stopped sending heartbeats as ``crashed`` and tell dashboards."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            for run_id in db_mark_stale_runs():
+                threading.Thread(target=db_compute_run_summary, args=(run_id,), daemon=True).start()
+                await _ws.broadcast({"type": "run_updated", "run_id": run_id})
+        except Exception:
+            _log.exception("crash sweep failed")
 
 
 # Every API route requires auth by default (see auth.require_auth). Interactive docs expose the
@@ -110,9 +157,15 @@ class _WsManager:
         if not self._connections:
             return
         text = json.dumps(payload)
+        run_id = payload.get("run_id")
+        project = db_get_run_project(run_id) if run_id else None
         dead: list[WebSocket] = []
         for ws in list(self._connections):
             try:
+                # Each dashboard only hears about runs its user may see.
+                principal = getattr(ws.state, "principal", None)
+                if project is not None and not auth.can_read_project(principal, project):
+                    continue
                 await ws.send_text(text)
             except Exception:
                 dead.append(ws)
@@ -154,6 +207,9 @@ def err(message: str, status_code: int = 400):
 # ---------------------------------------------------------------------------
 
 class CreateRunRequest(BaseModel):
+    # Set by the SDK so run creation is idempotent (offline sync, retries); the server mints one if absent.
+    run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,64}$")
+    created_at: float | None = None
     name: str | None = None
     hyperparams: dict = {}
     tags: list[str] = []
@@ -166,6 +222,9 @@ class CreateRunRequest(BaseModel):
     pytorch_version: str | None = None
     python_version: str | None = None
     hostname: str | None = None
+    project: str | None = None
+    # Resume an existing run: "must" (404 if unknown) or "auto" (create it when unknown). Needs run_id.
+    resume: Literal["must", "auto"] | None = None
 
 
 class UpdateRunRequest(BaseModel):
@@ -207,6 +266,7 @@ class SystemSnapshot(BaseModel):
     process_exclusive: bool | None = None
     attributed_utilization: float | None = None
     attributed_power: float | None = None
+    gpu_index: int | None = None  # CUDA ordinal within the run's visible GPUs; None = GPU 0
 
 
 class ParamStatEntry(BaseModel):
@@ -258,6 +318,18 @@ class MediaEntry(BaseModel):
     data: str        # base64 PNG for images/figures, JSON string for histograms
 
 
+MAX_SAMPLES_PER_CALL = 500
+MAX_SAMPLE_BYTES = 64 * 1024        # serialized JSON per sample
+MAX_SAMPLES_CALL_BYTES = 4 * 1024 * 1024
+
+
+class SamplesEntry(BaseModel):
+    name: str = "samples"
+    step: int
+    timestamp: float
+    samples: list[dict]
+
+
 # ---------------------------------------------------------------------------
 # Routes — health
 # ---------------------------------------------------------------------------
@@ -271,45 +343,381 @@ def health():
 # Routes — auth (public; they bootstrap the dashboard's session)
 # ---------------------------------------------------------------------------
 
+class SetupRequest(BaseModel):
+    token: str
+    username: str
+    password: str
+
+
 class LoginRequest(BaseModel):
-    key: str
+    username: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current: str
+    new: str
+
+
+class CreateKeyRequest(BaseModel):
+    name: str
+    project: str | None = None  # bind the key to one project
+
+
+class AlertRuleRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    kind: str
+    url: str = Field(max_length=2048)
+    format: str = "generic"
+    project: str | None = None          # None = every project
+    min_severity: str | None = None     # kind "event"
+    metric: str | None = None           # kind "metric_threshold"
+    op: str | None = None
+    threshold: float | None = None
+    enabled: bool = True
+
+
+class UpdateAlertRuleRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    url: str | None = Field(default=None, max_length=2048)
+    format: str | None = None
+    project: str | None = None
+    min_severity: str | None = None
+    metric: str | None = None
+    op: str | None = None
+    threshold: float | None = None
+    enabled: bool | None = None
+
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+
+class UpdateUserRequest(BaseModel):
+    password: str | None = None
+    role: str | None = None
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+    visibility: str = "public"
+
+
+class UpdateProjectRequest(BaseModel):
+    visibility: str | None = None
+    members: list[str] | None = None
+
+
+def _set_session_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        max_age=auth.SESSION_TTL,
+        httponly=True,
+        samesite="strict",
+        secure=auth.is_https(request),
+        path="/",
+    )
 
 
 @app.get("/auth/session")
 def auth_session(request: Request):
+    """What the dashboard needs to pick a screen: ``setup_required`` | ``login`` | ``ready``."""
     if not auth_enabled():
-        return ok({"auth": "off", "authenticated": True, "user": None})
-    principal = authenticate(request, read_only=True)
-    ok_read = principal is not None and "read" in principal.scopes
-    return ok({
-        "auth": "required",
-        "authenticated": ok_read,
-        "user": principal.name if ok_read else None,
-    })
+        return ok({"auth": "off", "state": "ready", "authenticated": True, "user": None, "role": "admin"})
+    principal = auth.authenticate(request)
+    if principal is not None:
+        return ok({
+            "auth": "required", "state": "ready", "authenticated": True,
+            "user": principal.name, "role": principal.role,
+        })
+    state = "login" if auth.admin_configured() else "setup_required"
+    return ok({"auth": "required", "state": state, "authenticated": False, "user": None, "role": None})
+
+
+@app.post("/auth/setup")
+def auth_setup(req: SetupRequest, request: Request, response: Response):
+    """First run: exchange the one-time setup token (from the server log) for the first admin account."""
+    try:
+        username = auth.claim_setup(req.token.strip(), req.username, req.password)
+        session = auth.login(username, req.password)
+    except RateLimited:
+        err("Too many failed attempts; try again later", 429)
+    except PermissionError as e:
+        err(str(e), 401)
+    except ValueError as e:
+        err(str(e), 400)
+    _set_session_cookie(response, request, session)
+    return ok({"user": username})
 
 
 @app.post("/auth/login")
 def auth_login(req: LoginRequest, request: Request, response: Response):
-    """Exchange a read-scoped API key for an HttpOnly session cookie (read-only access)."""
-    principal = verify_key(req.key)
-    if principal is None or "read" not in principal.scopes:
-        err("Invalid API key, or key lacks the 'read' scope", 401)
-    response.set_cookie(
-        COOKIE_NAME,
-        req.key,
-        max_age=30 * 24 * 3600,
-        httponly=True,
-        samesite="strict",
-        secure=is_https(request),
-        path="/",
-    )
-    return ok({"user": principal.name})
+    """Username/password login; sets an HttpOnly, SameSite=Strict, read-only session cookie."""
+    try:
+        session = auth.login(req.username, req.password)
+    except RateLimited:
+        err("Too many failed attempts; try again later", 429)
+    except PermissionError as e:
+        err(str(e), 401)
+    _set_session_cookie(response, request, session)
+    return ok({"user": req.username.strip().lower()})
 
 
 @app.post("/auth/logout")
-def auth_logout(response: Response):
+def auth_logout(request: Request, response: Response):
+    auth.end_session(request.cookies.get(COOKIE_NAME))
     response.delete_cookie(COOKIE_NAME, path="/")
     return ok({"logged_out": True})
+
+
+@app.post("/auth/password")
+def auth_change_password(req: ChangePasswordRequest, request: Request, response: Response):
+    """Change your own password. Ends all your sessions; this response signs you back in."""
+    principal = _principal(request)
+    if principal is None:
+        err("Not available in local no-auth mode", 400)
+    try:
+        auth.change_own_password(principal.name, req.current, req.new)
+        session = auth.login(principal.name, req.new)
+    except RateLimited:
+        err("Too many failed attempts; try again later", 429)
+    except PermissionError as e:
+        err(str(e), 403)
+    except ValueError as e:
+        err(str(e), 400)
+    _set_session_cookie(response, request, session)
+    return ok({"changed": True})
+
+
+# ---------------------------------------------------------------------------
+# Routes — projects
+# ---------------------------------------------------------------------------
+
+def _principal(request: Request):
+    """The authenticated caller, or ``None`` when auth is off."""
+    return getattr(request.state, "principal", None)
+
+
+def _validated_project_name(name: str) -> str:
+    name = name.strip()
+    if not auth.PROJECT_RE.match(name):
+        err("Project name must be 1-64 characters: letters, digits, '.', '_' or '-'", 400)
+    return name
+
+
+@app.get("/projects")
+def list_projects(request: Request):
+    """Projects the caller can see (all of them for admins and global keys)."""
+    return ok(db_list_projects(auth.visible_projects(_principal(request))))
+
+
+@app.post("/projects", status_code=201)
+def create_project(req: CreateProjectRequest, request: Request):
+    """Register a project. A private project also gets its own API key, returned once."""
+    name = _validated_project_name(req.name)
+    if req.visibility not in ("public", "private"):
+        err("visibility must be 'public' or 'private'", 400)
+    principal = _principal(request)
+    project = db_create_project(name, req.visibility, principal.name if principal else "local")
+    if project is None:
+        err(f"Project {name!r} already exists", 409)
+    key = None
+    if req.visibility == "private" and auth_enabled():
+        _, key = auth.create_key(f"project:{name}", project=name)
+    return ok({"project": project, "key": key})
+
+
+# ---------------------------------------------------------------------------
+# Routes — admin: users, projects, API keys (admin only; see auth.require_auth)
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/keys")
+def admin_list_keys():
+    return ok(auth.list_keys())
+
+
+@app.post("/admin/keys", status_code=201)
+def admin_create_key(req: CreateKeyRequest):
+    name = req.name.strip()
+    if not 1 <= len(name) <= 64:
+        err("Name must be 1-64 characters", 400)
+    if req.project is not None and db_get_project(req.project) is None:
+        err("No such project", 404)
+    key_id, key = auth.create_key(name, project=req.project)
+    return ok({"id": key_id, "name": name, "project": req.project, "key": key})  # the only time the key is shown
+
+
+@app.delete("/admin/keys/{key_id}")
+def admin_revoke_key(key_id: str):
+    if not auth.revoke_key(key_id):
+        err("No such key", 404)
+    return ok({"revoked": key_id})
+
+
+@app.get("/admin/users")
+def admin_list_users():
+    return ok(auth.list_users())
+
+
+@app.post("/admin/users", status_code=201)
+def admin_create_user(req: CreateUserRequest):
+    try:
+        auth.create_user(req.username, req.password, req.role)
+    except ValueError as e:
+        err(str(e), 409 if "already exists" in str(e) else 400)
+    return ok({"username": req.username.strip().lower(), "role": req.role})
+
+
+@app.patch("/admin/users/{username}")
+def admin_update_user(username: str, req: UpdateUserRequest):
+    if auth.get_user(username) is None:
+        err("No such user", 404)
+    try:
+        if req.role is not None:
+            auth.update_user_role(username, req.role)
+        if req.password is not None:
+            auth.set_password(username, req.password)
+    except ValueError as e:
+        err(str(e), 400)
+    return ok({"updated": username})
+
+
+@app.delete("/admin/users/{username}")
+def admin_delete_user(username: str, request: Request):
+    me = _principal(request)
+    if me is not None and me.name == username.strip().lower():
+        err("You cannot delete your own account", 400)
+    try:
+        deleted = auth.delete_user(username)
+    except ValueError as e:
+        err(str(e), 400)
+    if not deleted:
+        err("No such user", 404)
+    return ok({"deleted": username})
+
+
+@app.get("/admin/projects/{name}")
+def admin_get_project(name: str):
+    project = db_get_project(name)
+    if project is None:
+        err("No such project", 404)
+    return ok({**project, "members": db_get_members(name)})
+
+
+@app.patch("/admin/projects/{name}")
+def admin_update_project(name: str, req: UpdateProjectRequest):
+    if db_get_project(name) is None:
+        err("No such project", 404)
+    if req.visibility is not None:
+        if req.visibility not in ("public", "private"):
+            err("visibility must be 'public' or 'private'", 400)
+        db_set_project_visibility(name, req.visibility)
+    if req.members is not None:
+        unknown = [u for u in req.members if auth.get_user(u) is None]
+        if unknown:
+            err(f"Unknown users: {', '.join(unknown)}", 400)
+        db_set_members(name, [u.strip().lower() for u in req.members])
+    return ok({**db_get_project(name), "members": db_get_members(name)})
+
+
+# ---------------------------------------------------------------------------
+# Routes — admin: webhook alert rules (URLs are secrets: always masked in responses)
+# ---------------------------------------------------------------------------
+
+def _check_alert_rule(rule: dict) -> None:
+    """Validate a complete rule dict, answering 400/404 through ``err``."""
+    if rule["kind"] not in alerts.KINDS:
+        err(f"kind must be one of {', '.join(alerts.KINDS)}", 400)
+    if rule["format"] not in alerts.FORMATS:
+        err(f"format must be one of {', '.join(alerts.FORMATS)}", 400)
+    bad_url = alerts.validate_url(rule["url"])
+    if bad_url:
+        err(bad_url, 400)
+    if rule.get("project") is not None and db_get_project(rule["project"]) is None:
+        err("No such project", 404)
+    if rule["kind"] == "event" and (rule.get("min_severity") or "error") not in alerts.SEVERITIES:
+        err(f"min_severity must be one of {', '.join(alerts.SEVERITIES)}", 400)
+    if rule["kind"] == "metric_threshold":
+        if not rule.get("metric") or rule.get("op") not in alerts.OPS or rule.get("threshold") is None:
+            err("metric_threshold rules need metric, op (>, >=, <, <=) and threshold", 400)
+
+
+@app.get("/admin/alerts")
+def admin_list_alerts():
+    return ok([alerts.public_rule(r) for r in db_list_alert_rules()])
+
+
+@app.post("/admin/alerts", status_code=201)
+def admin_create_alert(req: AlertRuleRequest, request: Request):
+    rule = req.model_dump()
+    rule["name"] = rule["name"].strip()
+    _check_alert_rule(rule)
+    if rule["kind"] == "event" and not rule["min_severity"]:
+        rule["min_severity"] = "error"
+    me = _principal(request)
+    return ok(alerts.public_rule(db_create_alert_rule(rule, me.name if me else "local")))
+
+
+@app.patch("/admin/alerts/{rule_id}")
+def admin_update_alert(rule_id: str, req: UpdateAlertRuleRequest):
+    current = db_get_alert_rule(rule_id)
+    if current is None:
+        err("No such alert rule", 404)
+    patch = req.model_dump(exclude_unset=True)
+    _check_alert_rule({**current, **patch})
+    db_update_alert_rule(rule_id, patch)
+    return ok(alerts.public_rule(db_get_alert_rule(rule_id)))
+
+
+@app.delete("/admin/alerts/{rule_id}")
+def admin_delete_alert(rule_id: str):
+    if not db_delete_alert_rule(rule_id):
+        err("No such alert rule", 404)
+    return ok({"deleted": rule_id})
+
+
+@app.post("/admin/alerts/{rule_id}/test")
+def admin_test_alert(rule_id: str):
+    """Send a test message to the rule's webhook now."""
+    rule = db_get_alert_rule(rule_id)
+    if rule is None:
+        err("No such alert rule", 404)
+    error = alerts.send_test(rule)
+    if error:
+        err(f"Delivery failed: {error}", 502)
+    return ok({"sent": True})
+
+
+# ---------------------------------------------------------------------------
+# Idempotent ingestion
+# ---------------------------------------------------------------------------
+
+BATCH_HEADER = "X-Pyrometer-Batch"
+
+
+def _ingest_once(run_id: str, request: Request, insert):
+    """Run ``insert()`` unless this client batch id was already ingested for the run.
+
+    The SDK retries undelivered batches, possibly after the server stored them but the response was
+    lost. Returns ``insert()``'s result, or ``None`` for a duplicate (nothing inserted).
+    """
+    batch_id = request.headers.get(BATCH_HEADER)
+    if not batch_id:
+        return insert()
+    if not db_claim_batch(run_id, batch_id[:64]):
+        return None
+    try:
+        return insert()
+    except Exception:
+        db_release_batch(run_id, batch_id[:64])
+        raise
+
+
+def _dup() -> dict:
+    return ok({"inserted": 0, "duplicate": True})
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +725,42 @@ def auth_logout(response: Response):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs", status_code=201)
-async def create_run(req: CreateRunRequest):
+async def create_run(req: CreateRunRequest, request: Request):
+    principal = _principal(request)
+    if req.resume is not None:
+        if req.run_id is None:
+            err("resume needs a run_id", 400)
+        existing = db_get_run_project(req.run_id)
+        if existing is not None:
+            if not auth.can_write_project(principal, existing):
+                err("No such run", 404)  # same answer as a missing run: do not reveal other projects
+            if req.project is not None and req.project != existing:
+                err(f"Run {req.run_id} belongs to project {existing!r}, not {req.project!r}", 409)
+            info = db_resume_run(req.run_id)
+            await _ws.broadcast({"type": "run_updated", "run_id": req.run_id})
+            return ok(info)
+        if req.resume == "must":
+            err("No such run", 404)
+    # A project key implies its project; everyone else lands in "default" unless they name one.
+    default = principal.project if principal and principal.role == "project" else "default"
+    project = _validated_project_name(req.project or default)
+    if db_get_project(project) is None:
+        if principal is not None and principal.role == "project":
+            err("No such project", 404)
+        # First use by a global key (or local mode) registers it as a public project.
+        db_create_project(project, "public", principal.name if principal else "local")
+    if not auth.can_write_project(principal, project):
+        err("No such project", 404)  # same answer as a missing one: do not reveal private names
+    if req.run_id is not None:
+        existing = db_get_run_project(req.run_id)
+        if existing is not None:  # repeat of an earlier create (lost response, re-synced spool)
+            if not auth.can_write_project(principal, existing):
+                err("No such project", 404)
+            run = db_get_run(req.run_id)
+            return ok({k: run[k] for k in ("run_id", "name", "status", "created_at", "project")})
     run = db_create_run(
+        run_id=req.run_id,
+        created_at=req.created_at,
         name=req.name,
         hyperparams=req.hyperparams,
         tags=req.tags,
@@ -331,14 +773,15 @@ async def create_run(req: CreateRunRequest):
         pytorch_version=req.pytorch_version,
         python_version=req.python_version,
         hostname=req.hostname,
+        project=project,
     )
     await _ws.broadcast({"type": "run_created", "run_id": run["run_id"]})
     return ok(run)
 
 
 @app.get("/runs")
-def list_runs():
-    return ok(db_list_runs())
+def list_runs(request: Request):
+    return ok(db_list_runs(auth.visible_projects(_principal(request))))
 
 
 @app.get("/runs/{run_id}")
@@ -351,17 +794,32 @@ def get_run(run_id: str):
 
 @app.patch("/runs/{run_id}")
 async def update_run(run_id: str, req: UpdateRunRequest):
-    if req.status not in (None, "running", "completed", "crashed", "killed"):
+    if req.status not in (None, "running", *TERMINAL_STATUSES):
         err(f"Invalid status: {req.status!r}")
+    # An explicit status always wins, including a replayed one after the sweeper marked the run crashed.
+    before = db_get_run_status(run_id)
     db_update_run(run_id, req.status, req.notes)
+    if req.status is not None and req.status != before:  # a replayed PATCH must not alert twice
+        alerts.notify_run_status(run_id, req.status)
     # Compute derived summary stats when a run reaches a terminal state.
-    if req.status in ("completed", "crashed", "killed"):
-        import threading as _threading
-        _threading.Thread(
+    if req.status in TERMINAL_STATUSES:
+        threading.Thread(
             target=db_compute_run_summary, args=(run_id,), daemon=True
         ).start()
     await _ws.broadcast({"type": "run_updated", "run_id": run_id})
     return ok({"updated": True})
+
+
+@app.post("/runs/{run_id}/heartbeat")
+async def heartbeat(run_id: str):
+    """Liveness ping from the SDK. Revives a run the sweeper marked ``crashed``."""
+    before = db_get_run_status(run_id)
+    if before is None:
+        err("Run not found", status_code=404)
+    db_heartbeat(run_id)
+    if before == "crashed":
+        await _ws.broadcast({"type": "run_updated", "run_id": run_id})
+    return ok({"alive": True})
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +827,12 @@ async def update_run(run_id: str, req: UpdateRunRequest):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/metrics", status_code=201)
-async def ingest_metrics(run_id: str, metrics: list[MetricEntry]):
-    inserted = db_insert_metrics(run_id, [m.model_dump() for m in metrics])
+async def ingest_metrics(run_id: str, metrics: list[MetricEntry], request: Request):
+    points = [m.model_dump() for m in metrics]
+    inserted = _ingest_once(run_id, request, lambda: db_insert_metrics(run_id, points))
+    if inserted is None:
+        return _dup()
+    alerts.check_metrics(run_id, points)
     await _ws.broadcast({"type": "metrics", "run_id": run_id}, throttle_key=(run_id, "metrics"))
     return ok({"inserted": inserted})
 
@@ -390,8 +852,12 @@ def get_metric_names(run_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/profile", status_code=201)
-def ingest_profile(run_id: str, events: list[ProfileEvent]):
-    inserted = db_insert_profile_events(run_id, [e.model_dump() for e in events])
+def ingest_profile(run_id: str, events: list[ProfileEvent], request: Request):
+    inserted = _ingest_once(
+        run_id, request, lambda: db_insert_profile_events(run_id, [e.model_dump() for e in events])
+    )
+    if inserted is None:
+        return _dup()
     return ok({"inserted": inserted})
 
 
@@ -415,8 +881,9 @@ def get_profile_steps(run_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/system", status_code=201)
-async def ingest_system_snapshot(run_id: str, snapshot: SystemSnapshot):
-    db_insert_system_snapshot(run_id, snapshot.model_dump())
+async def ingest_system_snapshot(run_id: str, snapshot: SystemSnapshot, request: Request):
+    if _ingest_once(run_id, request, lambda: db_insert_system_snapshot(run_id, snapshot.model_dump()) or True) is None:
+        return _dup()
     await _ws.broadcast({"type": "system", "run_id": run_id}, throttle_key=(run_id, "system"))
     return ok({"inserted": True})
 
@@ -431,8 +898,10 @@ def get_system_snapshots(run_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/param-stats", status_code=201)
-async def ingest_param_stats(run_id: str, stats: list[ParamStatEntry]):
-    inserted = db_insert_param_stats(run_id, [s.model_dump() for s in stats])
+async def ingest_param_stats(run_id: str, stats: list[ParamStatEntry], request: Request):
+    inserted = _ingest_once(run_id, request, lambda: db_insert_param_stats(run_id, [s.model_dump() for s in stats]))
+    if inserted is None:
+        return _dup()
     await _ws.broadcast({"type": "param_stats", "run_id": run_id}, throttle_key=(run_id, "param_stats"))
     return ok({"inserted": inserted})
 
@@ -452,8 +921,10 @@ def get_param_stat_names_route(run_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/events", status_code=201)
-def ingest_event(run_id: str, event: EventEntry):
-    db_insert_event(run_id, event.model_dump())
+def ingest_event(run_id: str, event: EventEntry, request: Request):
+    if _ingest_once(run_id, request, lambda: db_insert_event(run_id, event.model_dump()) or True) is None:
+        return _dup()
+    alerts.notify_event(run_id, event.model_dump())
     return ok({"inserted": True})
 
 
@@ -467,8 +938,10 @@ def get_events(run_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/logs", status_code=201)
-async def ingest_logs(run_id: str, entries: list[LogEntry]):
-    inserted = db_insert_logs(run_id, [e.model_dump() for e in entries])
+async def ingest_logs(run_id: str, entries: list[LogEntry], request: Request):
+    inserted = _ingest_once(run_id, request, lambda: db_insert_logs(run_id, [e.model_dump() for e in entries]))
+    if inserted is None:
+        return _dup()
     await _ws.broadcast({"type": "logs", "run_id": run_id}, throttle_key=(run_id, "logs"))
     return ok({"inserted": inserted})
 
@@ -483,8 +956,9 @@ def get_logs(run_id: str, stream: str | None = None):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/artifacts", status_code=201)
-def ingest_artifact(run_id: str, artifact: ArtifactEntry):
-    db_insert_artifact(run_id, artifact.model_dump())
+def ingest_artifact(run_id: str, artifact: ArtifactEntry, request: Request):
+    if _ingest_once(run_id, request, lambda: db_insert_artifact(run_id, artifact.model_dump()) or True) is None:
+        return _dup()
     return ok({"inserted": True})
 
 
@@ -600,7 +1074,10 @@ def get_llm_summary(run_id: str):
         if summary.get("peak_process_memory_bytes"):
             peak_gb = summary["peak_process_memory_bytes"] / 1024**3
             total_str = ""
-            if run.get("gpu_memory_total"):
+            n_gpus = db_gpu_count(run_id)
+            if n_gpus > 1:
+                total_str = f" (summed over {n_gpus} GPUs)"
+            elif run.get("gpu_memory_total"):
                 total_gb = run["gpu_memory_total"] / 1024**3
                 total_str = f" / {total_gb:.1f} GB"
             sys_parts.append(f"  Peak VRAM: {peak_gb:.2f} GB{total_str}")
@@ -619,6 +1096,17 @@ def get_llm_summary(run_id: str):
             lines.append(f"  [{step_str}] {e['event_type']} ({e['severity']}): {e['message']}")
         lines.append("")
 
+    # Samples: latest step's best and worst by reward, truncated
+    def _clip(smp: dict) -> str:
+        return "; ".join(f"{k}={str(v)[:160]!r}" for k, v in list(smp.items())[:6])
+
+    for ex in db_get_sample_extremes(run_id):
+        lines.append(f"SAMPLES '{ex['name']}' ({ex['n_steps']} steps with samples; latest step {ex['latest_step']})")
+        for label, key in (("top reward", "top"), ("bottom reward", "bottom")):
+            for smp in ex[key]:
+                lines.append(f"  [{label}] {_clip(smp)}")
+        lines.append("")
+
     # Notes
     if run.get("notes"):
         lines.append("NOTES")
@@ -633,8 +1121,9 @@ def get_llm_summary(run_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/runs/{run_id}/media", status_code=201)
-def ingest_media(run_id: str, item: MediaEntry):
-    db_insert_media(run_id, item.model_dump())
+def ingest_media(run_id: str, item: MediaEntry, request: Request):
+    if _ingest_once(run_id, request, lambda: db_insert_media(run_id, item.model_dump()) or True) is None:
+        return _dup()
     return ok({"inserted": True})
 
 
@@ -646,6 +1135,44 @@ def get_media_names(run_id: str):
 @app.get("/runs/{run_id}/media")
 def get_media(run_id: str, name: str | None = None):
     return ok(db_get_media(run_id, name))
+
+
+# ---------------------------------------------------------------------------
+# Routes — samples (prompt / completion / reward dicts per step)
+# ---------------------------------------------------------------------------
+
+@app.post("/runs/{run_id}/samples", status_code=201)
+def ingest_samples(run_id: str, item: SamplesEntry, request: Request):
+    import json as _json
+
+    if len(item.samples) > MAX_SAMPLES_PER_CALL:
+        err(f"Too many samples in one call ({len(item.samples)} > {MAX_SAMPLES_PER_CALL})", 413)
+    total = 0
+    for i, smp in enumerate(item.samples):
+        size = len(_json.dumps(smp, default=str))
+        if size > MAX_SAMPLE_BYTES:
+            err(f"Sample {i} is {size} bytes; the limit is {MAX_SAMPLE_BYTES}", 413)
+        total += size
+    if total > MAX_SAMPLES_CALL_BYTES:
+        err(f"Samples payload is {total} bytes; the limit is {MAX_SAMPLES_CALL_BYTES}", 413)
+    n = _ingest_once(
+        run_id, request,
+        lambda: db_insert_samples(run_id, item.name[:200], item.step, item.timestamp, item.samples),
+    )
+    if n is None:
+        return _dup()
+    return ok({"inserted": n})
+
+
+@app.get("/runs/{run_id}/samples/steps")
+def get_sample_steps(run_id: str):
+    return ok(db_get_sample_steps(run_id))
+
+
+@app.get("/runs/{run_id}/samples")
+def get_samples(run_id: str, name: str = "samples", step: int = 0, limit: int = 50, offset: int = 0):
+    limit = max(1, min(limit, 200))
+    return ok(db_get_samples(run_id, name, step, limit, max(0, offset)))
 
 
 # ---------------------------------------------------------------------------
