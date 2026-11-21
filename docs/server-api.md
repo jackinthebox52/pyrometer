@@ -235,7 +235,10 @@ Create a new training run.
 | `git_hash` | `string` | No | Git commit hash. |
 | `git_dirty` | `boolean` | No | True if uncommitted changes exist. |
 | `gpu_model` | `string` | No | GPU model name. |
-| `gpu_memory_total` | `integer` | No | Total VRAM in bytes. |
+| `gpu_memory_total` | `integer` | No | Total VRAM in bytes (GPU 0, kept for compatibility). |
+| `gpus` | `object[]` | No | Every GPU visible to the run: `index` (CUDA ordinal), `name`, `uuid`, `memory_total`, `driver_version`, `mig_mode` (`enabled`/`disabled`/null), `is_mig` (the visible device is itself a MIG instance), `mig_devices` (instances of a MIG-enabled GPU: `index`, `uuid`, `name`, `memory_total`, `utilization` always null) and, for MIG, a `note` (NVML reports no utilization, temperature or power per MIG instance). `gpu_model`/`gpu_memory_total` = GPU 0. Returned as `[]` for older runs. |
+| `gpu_count` | `integer` | No | Number of entries in `gpus`. |
+| `driver_version` | `string` | No | NVIDIA driver version. |
 | `cuda_version` | `string` | No | CUDA version string. |
 | `pytorch_version` | `string` | No | PyTorch version string. |
 | `python_version` | `string` | No | Python version string. |
@@ -392,7 +395,7 @@ Update run status, notes, hardware info and the organisation fields (name, tags,
 | `tags` | `list[string]` | No | **Replaces** the tag list (trimmed, deduplicated, at most 50 tags of at most 64 characters) |
 | `hyperparams` | `object` | No | **Replaces** the run's hyperparams. API keys only (dashboard sessions get 403). Used by the SDK when a script's `init()` attaches to a `pyrometer run` launcher run |
 | `group` | `string\|null` | No | Set the run's group (max 128 characters); `""`/`null` clears it |
-| `git_hash`, `git_dirty`, `gpu_model`, `gpu_memory_total`, `cuda_version`, `pytorch_version`, `python_version`, `hostname` | various | No | Hardware/environment fields. The SDK sends these in a follow-up PATCH once its background probe (importing torch, initialising NVML; takes seconds) is done, so `init()` does not wait for it. Absent or null fields are left unchanged |
+| `git_hash`, `git_dirty`, `gpu_model`, `gpu_memory_total`, `gpus`, `gpu_count`, `driver_version`, `cuda_version`, `pytorch_version`, `python_version`, `hostname` | various | No | Hardware/environment fields. The SDK sends these in a follow-up PATCH once its background probe (importing torch, initialising NVML; takes seconds) is done, so `init()` does not wait for it. Absent or null fields are left unchanged |
 
 **Who may call it**: API keys that can write the run's project (global key, or that project's key) may set every field.
 Dashboard **admins** (session or trusted proxy, same-origin) may set only `name`, `tags`, `notes` and `group`; sending
@@ -1346,11 +1349,28 @@ Get derived statistics for a run.
       "gpu_utilization": 0.873,
       "memory_efficiency": 0.75,
       "compute_efficiency": 0.92
-    }
+    },
+    "per_gpu": [
+      {
+        "gpu_index": 0,
+        "avg_gpu_utilization": 91.2,
+        "avg_device_utilization": 93.0,
+        "peak_process_memory_bytes": 17179869184,
+        "peak_memory_bytes": 17500000000,
+        "memory_total_bytes": 42949672960,
+        "samples": 1350
+      }
+    ]
   },
   "error": null
 }
 ```
+
+`per_gpu` has one entry per GPU that reported snapshots (`gpu_index` is the CUDA ordinal; old rows count as GPU 0).
+`avg_gpu_utilization` is this process's own utilization where known (else the device's), `avg_device_utilization`
+the whole device's, `peak_process_memory_bytes` / `peak_memory_bytes` this process's / the device's peak VRAM.
+Utilization fields are `null` for GPUs that never report it (MIG instances). Summaries computed before this field
+existed are recomputed on read.
 
 If no summary has been computed (e.g., run still in progress), one is computed on-the-fly and cached.
 

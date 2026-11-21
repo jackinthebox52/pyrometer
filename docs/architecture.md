@@ -221,7 +221,10 @@ One row per training run. Small table, read frequently.
 | `git_hash` | `VARCHAR` | Git commit hash |
 | `git_dirty` | `BOOLEAN` | Uncommitted changes flag |
 | `gpu_model` | `VARCHAR` | GPU model name |
-| `gpu_memory_total` | `BIGINT` | Total VRAM in bytes |
+| `gpu_memory_total` | `BIGINT` | Total VRAM in bytes (GPU 0; kept for compatibility) |
+| `gpus` | `JSON` | Every GPU visible to the run: index, name, uuid, memory_total, driver_version, mig_mode, is_mig, mig_devices (per-instance memory; utilization is always null) |
+| `gpu_count` | `INTEGER` | Number of visible GPUs |
+| `driver_version` | `VARCHAR` | NVIDIA driver version |
 | `cuda_version` | `VARCHAR` | CUDA version string |
 | `pytorch_version` | `VARCHAR` | PyTorch version string |
 | `python_version` | `VARCHAR` | Python version string |
@@ -422,6 +425,7 @@ Derived statistics computed when a run finishes.
 | `total_training_time_s` | `DOUBLE` | Wall-clock duration |
 | `total_steps` | `INTEGER` | Total training steps |
 | `steps_per_sec` | `DOUBLE` | Throughput |
+| `per_gpu` | `JSON` | Per-GPU breakdown (avg utilization, peak process / device memory per `gpu_index`) |
 | `avg_gpu_utilization` | `DOUBLE` | Average GPU utilization: per-process values over the GPUs this run uses when available, else device-wide across all monitored GPUs |
 | `peak_process_memory_bytes` | `BIGINT` | Peak VRAM usage (process-attributed if available, else device), summed over GPUs per poll |
 | `anomaly_count` | `INTEGER` | Number of anomaly events |

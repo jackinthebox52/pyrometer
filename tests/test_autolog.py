@@ -628,3 +628,35 @@ def test_recent_param_stats_endpoint_and_grad_detector_seed(tmp_path, monkeypatc
     warm.seed("w", [1.0] * 40)
     assert cold.observe("w", 5000.0, 100, False) is None  # no history yet: blind
     assert warm.observe("w", 5000.0, 100, False) is not None  # seeded: a 5000x spike is caught at once
+
+
+def test_lazy_device_values_are_read_only_when_their_copy_finished():
+    """CUDA scalars are staged to pinned memory with an event; an unfinished event leaves the entry queued
+    (no blocking read), ``force`` (finish) drains everything."""
+    import threading
+    from types import SimpleNamespace
+
+    from pyrometer._autolog import _AutologEngine
+
+    logged: list = []
+    eng = _AutologEngine.__new__(_AutologEngine)
+    eng._lock = threading.RLock()
+    eng.run = SimpleNamespace(_log=lambda vals, k, ts: logged.append((k, vals)))
+    state = {"done": False}
+    ev = SimpleNamespace(query=lambda: state["done"])
+    eng._lazy = [(1, 0.0, {"auto/loss": torch.tensor(2.5)}, [ev])]
+    eng._resolve_lazy()
+    assert logged == [] and len(eng._lazy) == 1
+    state["done"] = True
+    eng._resolve_lazy()
+    assert logged == [(1, {"auto/loss": 2.5})] and eng._lazy == []
+    eng._lazy = [(2, 0.0, {"auto/loss": torch.tensor(1.0)}, [SimpleNamespace(query=lambda: False)])]
+    eng._resolve_lazy(force=True)
+    assert logged[-1] == (2, {"auto/loss": 1.0})
+
+
+def test_stage_falls_back_to_the_tensor_without_cuda():
+    from pyrometer._autolog import _AutologEngine
+
+    staged, events = _AutologEngine._stage({"x": torch.tensor(3.0)})
+    assert float(staged["x"]) == 3.0 and events == []

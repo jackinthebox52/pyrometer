@@ -158,8 +158,8 @@ The main view for inspecting a single training run.
 | **Time ago** | Relative time since run started |
 | **Run ID** | UUID (truncated, hover for full ID) |
 | **Tags** | Clickable hashtag pills |
-| **Summary stats** | Efficiency grade, steps, throughput, GPU utilization, anomalies |
-| **Hardware info** | GPU model, CUDA, PyTorch, Python versions, hostname, git commit |
+| **Summary stats** | Efficiency grade, steps, throughput, GPU utilization, anomalies; on multi-GPU runs one chip per GPU (avg util, peak VRAM) |
+| **Hardware info** | Every visible GPU (model, memory, MIG), driver, CUDA, PyTorch, Python versions, hostname, git commit |
 
 #### Organising a run
 
@@ -196,7 +196,8 @@ HYPERPARAMETERS
   batch_size: 64
 
 HARDWARE
-  GPU: NVIDIA A100-SXM4-40GB (40.0 GB)
+  GPU 0: NVIDIA A100-SXM4-40GB (40.0 GB)
+  Driver: 535.54.03
   Python 3.12.0  |  PyTorch 2.1.0  |  CUDA 12.1
 
 GIT

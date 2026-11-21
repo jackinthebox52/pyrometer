@@ -80,6 +80,10 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS updated_at DOUBLE")
     conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_group VARCHAR")
     conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS archived_at DOUBLE")
+    # Hardware: every visible GPU (JSON list), their count and the driver. gpu_model/gpu_memory_total stay = GPU 0.
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS gpus JSON")
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS gpu_count INTEGER")
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS driver_version VARCHAR")
     conn.execute("UPDATE runs SET project = 'default' WHERE project IS NULL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS projects (
@@ -319,6 +323,7 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             efficiency_details        JSON
         )
     """)
+    conn.execute("ALTER TABLE run_summaries ADD COLUMN IF NOT EXISTS per_gpu JSON")
 
     # Per-user pinned runs (dashboard users only).
     conn.execute("""
@@ -534,6 +539,7 @@ _DETAIL_COLS = [
     "hyperparams", "git_hash", "git_dirty", "gpu_model", "gpu_memory_total",
     "cuda_version", "pytorch_version", "python_version", "hostname", "tags", "notes",
     "project", "last_heartbeat", "updated_at", "run_group", "archived_at",
+    "gpus", "gpu_count", "driver_version",
 ]
 
 
@@ -541,6 +547,7 @@ def _row_to_run_detail(row: tuple) -> dict:
     d = dict(zip(_DETAIL_COLS, row))
     d["hyperparams"] = _parse_json(d["hyperparams"]) or {}
     d["tags"] = _parse_json(d["tags"]) or []
+    d["gpus"] = _parse_json(d["gpus"]) or []
     d["created_at"] = _ts_to_iso(d["created_at"])
     d["finished_at"] = _ts_to_iso(d["finished_at"])
     d["last_heartbeat"] = _ts_to_iso(d["last_heartbeat"])
@@ -572,6 +579,9 @@ def db_create_run(
     run_id: str | None = None,
     created_at: float | None = None,
     group: str | None = None,
+    gpus: list[dict] | None = None,
+    gpu_count: int | None = None,
+    driver_version: str | None = None,
 ) -> dict:
     """Insert a run. ``run_id``/``created_at`` come from the SDK (offline runs keep their identity)."""
     run_id = run_id or str(uuid.uuid4())
@@ -585,10 +595,11 @@ def db_create_run(
             INSERT INTO runs (
                 run_id, name, status, created_at, finished_at, hyperparams, git_hash, git_dirty,
                 gpu_model, gpu_memory_total, cuda_version, pytorch_version, python_version,
-                hostname, tags, notes, project, last_heartbeat, updated_at, run_group
+                hostname, tags, notes, project, last_heartbeat, updated_at, run_group,
+                gpus, gpu_count, driver_version
             ) VALUES (
                 ?, ?, 'running', ?, NULL,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             [
@@ -604,6 +615,9 @@ def db_create_run(
                 time.time(),  # server clock: a run synced from a spool starts "alive" now
                 time.time(),  # updated_at
                 group,
+                json.dumps(gpus) if gpus else None,
+                gpu_count,
+                driver_version,
             ],
         )
 
@@ -997,7 +1011,7 @@ def db_resume_run(run_id: str) -> dict:
 # Hardware/environment columns the SDK may fill in after creating the run (see PATCH /runs/{id}).
 RUN_INFO_FIELDS = (
     "git_hash", "git_dirty", "gpu_model", "gpu_memory_total", "cuda_version",
-    "pytorch_version", "python_version", "hostname",
+    "pytorch_version", "python_version", "hostname", "gpus", "gpu_count", "driver_version",
 )
 
 
@@ -1041,7 +1055,10 @@ def db_update_run(
         for col, val in (info or {}).items():
             if col in RUN_INFO_FIELDS and val is not None:  # whitelist: the column name is interpolated
                 changed = True
-                conn.execute(f"UPDATE runs SET {col} = ? WHERE run_id = ?", [val, run_id])
+                conn.execute(
+                    f"UPDATE runs SET {col} = ? WHERE run_id = ?",
+                    [json.dumps(val) if col == "gpus" else val, run_id],
+                )
         for col, val in (meta or {}).items():
             if col in RUN_META_FIELDS:
                 changed = True
@@ -2064,6 +2081,26 @@ def db_compute_run_summary(run_id: str) -> dict | None:
             int(mem_row[0]) if mem_row and mem_row[0] is not None else None
         )
 
+        # Per-GPU breakdown (old rows without gpu_index are GPU 0). Utilization is this process's own where
+        # known (attributed), else the device's; None when the GPU never reported one (MIG instances).
+        per_gpu: list[dict] = []
+        for g_idx, g_util, g_dev_util, g_pmem, g_mem, g_total, g_n in conn.execute(
+            "SELECT COALESCE(gpu_index, 0), "
+            "AVG(COALESCE(attributed_utilization, gpu_utilization)), AVG(gpu_utilization), "
+            "MAX(process_memory_used), MAX(memory_used), MAX(memory_total), COUNT(*) "
+            "FROM system_snapshots WHERE run_id = ? GROUP BY 1 ORDER BY 1",
+            [run_id],
+        ).fetchall():
+            per_gpu.append({
+                "gpu_index": int(g_idx),
+                "avg_gpu_utilization": round(g_util, 1) if g_util is not None else None,
+                "avg_device_utilization": round(g_dev_util, 1) if g_dev_util is not None else None,
+                "peak_process_memory_bytes": int(g_pmem) if g_pmem is not None else None,
+                "peak_memory_bytes": int(g_mem) if g_mem is not None else None,
+                "memory_total_bytes": int(g_total) if g_total is not None else None,
+                "samples": int(g_n),
+            })
+
         # Anomaly event count
         anomaly_row = conn.execute(
             "SELECT COUNT(*) FROM events WHERE run_id = ? AND event_type = 'anomaly_detected'",
@@ -2144,6 +2181,7 @@ def db_compute_run_summary(run_id: str) -> dict | None:
         "best_metrics": best_metrics,
         "efficiency_score": efficiency_score,
         "efficiency_details": {k: round(v, 3) for k, v in efficiency_details.items()},
+        "per_gpu": per_gpu,
     }
 
     # Upsert (unless the run was hard-deleted while this was computing: that must leave no row behind)
@@ -2153,7 +2191,9 @@ def db_compute_run_summary(run_id: str) -> dict | None:
             return None
         conn.execute("DELETE FROM run_summaries WHERE run_id = ?", [run_id])
         conn.execute(
-            "INSERT INTO run_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO run_summaries (run_id, computed_at, total_training_time_s, total_steps, steps_per_sec, "
+            "avg_gpu_utilization, peak_process_memory_bytes, anomaly_count, final_metrics, best_metrics, "
+            "efficiency_score, efficiency_details, per_gpu) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 run_id,
                 now,
@@ -2167,6 +2207,7 @@ def db_compute_run_summary(run_id: str) -> dict | None:
                 json.dumps(best_metrics),
                 efficiency_score,
                 json.dumps({k: round(v, 3) for k, v in efficiency_details.items()}),
+                json.dumps(per_gpu),
             ],
         )
 
@@ -2181,7 +2222,7 @@ def db_get_run_summary(run_id: str) -> dict | None:
             """
             SELECT run_id, computed_at, total_training_time_s, total_steps, steps_per_sec,
                    avg_gpu_utilization, peak_process_memory_bytes, anomaly_count,
-                   final_metrics, best_metrics, efficiency_score, efficiency_details
+                   final_metrics, best_metrics, efficiency_score, efficiency_details, per_gpu
             FROM run_summaries WHERE run_id = ?
             """,
             [run_id],
@@ -2191,9 +2232,10 @@ def db_get_run_summary(run_id: str) -> dict | None:
     cols = [
         "run_id", "computed_at", "total_training_time_s", "total_steps", "steps_per_sec",
         "avg_gpu_utilization", "peak_process_memory_bytes", "anomaly_count",
-        "final_metrics", "best_metrics", "efficiency_score", "efficiency_details",
+        "final_metrics", "best_metrics", "efficiency_score", "efficiency_details", "per_gpu",
     ]
     d = dict(zip(cols, row))
+    d["per_gpu"] = _parse_json(d["per_gpu"])  # None = computed before per-GPU stats existed
     d["final_metrics"] = _parse_json(d["final_metrics"]) or {}
     d["best_metrics"] = _parse_json(d["best_metrics"]) or {}
     d["efficiency_details"] = _parse_json(d["efficiency_details"]) or {}

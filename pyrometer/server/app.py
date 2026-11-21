@@ -408,6 +408,9 @@ class CreateRunRequest(BaseModel):
     git_dirty: bool = False
     gpu_model: str | None = None
     gpu_memory_total: int | None = None
+    gpus: list[dict] | None = None  # every visible GPU (index, name, uuid, memory_total, mig_mode, mig_devices...)
+    gpu_count: int | None = None
+    driver_version: str | None = None
     cuda_version: str | None = None
     pytorch_version: str | None = None
     python_version: str | None = None
@@ -431,6 +434,9 @@ class UpdateRunRequest(BaseModel):
     git_dirty: bool | None = None
     gpu_model: str | None = None
     gpu_memory_total: int | None = None
+    gpus: list[dict] | None = None  # every visible GPU (index, name, uuid, memory_total, mig_mode, mig_devices...)
+    gpu_count: int | None = None
+    driver_version: str | None = None
     cuda_version: str | None = None
     pytorch_version: str | None = None
     python_version: str | None = None
@@ -1128,6 +1134,9 @@ async def create_run(req: CreateRunRequest, request: Request):
             git_dirty=req.git_dirty,
             gpu_model=req.gpu_model,
             gpu_memory_total=req.gpu_memory_total,
+            gpus=req.gpus,
+            gpu_count=req.gpu_count,
+            driver_version=req.driver_version,
             cuda_version=req.cuda_version,
             pytorch_version=req.pytorch_version,
             python_version=req.python_version,
@@ -1646,7 +1655,7 @@ def get_artifacts(run_id: str):
 def _current_summary(run_id: str) -> dict | None:
     """The stored summary for a finished run; in-progress (or resumed) runs are recomputed, never served stale."""
     summary = db_get_run_summary(run_id)
-    if summary is None or db_get_run_status(run_id) not in TERMINAL_STATUSES:
+    if summary is None or summary.get("per_gpu") is None or db_get_run_status(run_id) not in TERMINAL_STATUSES:
         summary = db_compute_run_summary(run_id)
     return summary
 
@@ -1698,7 +1707,18 @@ def get_llm_summary(run_id: str):
 
     # Hardware
     hw_parts = []
-    if run.get("gpu_model"):
+    gpus = run.get("gpus") or []
+    if gpus:
+        for g in gpus:
+            vram = f" ({g['memory_total'] / 1024**3:.1f} GB)" if g.get("memory_total") else ""
+            tag = " [MIG instance]" if g.get("is_mig") else ""
+            hw_parts.append(f"  GPU {g.get('index')}: {g.get('name')}{vram}{tag}")
+            for m in g.get("mig_devices") or []:
+                mvram = f" ({m['memory_total'] / 1024**3:.1f} GB)" if m.get("memory_total") else ""
+                hw_parts.append(f"    MIG {m.get('index')}: {m.get('name')}{mvram}, utilization n/a")
+        if gpus[0].get("driver_version"):
+            hw_parts.append(f"  Driver: {gpus[0]['driver_version']}")
+    elif run.get("gpu_model"):
         vram = f" ({run['gpu_memory_total'] / 1024**3:.1f} GB)" if run.get("gpu_memory_total") else ""
         hw_parts.append(f"  GPU: {run['gpu_model']}{vram}")
     env_parts = []
@@ -1747,6 +1767,13 @@ def get_llm_summary(run_id: str):
             sys_parts.append(f"  Steps: {summary['total_steps']}{throughput}")
         if summary.get("avg_gpu_utilization") is not None:
             sys_parts.append(f"  Avg GPU utilization: {summary['avg_gpu_utilization']:.1f}%")
+        per_gpu = summary.get("per_gpu") or []
+        if len(per_gpu) > 1:
+            for g in per_gpu:
+                util = f"{g['avg_gpu_utilization']:.1f}%" if g.get("avg_gpu_utilization") is not None else "n/a"
+                peak = g.get("peak_process_memory_bytes") or g.get("peak_memory_bytes")
+                mem = f"{peak / 1024**3:.2f} GB" if peak else "n/a"
+                sys_parts.append(f"  GPU {g['gpu_index']}: avg util {util}, peak VRAM {mem}")
         if summary.get("peak_process_memory_bytes"):
             peak_gb = summary["peak_process_memory_bytes"] / 1024**3
             total_str = ""

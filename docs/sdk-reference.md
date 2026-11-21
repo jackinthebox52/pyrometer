@@ -124,7 +124,7 @@ A [`Run`](#run-object) instance for logging metrics and managing the training ru
 
 On initialization, Pyrometer automatically captures:
 
-- **Hardware info**: GPU model, VRAM, CUDA version, PyTorch version, hostname
+- **Hardware info**: every visible GPU (model, VRAM, UUID, MIG mode and per-instance memory), driver version, CUDA version, PyTorch version, hostname (`gpu_model`/`gpu_memory_total` stay = GPU 0)
 - **Git state**: Commit hash and dirty flag (uncommitted changes)
 
 #### Example
@@ -479,7 +479,7 @@ SDK never looks at your model:
 
 - `torch.optim.optimizer.register_optimizer_step_post_hook`: one cheap callback per `optimizer.step()`.
 - A scoped wrap of `torch.Tensor.backward` and `torch.autograd.backward`: keeps a *detached reference* to each scalar
-  floating-point loss. The value is read at the **next** logging cadence, so there is no per-step GPU synchronisation.
+  floating-point loss. The value is copied to pinned host memory asynchronously and read at a later cadence once the copy has finished (checked with a CUDA event), so there is no per-step GPU synchronisation and no stream stall.
   The originals are restored when the last active run ends; if another library wrapped `backward` on top of ours in the
   meantime, our wrapper stays in place but inert instead of clobbering theirs.
 - Optional, off by default (`run.config.grad_health`): a global forward hook that discovers parameters.
@@ -989,7 +989,7 @@ All buffers are flushed immediately on `run.finish()`.
 On `pyrometer.init()`, two daemon threads are started:
 
 1. **Flush thread**: Wakes every 5 seconds to flush buffered metrics.
-2. **System monitor thread**: Polls pynvml every 2 seconds for **every GPU visible to the process** (honours `CUDA_VISIBLE_DEVICES`, indices or UUIDs; `gpu_index` is the CUDA ordinal) and reports utilization, temperature, power and memory per GPU. It also attributes VRAM and SM utilization to this process (plus its child processes when `psutil` is installed); the `process_*`/`attributed_*` fields are null on GPUs where the process has no context or the driver does not support it.
+2. **System monitor thread**: Polls pynvml every 2 seconds for **every GPU visible to the process** (honours `CUDA_VISIBLE_DEVICES`, indices or UUIDs; `gpu_index` is the CUDA ordinal) and reports utilization, temperature, power and memory per GPU. It also attributes VRAM and SM utilization to this process (plus its child processes when `psutil` is installed); the `process_*`/`attributed_*` fields are null on GPUs where the process has no context or the driver does not support it. Fields a device cannot report (power draw on a Quadro P1000, everything but memory on a MIG instance) are null; the GPU is still sampled. Under MIG, `CUDA_VISIBLE_DEVICES` may hold `MIG-` UUIDs; the run's hardware list shows the instance (or, for a MIG-enabled parent, its instances) with per-instance memory, and utilization is reported as null because NVML has no per-instance utilization.
 
 ### Console Capture
 

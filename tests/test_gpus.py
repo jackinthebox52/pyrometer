@@ -161,3 +161,154 @@ def test_summary_device_fallback_without_process_data(server):
     post(server, rid, 1.0, 1, gpu_utilization=60.0, memory_used=200)
     s = db.db_compute_run_summary(rid)
     assert s["avg_gpu_utilization"] == 50.0 and s["peak_process_memory_bytes"] == 300
+
+
+# --- P3-E: run-level inventory, MIG, per-GPU summary -------------------------------------------------
+
+class InvNvml(FakeNvml):
+    """FakeNvml plus inventory calls; GPU 1 is MIG-enabled with two instances."""
+
+    NVML_DEVICE_MIG_ENABLE = 1
+
+    def nvmlSystemGetDriverVersion(self):
+        return b"535.54"
+
+    def nvmlDeviceGetUUID(self, h):
+        return f"MIG-{h}" if isinstance(h, str) else f"GPU-{h}"
+
+    def nvmlDeviceGetName(self, h):
+        return "Fake MIG 1g.5gb" if isinstance(h, str) else f"Fake GPU {h}"
+
+    def nvmlDeviceIsMigDeviceHandle(self, h):
+        return isinstance(h, str)
+
+    def nvmlDeviceGetMigMode(self, h):
+        return (1 if h == 1 else 0, 0)
+
+    def nvmlDeviceGetMaxMigDeviceCount(self, h):
+        return 3
+
+    def nvmlDeviceGetMigDeviceHandleByIndex(self, h, i):
+        if i == 2:
+            raise RuntimeError("no such instance")
+        return f"{h}-{i}"
+
+    def nvmlDeviceGetMemoryInfo(self, h):
+        if isinstance(h, str):
+            return NS(used=10, total=5 * 2**30)
+        return super().nvmlDeviceGetMemoryInfo(h)
+
+    def nvmlDeviceGetUtilizationRates(self, h):
+        if isinstance(h, str):
+            raise RuntimeError("not supported on MIG")
+        return super().nvmlDeviceGetUtilizationRates(h)
+
+    def nvmlDeviceGetPowerUsage(self, h):
+        if isinstance(h, str):
+            raise RuntimeError("not supported on MIG")
+        return super().nvmlDeviceGetPowerUsage(h)
+
+    def nvmlDeviceGetTemperature(self, h, k):
+        if isinstance(h, str):
+            raise RuntimeError("not supported on MIG")
+        return super().nvmlDeviceGetTemperature(h, k)
+
+
+def test_inventory_lists_all_gpus_with_mig():
+    nv = InvNvml(3)
+    inv = _gpu.gpu_inventory(nv, _gpu._resolve_handles(nv, None))
+    assert [g["index"] for g in inv] == [0, 1, 2]
+    assert {g["driver_version"] for g in inv} == {"535.54"}
+    assert [g["mig_mode"] for g in inv] == ["disabled", "enabled", "disabled"]
+    assert inv[0]["uuid"] == "GPU-0" and inv[0]["memory_total"] == 10000
+    mig = inv[1]["mig_devices"]
+    assert [m["index"] for m in mig] == [0, 1] and mig[0]["memory_total"] == 5 * 2**30
+    assert all(m["utilization"] is None for m in mig) and "MIG" in inv[1]["note"]
+
+
+def test_inventory_mig_uuid_in_cuda_visible_devices():
+    nv = InvNvml(2)
+    nv.nvmlDeviceGetHandleByUUID = lambda u: "mig0" if u.startswith("MIG-") else int(u.split("-")[1])
+    handles = _gpu._resolve_handles(nv, "MIG-abc,GPU-1")
+    inv = _gpu.gpu_inventory(nv, handles)
+    assert inv[0]["is_mig"] and inv[0]["mig_mode"] == "enabled" and inv[0]["memory_total"] == 5 * 2**30
+    assert not inv[1]["is_mig"]
+
+
+def test_mig_snapshot_has_null_utilization_but_memory():
+    nv = InvNvml(1)
+    snap = _gpu.sample_gpu(nv, "mig0", 0, {1})
+    assert snap["memory_total"] == 5 * 2**30
+    assert snap["gpu_utilization"] is None and snap["attributed_utilization"] is None
+    assert snap["temperature"] is None and snap["power_draw"] is None and snap["attributed_power"] is None
+
+
+def test_fingerprint_slow_reports_gpu_list_and_compat_fields(monkeypatch):
+    import sys
+
+    from pyrometer import _hardware
+
+    nv = InvNvml(2)
+    nv.nvmlInit = lambda: None
+    monkeypatch.setitem(sys.modules, "pynvml", nv)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", None)  # import torch -> ImportError
+    info = _hardware.fingerprint_slow()
+    assert info["gpu_count"] == 2 and info["driver_version"] == "535.54"
+    assert info["gpu_model"] == "Fake GPU 0" and info["gpu_memory_total"] == 10000
+    assert [g["name"] for g in info["gpus"]] == ["Fake GPU 0", "Fake GPU 1"]
+
+
+def test_run_gpus_stored_and_in_llm_summary(server):
+    gpus = [
+        {"index": 0, "name": "A", "uuid": "GPU-0", "memory_total": 2**30, "driver_version": "535", "mig_mode": "disabled",
+         "is_mig": False, "mig_devices": []},
+        {"index": 1, "name": "B", "uuid": "GPU-1", "memory_total": 2**31, "driver_version": "535", "mig_mode": "enabled",
+         "is_mig": False, "mig_devices": [{"index": 0, "uuid": "MIG-1", "name": "1g", "memory_total": 2**30, "utilization": None}]},
+    ]
+    rid = server.post("/runs", json={"gpu_model": "A"}).json()["data"]["run_id"]
+    assert server.get(f"/runs/{rid}").json()["data"]["gpus"] == []
+    r = server.patch(f"/runs/{rid}", json={"gpus": gpus, "gpu_count": 2, "driver_version": "535"})
+    assert r.status_code == 200
+    run = server.get(f"/runs/{rid}").json()["data"]
+    assert run["gpus"] == gpus and run["gpu_count"] == 2 and run["driver_version"] == "535"
+    text = server.get(f"/runs/{rid}/llm-summary").text
+    assert "GPU 0: A (1.0 GB)" in text and "GPU 1: B (2.0 GB)" in text and "MIG 0: 1g" in text and "Driver: 535" in text
+
+
+def test_summary_per_gpu_breakdown(server):
+    rid = server.post("/runs", json={}).json()["data"]["run_id"]
+    for t in (1.0, 3.0):
+        post(server, rid, t, 0, gpu_utilization=90.0, memory_used=500, process_memory_used=300, attributed_utilization=80.0)
+        post(server, rid, t, 1, gpu_utilization=40.0, memory_used=700, process_memory_used=200, attributed_utilization=20.0)
+    post(server, rid, 5.0, 1, gpu_utilization=None, memory_used=900, process_memory_used=250)
+    s = server.get(f"/runs/{rid}/summary").json()["data"]
+    g0, g1 = s["per_gpu"]
+    assert g0["gpu_index"] == 0 and g0["avg_gpu_utilization"] == 80.0 and g0["peak_process_memory_bytes"] == 300
+    assert g1["gpu_index"] == 1 and g1["avg_gpu_utilization"] == 20.0 and g1["peak_process_memory_bytes"] == 250
+    assert g1["peak_memory_bytes"] == 900 and g1["samples"] == 3
+    text = server.get(f"/runs/{rid}/llm-summary").text
+    assert "GPU 1: avg util 20.0%" in text
+
+
+def test_old_db_migrates_gpu_columns(tmp_path):
+    import duckdb
+
+    con = duckdb.connect(str(tmp_path / "old.duckdb"))
+    db._init_schema(con)
+    for col in ("gpus", "gpu_count", "driver_version"):  # a database from before this schema version
+        con.execute(f"ALTER TABLE runs DROP COLUMN {col}")
+    con.execute("ALTER TABLE run_summaries DROP COLUMN per_gpu")
+    db._init_schema(con)
+    assert {"gpus", "gpu_count", "driver_version"} <= {r[0] for r in con.execute("DESCRIBE runs").fetchall()}
+    assert "per_gpu" in {r[0] for r in con.execute("DESCRIBE run_summaries").fetchall()}
+    con.close()
+
+
+def test_unsupported_power_does_not_drop_the_gpu():
+    """Real bug found on a Quadro P1000 (no power reporting): the whole device used to be skipped."""
+    nv = FakeNvml(1)
+    nv.nvmlDeviceGetPowerUsage = lambda h: (_ for _ in ()).throw(RuntimeError("Not Supported"))
+    snaps = _gpu.sample_all(nv, [(0, 0)], own_pid=1)
+    assert len(snaps) == 1 and snaps[0]["power_draw"] is None and snaps[0]["attributed_power"] is None
+    assert snaps[0]["gpu_utilization"] == 50.0 and snaps[0]["memory_used"] == 1000

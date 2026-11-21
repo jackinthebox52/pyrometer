@@ -54,9 +54,11 @@ def sample_gpu(nvml: Any, handle: Any, gpu_index: int, pids: set[int]) -> dict[s
     device value is used when we are the only process, else scaled by our share of VRAM (an estimate).
     """
     mem = nvml.nvmlDeviceGetMemoryInfo(handle)
-    util = nvml.nvmlDeviceGetUtilizationRates(handle)
-    temp = nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
-    power = nvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW -> W
+    # MIG instances support memory info only: utilization / temperature / power stay None there.
+    util_rates = _call(nvml.nvmlDeviceGetUtilizationRates, handle)
+    temp = _call(nvml.nvmlDeviceGetTemperature, handle, nvml.NVML_TEMPERATURE_GPU)
+    power_mw = _call(nvml.nvmlDeviceGetPowerUsage, handle)
+    power: float | None = power_mw / 1000.0 if power_mw is not None else None  # mW -> W
 
     fan: float | None = None
     try:
@@ -76,7 +78,7 @@ def sample_gpu(nvml: Any, handle: Any, gpu_index: int, pids: set[int]) -> dict[s
     process_exclusive: bool | None = None
     attributed_utilization: float | None = None
     attributed_power: float | None = None
-    device_util = float(util.gpu)
+    device_util: float | None = float(util_rates.gpu) if util_rates is not None else None
 
     our_vram = 0
     total_vram = 0
@@ -102,15 +104,17 @@ def sample_gpu(nvml: Any, handle: Any, gpu_index: int, pids: set[int]) -> dict[s
     except Exception:
         pass
 
-    if attributed_utilization is None:
+    if attributed_utilization is None and device_util is not None:
         if process_exclusive:
             attributed_utilization = device_util
         elif our_vram > 0 and total_vram > 0:
             attributed_utilization = device_util * our_vram / total_vram
 
-    if process_exclusive:
+    if power is None:
+        attributed_power = None
+    elif process_exclusive:
         attributed_power = power
-    elif attributed_utilization is not None and device_util > 0:
+    elif attributed_utilization is not None and device_util:
         attributed_power = power * min(1.0, attributed_utilization / device_util)
     elif our_vram > 0 and total_vram > 0:
         attributed_power = power * our_vram / total_vram
@@ -120,7 +124,7 @@ def sample_gpu(nvml: Any, handle: Any, gpu_index: int, pids: set[int]) -> dict[s
         "gpu_utilization": device_util,
         "memory_used": mem.used,
         "memory_total": mem.total,
-        "temperature": float(temp),
+        "temperature": float(temp) if temp is not None else None,
         "power_draw": power,
         "fan_speed": fan,
         "sm_clock_mhz": sm_clock,
@@ -178,3 +182,98 @@ def throttle_mask(nvml: Any, handle: Any) -> int | None:
         except Exception:
             continue
     return None
+
+
+# ---------------------------------------------------------------------------
+# Hardware inventory (run-level): every visible GPU, MIG-aware
+# ---------------------------------------------------------------------------
+
+MIG_UTILIZATION_NOTE = (
+    "NVML does not report utilization, temperature or power for MIG instances; "
+    "those fields are null for MIG devices (memory is reported per instance)."
+)
+
+
+def _text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _call(fn: Any, *args: Any) -> Any:
+    try:
+        return fn(*args)
+    except Exception:
+        return None
+
+
+def is_mig_handle(nvml: Any, handle: Any, uuid: str | None = None) -> bool:
+    """True if ``handle`` is a MIG instance (not a whole GPU)."""
+    f = getattr(nvml, "nvmlDeviceIsMigDeviceHandle", None)
+    if f is not None:
+        res = _call(f, handle)
+        if res is not None:
+            return bool(res)
+    return bool(uuid and uuid.startswith("MIG-"))
+
+
+def mig_children(nvml: Any, handle: Any) -> list[dict[str, Any]]:
+    """MIG instances of a MIG-enabled parent GPU (empty if none or unsupported)."""
+    out: list[dict[str, Any]] = []
+    count = _call(getattr(nvml, "nvmlDeviceGetMaxMigDeviceCount", lambda h: 0), handle) or 0
+    for i in range(int(count)):
+        try:
+            child = nvml.nvmlDeviceGetMigDeviceHandleByIndex(handle, i)
+        except Exception:
+            continue  # unused slot
+        mem = _call(nvml.nvmlDeviceGetMemoryInfo, child)
+        out.append({
+            "index": i,
+            "uuid": _text(_call(nvml.nvmlDeviceGetUUID, child)),
+            "name": _text(_call(nvml.nvmlDeviceGetName, child)),
+            "memory_total": int(mem.total) if mem is not None else None,
+            "utilization": None,  # not available per MIG instance via NVML
+        })
+    return out
+
+
+def gpu_inventory(nvml: Any, handles: list[tuple[int, Any]]) -> list[dict[str, Any]]:
+    """Static description of each visible GPU: ``index`` (CUDA ordinal), ``name``, ``uuid``, ``memory_total``,
+    ``driver_version``, ``mig_mode`` (``"enabled"``/``"disabled"``/``None`` if unknown), ``is_mig``
+    (the visible device itself is a MIG instance, e.g. ``CUDA_VISIBLE_DEVICES=MIG-...``) and ``mig_devices``
+    (instances of a MIG-enabled GPU, with per-instance memory and ``utilization: null``).
+    A device NVML cannot describe is skipped.
+    """
+    driver = _text(_call(nvml.nvmlSystemGetDriverVersion))
+    out: list[dict[str, Any]] = []
+    for index, handle in handles:
+        try:
+            uuid = _text(_call(nvml.nvmlDeviceGetUUID, handle))
+            mem = nvml.nvmlDeviceGetMemoryInfo(handle)
+            entry: dict[str, Any] = {
+                "index": index,
+                "name": _text(_call(nvml.nvmlDeviceGetName, handle)),
+                "uuid": uuid,
+                "memory_total": int(mem.total),
+                "driver_version": driver,
+                "mig_mode": None,
+                "is_mig": False,
+                "mig_devices": [],
+            }
+            if is_mig_handle(nvml, handle, uuid):
+                entry["is_mig"] = True
+                entry["mig_mode"] = "enabled"
+                entry["note"] = MIG_UTILIZATION_NOTE
+            else:
+                modes = _call(getattr(nvml, "nvmlDeviceGetMigMode", lambda h: None), handle)
+                if modes is not None:
+                    current = modes[0] if isinstance(modes, (tuple, list)) else modes
+                    enabled = int(current) == int(getattr(nvml, "NVML_DEVICE_MIG_ENABLE", 1))
+                    entry["mig_mode"] = "enabled" if enabled else "disabled"
+                    if enabled:
+                        entry["mig_devices"] = mig_children(nvml, handle)
+                        entry["note"] = MIG_UTILIZATION_NOTE
+            out.append(entry)
+        except Exception:
+            continue
+    return out

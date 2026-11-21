@@ -340,7 +340,9 @@ class _AutologEngine:
         self._opt_ids: set[int] = set()
 
         self._streams: dict[Any, _Stream] = {}
-        self._lazy: list[tuple[int, float, dict[str, Any]]] = []  # (step, ts, {metric: device tensor})
+        # (step, ts, {metric: tensor}, [cuda events]): tensors were copied to pinned host memory asynchronously and are
+        # read once their events have completed (never by blocking the stream)
+        self._lazy: list[tuple[int, float, dict[str, Any], list[Any]]] = []
 
         # window for rates
         self._win_t: float | None = None
@@ -421,7 +423,7 @@ class _AutologEngine:
                 elif not self.saw_step:
                     for s in list(self._streams.values()):
                         self._fallback_flush(s, True)
-                self._resolve_lazy()
+                self._resolve_lazy(force=True)
         except Exception:
             log.debug("autolog final flush failed", exc_info=True)
         try:
@@ -674,7 +676,7 @@ class _AutologEngine:
 
     def _ship(self, k: int, ts: float, metrics: dict[str, float], device_vals: dict[str, Any]) -> None:
         """Log ready values now; device tensors are queued and read at the next cadence (no GPU sync)."""
-        # Values from earlier cadences are certainly computed by now: reading them cannot stall the GPU.
+        # Earlier cadences are read only if their async host copy already finished (never blocks the stream).
         self._resolve_lazy()
         if metrics:
             self.run._log(metrics, k, ts)
@@ -689,8 +691,37 @@ class _AutologEngine:
             self.run._log(ready, k, ts)
         pending = {n: t for n, t in device_vals.items() if n not in ready}
         if pending:
+            staged, events = self._stage(pending)
             with self._lock:
-                self._lazy.append((k, ts, pending))
+                self._lazy.append((k, ts, staged, events))
+
+    @staticmethod
+    def _stage(pending: dict[str, Any]) -> tuple[dict[str, Any], list[Any]]:
+        """Start an async copy of device scalars into pinned host memory and record an event per device, so the
+        later read neither synchronises the stream (``float(cuda_tensor)`` would wait for *all* queued work)
+        nor blocks. Falls back to the device tensor (a plain, blocking read later) if staging fails."""
+        import torch
+
+        staged: dict[str, Any] = {}
+        events: dict[Any, Any] = {}
+        for name, t in pending.items():
+            try:
+                with torch.cuda.device(t.device):
+                    buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+                    buf.copy_(t.detach(), non_blocking=True)
+                    if t.device not in events:
+                        ev = torch.cuda.Event()
+                        events[t.device] = ev
+                    staged[name] = buf
+            except Exception:
+                staged[name] = t
+        for dev, ev in events.items():
+            try:
+                with torch.cuda.device(dev):
+                    ev.record()
+            except Exception:
+                pass
+        return staged, list(events.values())
 
     def _fallback_flush(self, s: "_Stream", final: bool) -> None:
         """Loss fallback for programs that never step an optimizer (manual updates, custom rules): the loss of
@@ -793,11 +824,23 @@ class _AutologEngine:
         except Exception:
             return None
 
-    def _resolve_lazy(self) -> None:
-        """Read queued device values (one ``.item()`` each) and log them at their original step/time."""
+    def _resolve_lazy(self, force: bool = False) -> None:
+        """Log queued device values at their original step/time once their async host copies have completed.
+
+        Entries still in flight stay queued (they are read at a later cadence), so this never stalls the GPU
+        stream; ``force`` (at finish) waits for everything.
+        """
         with self._lock:
-            ready, self._lazy = self._lazy, []
-        for k, ts, tensors in ready:
+            ready: list[tuple[int, float, dict[str, Any], list[Any]]] = []
+            keep: list[tuple[int, float, dict[str, Any], list[Any]]] = []
+            for entry in self._lazy:
+                try:
+                    done = force or all(ev.query() for ev in entry[3])
+                except Exception:
+                    done = True
+                (ready if done else keep).append(entry)
+            self._lazy = keep
+        for k, ts, tensors, _events in ready:
             vals: dict[str, float] = {}
             for name, t in tensors.items():
                 try:

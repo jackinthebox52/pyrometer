@@ -69,14 +69,14 @@ const SYSTEM_SERIES: Array<{
   },
 ]
 
-function MetaItem({ label, value }: { label: string; value: string | null | undefined }) {
+function MetaItem({ label, value, title }: { label: string; value: string | null | undefined; title?: string }) {
   if (!value) return null
   return (
     <div>
       <div className="text-xs mb-0.5" style={{ color: '#4a4e60' }}>
         {label}
       </div>
-      <div className="text-xs font-mono leading-relaxed" style={{ color: '#e8eaf0' }}>
+      <div className="text-xs font-mono leading-relaxed" style={{ color: '#e8eaf0', whiteSpace: 'pre-line' }} title={title}>
         {value}
       </div>
     </div>
@@ -722,12 +722,19 @@ export default function RunDetailPage() {
     ? `${run.git_hash.slice(0, 8)}${run.git_dirty ? ' ·dirty' : ''}`
     : null
 
-  const gpuLabel = [
-    run.gpu_model,
-    run.gpu_memory_total ? formatBytes(run.gpu_memory_total) : null,
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  const gpuLabel = run.gpus && run.gpus.length > 0
+    ? run.gpus
+        .map((g) => {
+          const mem = g.memory_total ? ` · ${formatBytes(g.memory_total)}` : ''
+          const mig = g.is_mig ? ' · MIG instance' : g.mig_mode === 'enabled' ? ` · MIG (${g.mig_devices.length})` : ''
+          const prefix = run.gpus!.length > 1 ? `${g.index}: ` : ''
+          return `${prefix}${g.name ?? 'GPU'}${mem}${mig}`
+        })
+        .join('\n')
+    : [run.gpu_model, run.gpu_memory_total ? formatBytes(run.gpu_memory_total) : null].filter(Boolean).join(' · ')
+  const migNote = run.gpus?.some((g) => g.is_mig || g.mig_mode === 'enabled')
+    ? 'MIG: NVML reports memory per instance but no utilization, temperature or power'
+    : undefined
 
   // GPUs that reported snapshots (CUDA ordinals); X-axis is elapsed seconds from the first snapshot
   const t0 = Number.isFinite(gpuT0) ? gpuT0 : 0
@@ -820,6 +827,17 @@ export default function RunDetailPage() {
               value={formatBytes(summary.peak_process_memory_bytes)}
             />
           )}
+          {(summary.per_gpu?.length ?? 0) > 1 &&
+            summary.per_gpu!.map((g) => {
+              const peak = g.peak_process_memory_bytes ?? g.peak_memory_bytes
+              return (
+                <StatChip
+                  key={`gpu-${g.gpu_index}`}
+                  label={`GPU ${g.gpu_index}`}
+                  value={`${g.avg_gpu_utilization != null ? `${g.avg_gpu_utilization.toFixed(0)}%` : 'n/a'} · ${peak != null ? formatBytes(peak) : 'n/a'}`}
+                />
+              )
+            })}
           {summary.anomaly_count > 0 && (
             <StatChip
               label="anomalies"
@@ -839,7 +857,8 @@ export default function RunDetailPage() {
           gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))',
         }}
       >
-        <MetaItem label="GPU" value={gpuLabel || null} />
+        <MetaItem label={run.gpus && run.gpus.length > 1 ? `GPUs (${run.gpus.length})` : 'GPU'} value={gpuLabel || null} title={migNote} />
+        <MetaItem label="Driver" value={run.driver_version ?? run.gpus?.[0]?.driver_version} />
         <MetaItem label="CUDA" value={run.cuda_version} />
         <MetaItem label="PyTorch" value={run.pytorch_version} />
         <MetaItem label="Python" value={run.python_version} />

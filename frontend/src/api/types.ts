@@ -65,6 +65,10 @@ export interface Run {
   git_dirty: boolean
   gpu_model: string | null
   gpu_memory_total: number | null
+  /** Every GPU visible to the run (empty for runs from before multi-GPU hardware capture). */
+  gpus?: GpuInfo[]
+  gpu_count?: number | null
+  driver_version?: string | null
   cuda_version: string | null
   pytorch_version: string | null
   python_version: string | null
@@ -185,6 +189,37 @@ export interface BestMetricInfo {
   direction: 'min' | 'max'
 }
 
+export interface MigDevice {
+  index: number
+  uuid: string | null
+  name: string | null
+  memory_total: number | null
+  /** Always null: NVML does not report utilization per MIG instance. */
+  utilization: number | null
+}
+
+export interface GpuInfo {
+  index: number
+  name: string | null
+  uuid: string | null
+  memory_total: number | null
+  driver_version: string | null
+  mig_mode: 'enabled' | 'disabled' | null
+  is_mig: boolean
+  mig_devices: MigDevice[]
+  note?: string
+}
+
+export interface GpuSummary {
+  gpu_index: number
+  avg_gpu_utilization: number | null
+  avg_device_utilization: number | null
+  peak_process_memory_bytes: number | null
+  peak_memory_bytes: number | null
+  memory_total_bytes: number | null
+  samples: number
+}
+
 export interface RunSummary {
   run_id: string
   computed_at: number
@@ -198,6 +233,7 @@ export interface RunSummary {
   best_metrics: Record<string, BestMetricInfo>
   efficiency_score: 'A' | 'B' | 'C' | 'D' | 'F' | null
   efficiency_details: Record<string, number>
+  per_gpu?: GpuSummary[] | null
 }
 
 export interface ApiResponse<T> {
