@@ -16,6 +16,11 @@ interface Props {
   runId: string
 }
 
+/** File-backed images load by URL (no base64 in the list response); rows without one fall back to inline data. */
+function imageSrc(item: MediaItem): string {
+  return item.url ?? `data:image/png;base64,${item.data ?? ''}`
+}
+
 function HistogramChart({ data }: { data: string }) {
   const parsed = useMemo(() => {
     try {
@@ -67,6 +72,30 @@ function HistogramChart({ data }: { data: string }) {
   )
 }
 
+/** Tiny images (class-probability maps, 8x8 weights...) are scaled up with hard pixel edges instead of left as a dot. */
+function PreviewImage({ item, target = 240, maxHeight = 280 }: { item: MediaItem; target?: number; maxHeight?: number | string }) {
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null)
+  const small = natural != null && Math.max(natural.w, natural.h) < 128
+  const scale = small ? Math.max(1, Math.floor(target / Math.max(natural.w, natural.h))) : 1
+  return (
+    <img
+      src={imageSrc(item)}
+      loading="lazy"
+      decoding="async"
+      alt={item.name}
+      onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+      style={{
+        maxWidth: '100%',
+        maxHeight,
+        objectFit: 'contain',
+        borderRadius: 4,
+        imageRendering: small ? 'pixelated' : 'auto',
+        ...(small && natural ? { width: natural.w * scale, height: natural.h * scale } : {}),
+      }}
+    />
+  )
+}
+
 export default function MediaGallery({ runId }: Props) {
   const [names, setNames] = useState<string[]>([])
   const [selectedName, setSelectedName] = useState<string | null>(null)
@@ -97,7 +126,10 @@ export default function MediaGallery({ runId }: Props) {
   const currentItem = items[stepIdx] ?? null
 
   return (
-    <>
+    <div className="mb-6">
+      <h2 className="text-xs font-mono uppercase mb-3" style={{ color: '#c8cad6', letterSpacing: '0.12em' }}>
+        Media
+      </h2>
       <div className="rounded-lg p-4" style={{ backgroundColor: '#111318', border: '1px solid #252830' }}>
         {/* Name selector */}
         <div className="flex items-center justify-between mb-3">
@@ -141,18 +173,14 @@ export default function MediaGallery({ runId }: Props) {
             no data
           </div>
         ) : mediaType === 'histogram' ? (
-          <HistogramChart data={currentItem.data} />
+          <HistogramChart data={currentItem.data ?? ''} />
         ) : (
           <div
             className="flex items-center justify-center"
             style={{ minHeight: 120, cursor: 'zoom-in' }}
             onClick={() => setExpandedItem(currentItem)}
           >
-            <img
-              src={`data:image/png;base64,${currentItem.data}`}
-              alt={currentItem.name}
-              style={{ maxWidth: '100%', maxHeight: 280, objectFit: 'contain', borderRadius: 4 }}
-            />
+            <PreviewImage key={`${currentItem.name}:${currentItem.step}`} item={currentItem} />
           </div>
         )}
 
@@ -180,17 +208,13 @@ export default function MediaGallery({ runId }: Props) {
       {expandedItem && (
         <ExpandModal onClose={() => setExpandedItem(null)}>
           <div className="flex items-center justify-center p-4">
-            <img
-              src={`data:image/png;base64,${expandedItem.data}`}
-              alt={expandedItem.name}
-              style={{ maxWidth: '90vw', maxHeight: '80vh', objectFit: 'contain' }}
-            />
+            <PreviewImage item={expandedItem} target={640} maxHeight="80vh" />
           </div>
           <div className="text-center mt-2 text-xs font-mono" style={{ color: '#4a4e60' }}>
             {expandedItem.name} — step {expandedItem.step}
           </div>
         </ExpandModal>
       )}
-    </>
+    </div>
   )
 }

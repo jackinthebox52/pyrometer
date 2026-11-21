@@ -97,7 +97,7 @@ pyrometer/
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.11+
 - `uv` package manager
 - Node.js 18+ (for frontend development)
 

@@ -213,20 +213,32 @@ One row per training run. Small table, read frequently.
 |--------|------|-------------|
 | `run_id` | `VARCHAR` | UUID primary key |
 | `name` | `VARCHAR` | Human-readable name |
-| `status` | `VARCHAR` | `running`, `completed`, `crashed`, `killed` |
+| `status` | `VARCHAR` | `running`, `completed`, `failed`, `crashed` (no heartbeat), `killed` |
+| `last_heartbeat` | `DOUBLE` | Unix timestamp of the last SDK heartbeat or `running` status PATCH (null only for runs created before heartbeats that have not been migrated; the open-time migration fills it or marks them `crashed`) |
 | `created_at` | `DOUBLE` | Unix timestamp |
 | `finished_at` | `DOUBLE` | Unix timestamp (null if running) |
 | `hyperparams` | `JSON` | Arbitrary hyperparameter dict |
 | `git_hash` | `VARCHAR` | Git commit hash |
 | `git_dirty` | `BOOLEAN` | Uncommitted changes flag |
 | `gpu_model` | `VARCHAR` | GPU model name |
-| `gpu_memory_total` | `BIGINT` | Total VRAM in bytes |
+| `gpu_memory_total` | `BIGINT` | Total VRAM in bytes (GPU 0; kept for compatibility) |
+| `gpus` | `JSON` | Every GPU visible to the run: index, name, uuid, memory_total, driver_version, mig_mode, is_mig, mig_devices (per-instance memory; utilization is always null) |
+| `gpu_count` | `INTEGER` | Number of visible GPUs |
+| `driver_version` | `VARCHAR` | NVIDIA driver version |
 | `cuda_version` | `VARCHAR` | CUDA version string |
 | `pytorch_version` | `VARCHAR` | PyTorch version string |
 | `python_version` | `VARCHAR` | Python version string |
 | `hostname` | `VARCHAR` | Machine hostname |
 | `tags` | `JSON` | Array of tag strings |
 | `notes` | `VARCHAR` | Free-text notes |
+| `project` | `VARCHAR` | Owning project |
+| `updated_at` | `DOUBLE` | Last activity: bumped on every successful ingest (not duplicate batches) and every status/metadata change. Backfilled at migration from the newest data of each run. Default run sort |
+| `run_group` | `VARCHAR` | `init(group=...)` (exposed as `group`) |
+| `archived_at` | `DOUBLE` | Archive stamp (null = active). Archived runs, and runs of archived projects, are hidden from lists by default |
+
+Related organisation tables: `projects` (+ `archived_at`, `retention` JSON policy), `pinned_runs(username, run_id, pinned_at)` for per-user pins,
+`schema_meta(key, done_at)` for one-time repairs (legacy duplicate rows), and `alert_rules.updated_at`. A hard delete clears `runs` and every table
+that has a `run_id` column (`RUN_CHILD_TABLES` in `db.py`) plus `<data dir>/media/<run_id>/`. `seen_batches` rows live as long as their run.
 
 ---
 
@@ -286,6 +298,7 @@ Periodic GPU/system state from pynvml polling.
 | `process_exclusive` | `BOOLEAN` | Exclusive context flag |
 | `attributed_utilization` | `DOUBLE` | Process-attributed GPU util |
 | `attributed_power` | `DOUBLE` | Process-attributed power |
+| `gpu_index` | `INTEGER` | CUDA ordinal of the GPU within the run's visible devices (NULL on old rows = GPU 0); one row per GPU per poll |
 
 ---
 
@@ -311,6 +324,17 @@ Gradient and weight statistics from `run.watch()`.
 | `weight_histogram` | `JSON` | 32-bin weight histogram |
 
 ---
+
+#### `alert_rules`
+
+Admin-managed webhook alert rules: `id`, `name`, `url` (secret), `format`, `project` (NULL = all), `enabled`,
+`created_at`, `created_by`, `triggers` (JSON list of `{kind, min_severity, metric, op, threshold}`; the flat
+`kind`/`min_severity`/`metric`/`op`/`threshold` columns are the pre-multi-trigger layout, migrated into `triggers`
+and unused). Companion tables `alert_sent(rule_id, dkey, sent_at)` (dedupe window + per-minute rate limit) and
+`alert_violations(rule_id, trigger_key, run_id, violating)` (threshold-crossing state) persist alert state across
+restarts. Run summaries are computed on a managed single-worker executor drained on shutdown. Delivery logic lives in
+`pyrometer/server/alerts.py` (one worker thread, bounded queue; hooks in the ingest routes and
+`db_mark_stale_runs`). See [server-api.md](server-api.md#alerts).
 
 #### `events`
 
@@ -369,7 +393,24 @@ Images, histograms, figures.
 | `timestamp` | `DOUBLE` | Unix timestamp |
 | `name` | `VARCHAR` | Media name |
 | `media_type` | `VARCHAR` | `image`, `histogram`, `figure` |
-| `data` | `VARCHAR` | Base64 PNG or JSON string |
+| `data` | `VARCHAR` | JSON string (histograms) or an inline base64 PNG that could not be decoded; `NULL` for file-backed images/figures |
+| `path` | `VARCHAR` | Image/figure file, relative to `<data dir>/media` (`<run_id>/<sha256(name)[:16]>-<step>.png`); `NULL` if the payload is inline |
+
+---
+
+#### `samples`
+
+Generation samples from `run.log_samples`, one row per sample dict.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | `VARCHAR` | Foreign key to `runs` |
+| `step` | `INTEGER` | Training step |
+| `timestamp` | `DOUBLE` | Unix timestamp |
+| `name` | `VARCHAR` | Sample stream name |
+| `idx` | `INTEGER` | Order within (name, step) |
+| `reward` | `DOUBLE` | Numeric `reward` key if present, else NULL |
+| `data` | `VARCHAR` | The sample dict as JSON text |
 
 ---
 
@@ -384,8 +425,9 @@ Derived statistics computed when a run finishes.
 | `total_training_time_s` | `DOUBLE` | Wall-clock duration |
 | `total_steps` | `INTEGER` | Total training steps |
 | `steps_per_sec` | `DOUBLE` | Throughput |
-| `avg_gpu_utilization` | `DOUBLE` | Average GPU utilization |
-| `peak_process_memory_bytes` | `BIGINT` | Peak VRAM usage |
+| `per_gpu` | `JSON` | Per-GPU breakdown (avg utilization, peak process / device memory per `gpu_index`) |
+| `avg_gpu_utilization` | `DOUBLE` | Average GPU utilization: per-process values over the GPUs this run uses when available, else device-wide across all monitored GPUs |
+| `peak_process_memory_bytes` | `BIGINT` | Peak VRAM usage (process-attributed if available, else device), summed over GPUs per poll |
 | `anomaly_count` | `INTEGER` | Number of anomaly events |
 | `final_metrics` | `JSON` | Final metric values |
 | `best_metrics` | `JSON` | Best metric values with direction |
@@ -475,9 +517,14 @@ Main Thread (training loop)
     │   ├── Flush param stats buffer
     │   └── Flush log buffer
     │
+    ├── Sender Thread (daemon) — the only thread that talks HTTP
+    │   └── Ordered queue → POST with batch id, retry w/ backoff, spill to ~/.pyrometer/spool
+    │
     └── System Monitor Thread (daemon, 2s interval)
-        └── Poll pynvml → POST system snapshot
+        └── Poll pynvml → enqueue system snapshot
 ```
+
+All payloads are enqueued on a `Transport` (`pyrometer/_transport.py`); callers never perform network I/O.
 
 #### Buffer Management
 
@@ -533,10 +580,14 @@ class _WsManager:
     _connections: list[WebSocket]
     _last_broadcast: dict[tuple[str, str], float]  # throttle state
 
-    async def broadcast(payload, throttle_key=None, throttle_ms=500):
-        # Throttle to avoid flooding during rapid updates
+    async def broadcast(payload, throttle_key=None, throttle_ms=500, project=None, readable=None):
+        # Throttle to avoid flooding during rapid updates (the throttle map is bounded)
+        # Per connection: re-authenticate (revoked key/session -> close 1008), then filter by project visibility
         # Fire-and-forget send (dead connections silently removed)
 ```
+
+`broadcast_move` sends `run_moved` / `run_deleted` / `run_created` depending on which of the old and new projects a client can
+read, so no private project name leaks. Idle sockets re-validate their credential every `PYROMETER_WS_RECHECK` seconds.
 
 #### Static File Serving
 
@@ -650,10 +701,14 @@ export function useWebSocket(handler: Handler) {
 
 ### SDK
 
-- All network operations wrapped in try/except
-- Failures logged at DEBUG level, never block training
-- Buffers continue accumulating even if server is down
-- `run.finish()` attempts final flush but doesn't raise
+- Network I/O happens only on the sender thread; failures are retried with exponential backoff (cap 60 s) and never block training
+- Every payload is journaled to `~/.pyrometer/spool/<run_id>/queue.jsonl` (`PYROMETER_SPOOL_DIR`) before sending and acked after;
+  the 500-item memory queue is just a cache of it. The sender replays the backlog automatically after an outage; leftovers after
+  exit/SIGKILL go up with `pyrometer sync` (which skips runs whose process holds `owner.lock`). Metrics, stdout lines and gradient stats
+  buffered in memory are mirrored in `metrics.wal` / `logs.wal` / `param_stats.wal`. Media live in `blobs/`, poison payloads in `dead.jsonl`. `init()` with the server down
+  degrades: the run is created by the sender once the server answers
+- Every payload has a batch id; the server's `seen_batches` table (run_id, batch_id, seen_at) discards repeats
+- `run.finish()` makes a 10 s final drain, leaves the rest in the journal, prints one warning, and doesn't raise
 
 ### Server
 

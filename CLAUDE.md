@@ -10,8 +10,11 @@ Monorepo: Python SDK (`/sdk`), FastAPI server (`/server`), React frontend (`/fro
 - React 18 + TypeScript + Vite + Recharts + d3 for frontend
 - SDK ships as pip-installable package, torch is a peer dependency
 - WebSocket for live dashboard updates during active training runs
-- Auth is on by default. API keys (hashed at rest) for the SDK; trusted-reverse-proxy identity headers
-  (authentik) for the dashboard. `--no-auth` local mode is loopback-only. See `docs/auth.md`.
+- Auth is on by default. Dashboard **accounts** (admin / user; first admin via first-run setup token, or trusted
+  reverse-proxy identity header e.g. authentik) and **API keys** (SDK): global keys read/write every project and
+  can register projects; project keys are bound to one project. Only admins manage users, keys and membership.
+  Runs belong to **projects** (public or private); visibility is enforced per route and on WebSocket events.
+  `--no-auth` local mode is loopback-only. See `docs/auth.md`.
 - SDK is model-agnostic and optimizer-agnostic — never inspect or assume model architecture, 
   just log what the user passes. torch.profiler handles operator-level capture regardless of model type.
 
@@ -26,36 +29,54 @@ Monorepo: Python SDK (`/sdk`), FastAPI server (`/server`), React frontend (`/fro
 - DuckDB queries go in a dedicated `db.py` module, not scattered through route handlers
 - API endpoints return consistent JSON shape: `{"data": ..., "error": null}` or `{"data": null, "error": "message"}`
 - Frontend components go in `/frontend/src/components/`, pages in `/frontend/src/pages/`, API calls in `/frontend/src/api/`
-- **Any new SDK feature that produces dashboard-visible data must be demo'd in all three main example scripts: `examples/synthetic_train.py`, `examples/lr_sweep.py`, and `examples/optimizer_compare.py`**
+- **Any new SDK feature that produces dashboard-visible data must be demo'd in all three main example scripts: `examples/synthetic_train.py`, `examples/lr_sweep.py`, and `examples/optimizer_compare.py`** (written in the `with pyrometer.init(...) as run:` autolog style)
 
 ## Repo Hygiene (public repo — enforce on every commit)
 - `AGENTS.md` is a symlink to this file. Edit `CLAUDE.md`, never replace the symlink with a copy.
 - Agent notes, scratch files, plans and TODO lists (e.g. anything under `notes/`, `scratch/`, `local/`) are never
   committed and never tracked. They are gitignored; keep them there. This includes `DEVNOTES.md`,
   which stays on disk for agents to maintain but is never tracked.
-- Never commit secrets (API keys, tokens, `.env`, `keys.json`) or anything specific to the maintainer's
+- Never commit secrets (API keys, tokens, `.env`, `auth.json`) or anything specific to the maintainer's
   environment: IP addresses, hostnames, domains, network layout, homelab details. Use placeholders
   (`pyrometer.example.com`, `192.0.2.x`) in docs and examples.
 - Never commit agent-specific or personal config (`.claude/`, personal skills, `CLAUDE.local.md`).
   Personal skills are kept untracked in `local/` and installed to `~/.claude/skills/`, never in this repo.
 - Before committing, check `git status` / `git diff --cached` for any of the above.
 
+## First-Time Deployment Setup ("set it up")
+Maintainer-authorized development-cycle convenience. When the maintainer says **"set it up"** for a new
+deployment, do the whole first-run yourself instead of walking them through it:
+1. Deploy or start the server. Target, paths and procedure are in `CLAUDE.local.md` (untracked).
+2. Create the admin from the host: `pyrometer admin set-password --user admin` (generates a password; no setup token needed).
+3. Create a global API key: `pyrometer keys create --name <name>`.
+4. Paste the admin password and the API key to the maintainer in chat, once, and say they are shown once.
+   Never write them to any file, commit, log or doc. Verify with `/health` and one authenticated request,
+   without echoing the credentials again.
+Only do this when asked. It is a dev-cycle shortcut, not a production practice; the maintainer handles
+keeping the chat log free of live credentials.
+
 ## MCP Tools
 
 - Use the context7 tool if you ever need up-to-date information about a library. (e.g. pytorch, scikit-learn, numpy, uvicorn)
 
 ## SDK Public API (canonical reference)
-- `pyrometer.init(name, hyperparams, tags, server, api_key)` → Run  (`server` ← `PYROMETER_SERVER`, `api_key` ← `PYROMETER_API_KEY` if omitted)
-- `run.log(metrics_dict, step)` → None
-- `run.profile(step)` → context manager wrapping torch.profiler
+- `pyrometer.init(name, hyperparams, tags, server, api_key, project, group, offline, anomaly_detection, resume, autolog, preset, monitor_interval, rank_zero_only)` → Run, **a context manager and the main way to use the SDK**: `with pyrometer.init(...) as run:` enables autolog and finishes the run (`completed` / `killed` on Ctrl-C / `failed` on exception or non-zero SystemExit; exceptions never swallowed). (`server` ← `PYROMETER_SERVER`, `api_key` ← `PYROMETER_API_KEY` if omitted; `group` ← `PYROMETER_GROUP` (sweep/experiment name; filter + list per project); `offline` ← `PYROMETER_MODE=offline`: spool only, upload with `pyrometer sync`; `anomaly_detection` True|False|dict of threshold overrides; `resume=<run_id>|"auto"` (← `PYROMETER_RUN_ID`) reattaches to an existing run, see `run.resumed` / `run.last_step`; `autolog` True|False|dict of `AutologConfig` options (`PYROMETER_AUTOLOG=0` flips the default); `preset` ← `PYROMETER_PRESET`: `llm-pretrain|finetune|rlhf|rl|benchmark`, explicit options win; non-zero ranks get an inert `NullRun`)
+- `@pyrometer.run(name, hyperparams, **init_kwargs)` → decorator: function args become hyperparams; `pyrometer.current_run()` → innermost open run
+- `pyrometer run [--name --project --group --preset --tag --no-autolog] script.py|-m module [args]` → launcher CLI: runs the script in-process under a run with autolog live; argv → hyperparams; the script's first `init()` attaches to the launcher's run; `pyrometer presets` lists presets
+- Autolog (global hooks, on by default): `run.step`, `run.set_step(n)`, `run.config` (`AutologConfig`: log_every, loss, lr, throughput, step_optimizer, grad_norm, grad_health, grad_log_freq, profile_every, capture_grad, episode_window, episode_log_every), `run.track(tokens_per_batch, samples_per_batch, model, dataloader)` → wrapped loader, `run.name_loss(name, loss)`; metrics under `auto/` plus `tokens_seen` / `samples_seen` axes. `run.log(metrics)` without `step` uses `run.step`.
+- `pyrometer.create_project(name, private, server, api_key)` → dict  (needs a global key; private projects return their own key)
+- `run.log(metrics_dict, step=None)` → None
+- `run.profile(step=None)` → context manager wrapping torch.profiler
 - `run.watch(model, log_freq=100)` → None  (registers gradient/weight monitoring hooks)
 - `run.event(message, event_type, severity, metadata)` → None  (structured event / milestone marker)
 - `run.log_artifact(path, artifact_type, metadata)` → None  (track saved files without uploading)
 - `run.log_image(name, image, step)` → None  (PIL Image, numpy array, or torch.Tensor CHW/HW/NCHW)
 - `run.log_histogram(name, data, step, num_bins=32)` → None  (tensor/array → bin edges + counts)
 - `run.log_figure(name, figure, step)` → None  (matplotlib Figure → PNG)
-- `run.finish()` → None
-- System monitor thread starts automatically on init, polls pynvml every 2s
+- `run.log_samples(step, samples, name="samples", mode="replace")` → None  (list of dicts: prompt/completion/reward/...; Samples tab; `mode="replace"` overwrites the (name, step), `"append"` adds)
+- `run.log_episode(return_, length=None, step=None, **info)` → None  (RL: rolling `episode/*` stats + `env_steps` axis)
+- `run.finish()` → None  (called by `with`)
+- System monitor thread starts automatically on init, polls pynvml every 2s (`monitor_interval` / `benchmark` preset: 0.5s + clock-throttle capture)
 - stdout/stderr capture installed automatically on init, restored on finish()
 
 ## Anti-Patterns to Avoid

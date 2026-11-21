@@ -3,6 +3,7 @@ import type { RunStatus } from '../api/types.ts'
 const CONFIG: Record<RunStatus, { color: string; label: string; pulse: boolean }> = {
   running: { color: '#22c55e', label: 'Running', pulse: true },
   completed: { color: '#60a5fa', label: 'Completed', pulse: false },
+  failed: { color: '#f97316', label: 'Failed', pulse: false },
   crashed: { color: '#ef4444', label: 'Crashed', pulse: false },
   killed: { color: '#eab308', label: 'Killed', pulse: false },
 }

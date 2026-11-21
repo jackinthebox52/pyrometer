@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import * as d3 from 'd3'
 import type { ProfileEvent } from '../api/types.ts'
 import { formatMicroseconds } from '../utils/format.ts'
+import { LEGEND, opColor } from '../utils/kernelColors.ts'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 interface Props {
@@ -12,93 +13,6 @@ const PAD = { top: 8, right: 16, bottom: 40, left: 72 }
 const LANE_H = 42
 const LANE_GAP = 14
 const TOOLTIP_W = 260
-
-const LEGEND = [
-  { color: '#3b82f6', label: 'matmul' },
-  { color: '#4ade80', label: 'conv' },
-  { color: '#f59e0b', label: 'attention' },
-  { color: '#a78bfa', label: 'norm' },
-  { color: '#818cf8', label: 'activation' },
-  { color: '#ec4899', label: 'loss' },
-  { color: '#f43f5e', label: 'optimizer' },
-  { color: '#c084fc', label: 'autograd' },
-  { color: '#84cc16', label: 'reduction' },
-  { color: '#06b6d4', label: 'shape/layout' },
-  { color: '#6b7280', label: 'elementwise' },
-  { color: '#f97316', label: 'transfer' },
-  { color: '#22c55e', label: 'memory/fill' },
-  { color: '#94a3b8', label: 'cuda overhead' },
-  { color: '#4a4e60', label: 'other' },
-] as const
-
-function opColor(name: string, category: string): string {
-  if (category === 'memory_alloc' || category === 'memory_free') return '#22c55e'
-  const n = name.toLowerCase()
-
-  // Optimizer — Optimizer.step#*, Optimizer.zero_grad#*, _foreach_* (Adam/SGD multi-tensor ops)
-  if (/optimizer\.(step|zero_grad)/.test(n)) return '#f43f5e'
-  if (/_foreach_/.test(n)) return '#f43f5e'
-
-  // CUDA API overhead & profiler artifacts
-  if (/^cuda(launchkernel|memcpyasync|memsetasync|streamsynchronize|devicesynchronize|occupancy|streamiscapturing)/.test(n)) return '#94a3b8'
-  if (/activity buffer|lazy function loading/.test(n)) return '#94a3b8'
-
-  // Autograd engine — evaluate_function wrappers, named backward nodes, detach ops
-  if (/autograd::engine|accumulategrad/.test(n)) return '#c084fc'
-  if (/backward0/.test(n)) return '#c084fc'
-  if (/^detach|::detach/.test(n)) return '#c084fc'
-
-  // GEMM / matmul — addmm is nn.Linear; bmm/mm are direct; sgemm/hgemm are raw CUDA kernels
-  if (/(addmm|baddbmm|matmul|sgemm|hgemm|dgemm|cublas|cutlass)/.test(n)) return '#3b82f6'
-  if (/(?:^|::)(mm|bmm)(?:$|_)/.test(n)) return '#3b82f6'
-  if (/(?:^|::)linear(?:$|_)/.test(n)) return '#3b82f6'
-
-  // Convolution
-  if (/conv/.test(n)) return '#4ade80'
-
-  // Data transfer
-  if (/(copy_|(?:^|::)to(?:$|\s)|^memcpy|cudamemcpy)/.test(n)) return '#f97316'
-
-  // Normalization — layer_norm, batch_norm, linalg_vector_norm (gradient clipping), etc.
-  if (/(layer_norm|batch_norm|group_norm|instance_norm|rms_norm|linalg_vector_norm|frobenius_norm)/.test(n)) return '#a78bfa'
-
-  // Attention / softmax / log-softmax
-  if (/(attention|attn|softmax|scaled_dot|flash_attn|log_softmax|softmax_warp)/.test(n)) return '#f59e0b'
-
-  // Embedding
-  if (/embedding/.test(n)) return '#14b8a6'
-
-  // Activations + dropout (both are element-wise non-linear ops)
-  if (/(relu|gelu|silu|sigmoid|tanh|hardswish|leaky_relu|threshold_backward|fused_dropout|native_dropout|dropout)/.test(n)) return '#818cf8'
-
-  // Loss functions
-  if (/(cross_entropy|nll_loss|mse_loss|bce|kl_div|hinge|margin_loss)/.test(n)) return '#ec4899'
-
-  // Raw CUDA kernel name heuristics (long mangled names from cuda_kernel category)
-  if (/reduce_kernel/.test(n)) return '#84cc16'           // reduction kernels
-  if (/multi_tensor_apply_kernel/.test(n)) return '#f43f5e' // optimizer multi-tensor ops
-  if (/vectorized_elementwise_kernel/.test(n)) return '#6b7280'
-  if (/nll_loss.*kernel/.test(n)) return '#ec4899'
-  if (/dropout_kernel|masked_scale/.test(n)) return '#818cf8'
-
-  // Shape / layout ops — including aten::t (the .T transpose shorthand)
-  if (/(view|reshape|transpose|permute|contiguous|flatten|squeeze|unsqueeze|expand|repeat|chunk|split|narrow|select|as_strided|(?:^|::)cat(?:$|_)|(?:^|::)stack(?:$|_))/.test(n)) return '#06b6d4'
-  if (/(?:^|::)t(?:$|_)/.test(n)) return '#06b6d4'
-
-  // Allocations, fill, memset — empty, zeros, fill_, zero_, Memset (Device)
-  if (/^memset|(?:^|::)(empty|zeros|ones|full|fill_|zero_|empty_like|zeros_like|ones_like|empty_strided)(?:_|$|::)/.test(n)) return '#22c55e'
-
-  // Reductions
-  if (/(?:^|::)(sum|mean|amax|amin|max|min|var|std|norm|prod|cumsum|cumprod|logsumexp|argmax|argmin)(?:_|$|::)/.test(n)) return '#84cc16'
-
-  // Elementwise arithmetic
-  if (/(?:^|::)(add|mul|sub|div|pow|exp|log|sqrt|abs|neg|clamp|where|sign|ceil|floor|round|lerp|addcmul|addcdiv|clamp_min|clamp_max)(?:_|$|::)/.test(n)) return '#6b7280'
-
-  // Indexing
-  if (/(index|gather|scatter|masked_fill|masked_select|nonzero)/.test(n)) return '#fb923c'
-
-  return '#4a4e60'
-}
 
 interface BarDatum {
   x0: number        // start in μs (within this lane)

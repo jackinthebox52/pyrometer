@@ -63,9 +63,9 @@ uv sync
 # Start the server (default: http://localhost:8321)
 uv run pyrometer serve --no-auth        # local mode (loopback only)
 
-# ...or with auth (the default): create a key, then export it for your scripts
+# ...or with auth (the default): open the dashboard, enter the setup token printed in the
+# server log, create the first admin, then create an API key under Settings
 uv run pyrometer serve
-uv run pyrometer keys create --name my-project --scopes ingest
 export PYROMETER_API_KEY=pyro_...
 ```
 
@@ -104,7 +104,7 @@ Navigate to **http://localhost:8321** to see your runs, metrics, and GPU profili
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.11+
 - (Optional) NVIDIA GPU with CUDA for GPU profiling
 - (Optional) PyTorch for deep learning integration
 
@@ -204,7 +204,8 @@ run.finish()
 | Feature | Description |
 |---------|-------------|
 | **Zero-config SDK** | Drop into any PyTorch script with 3 lines of code |
-| **Secure by default** | API keys (hashed at rest) and authentik/proxy support; see [auth.md](auth.md) |
+| **Secure by default** | User accounts, API keys (hashed at rest), first-run setup token, authentik/proxy support; see [auth.md](auth.md) |
+| **Projects** | Public or private projects, per-project API keys, per-user membership; see [auth.md](auth.md#projects) |
 | **Local storage** | All data stored in a single DuckDB file (`~/.pyrometer/data.duckdb`) |
 | **GPU profiling** | Kernel-level timing, memory allocation tracking via `torch.profiler` |
 | **System monitoring** | Automatic GPU utilization, temperature, power draw polling via pynvml |
@@ -319,16 +320,19 @@ uv run pyrometer serve
 uv run pyrometer serve --no-auth
 
 # API keys
-uv run pyrometer keys create --name my-project --scopes ingest
+uv run pyrometer keys create --name my-laptop                # global key (or Settings in the dashboard)
+uv run pyrometer keys create --name ci --project team-a      # key limited to one project
 uv run pyrometer keys list
 uv run pyrometer keys revoke <id>
+uv run pyrometer admin set-password --user admin   # create or reset a dashboard user
 
 # Custom host and port
 uv run pyrometer serve --host 0.0.0.0 --port 8080
 
 # Environment variables
 PYROMETER_DB_PATH=/custom/path/db.duckdb      # database file
-PYROMETER_KEYS_FILE=/custom/path/keys.json    # API key store
+PYROMETER_AUTH_FILE=/custom/path/auth.json    # admin password, API keys, sessions
+PYROMETER_BOOTSTRAP_TOKEN=...                 # pin the first-run setup token
 PYROMETER_TRUSTED_PROXIES=127.0.0.1           # peers whose identity header is trusted
 PYROMETER_AUTH=off                            # same as --no-auth
 ```

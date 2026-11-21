@@ -1,14 +1,22 @@
 """Run — the handle returned by pyrometer.init() that the user interacts with."""
 
+import atexit
 import logging
-import math
 import os
+import signal
 import sys
 import threading
+import uuid
 import time
 from contextlib import contextmanager
+from typing import Any
 
 import httpx
+
+from pyrometer import _gpu
+from pyrometer._anomaly import AnomalyConfig, GradDetector, MetricDetector
+from pyrometer._autolog import AutologConfig, _AutologEngine, name_loss as _name_loss
+from pyrometer._transport import Spool, Transport
 
 log = logging.getLogger(__name__)
 
@@ -26,11 +34,14 @@ class _TeeWriter:
         self._name = stream_name
         self._on_line = on_line  # callable(line: str, stream: str)
         self._buf = ""
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.detached = False  # the run ended while something else wrapped us: pass through, capture nothing
 
     def write(self, text: str) -> int:
         with self._lock:
             self._orig.write(text)
+            if self.detached:
+                return len(text)
             self._buf += text
             while "\n" in self._buf:
                 line, self._buf = self._buf.split("\n", 1)
@@ -43,7 +54,7 @@ class _TeeWriter:
 
     def flush(self) -> None:
         with self._lock:
-            if self._buf.strip():
+            if self._buf.strip() and not self.detached:
                 try:
                     self._on_line(self._buf, self._name)
                 except Exception:
@@ -61,51 +72,204 @@ class _TeeWriter:
         return getattr(self._orig, name)
 
 
+HEARTBEAT_INTERVAL = 30.0
+_INLINE_MEDIA_MAX = 32 * 1024  # larger string media (histograms) go to a blob file
+
+# Runs that have not finished yet. A single excepthook / sys.exit / SIGTERM handler (installed on first
+# use) decides how they end: uncaught exception or sys.exit(nonzero) -> failed, Ctrl-C or SIGTERM -> killed.
+_active_runs: "set[Run]" = set()
+_excepthook_installed = False
+_our_sigterm = None  # the SIGTERM handler we installed (so a second init does not wrap it again)
+_run_stack: "list[Run]" = []  # open runs, newest last (``pyrometer.current_run()``)
+
+
+def _exit_code_status(code) -> str:
+    """Run status implied by a ``SystemExit`` code: ``None``/0 -> completed, anything else -> failed."""
+    return "completed" if code is None or code == 0 else "failed"
+
+
+def _install_exit_hooks() -> None:
+    global _excepthook_installed
+    if not _excepthook_installed:
+        _excepthook_installed = True
+        prev_hook = sys.excepthook
+
+        def excepthook(exc_type, exc, tb) -> None:
+            status = "killed" if issubclass(exc_type, KeyboardInterrupt) else "failed"
+            for run in list(_active_runs):
+                run._exit_status, run._exit_from_sys_exit = status, False
+            prev_hook(exc_type, exc, tb)
+
+        sys.excepthook = excepthook
+
+        # An uncaught SystemExit never reaches excepthook, so sys.exit() is where its code is visible.
+        # (``raise SystemExit(1)`` written out by hand bypasses it and ends as completed.)
+        prev_exit = sys.exit
+
+        def exit_(status=None) -> None:
+            for run in list(_active_runs):
+                run._exit_status, run._exit_from_sys_exit = _exit_code_status(status), True
+            prev_exit(status)
+
+        sys.exit = exit_
+    _install_sigterm()
+
+
+def _install_sigterm() -> None:
+    """Chain our SIGTERM handling in front of whatever the application installed.
+
+    Ours marks every live run ``killed`` and finishes it, then hands over to the previous
+    handler (or to the default action: terminate). ``SIG_IGN`` is respected: a process that ignores
+    SIGTERM keeps running, so its runs must not be closed. Needs the main thread; a ``init()`` from
+    another thread leaves it for a later one.
+    """
+    global _our_sigterm
+    if threading.current_thread() is not threading.main_thread():
+        return
+    try:
+        prev = signal.getsignal(signal.SIGTERM)
+        if prev is _our_sigterm and _our_sigterm is not None:
+            return
+        if prev is signal.SIG_IGN:
+            return
+
+        def on_term(signum, frame) -> None:
+            for run in list(_active_runs):
+                run._exit_status, run._exit_from_sys_exit = "killed", False
+                run._finish("killed")
+            if callable(prev):
+                prev(signum, frame)
+            else:  # SIG_DFL (or None: handler not installed from Python): behave as if we were not here
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        signal.signal(signal.SIGTERM, on_term)
+        _our_sigterm = on_term
+    except (ValueError, OSError, AttributeError):
+        pass  # platform without SIGTERM, or not allowed here
+
+
+_MAX_SAMPLE_BYTES = 60 * 1024  # server limit is 64 KB per sample
+_MAX_SAMPLES_PER_REQUEST = 200
+
+
 class Run:
     """Represents an active training run.
 
     Returned by :func:`pyrometer.init`. Not instantiated directly.
 
-    Manages two background threads:
-    - A flush thread that ships buffered metrics to the server every 5 seconds
+    Manages three background threads:
+    - A flush thread that hands buffered metrics to the sender every 5 seconds
       (or immediately when the buffer reaches 100 entries).
+    - A sender thread that delivers payloads in order from a write-ahead journal
+      (``~/.pyrometer/spool/<run_id>/``), retrying failures with exponential backoff
+      and replaying automatically when the server comes back. Anything still
+      undelivered at exit can be uploaded with ``pyrometer sync``.
     - A system monitor thread that polls pynvml every 2 seconds and POSTs
       GPU utilization, memory, temperature, and power draw to the server.
     """
 
-    def __init__(self, run_id: str, server_url: str, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        server_url: str,
+        api_key: str | None = None,
+        offline: bool = False,
+        anomaly_detection: bool | dict | None = True,
+        create: dict | None = None,
+        autolog: bool | dict = True,
+        preset: "Any" = None,
+        monitor_interval: float | None = None,
+        capture_throttle: bool | None = None,
+    ) -> None:
         self.run_id = run_id
         self._server = server_url
-        self._client = httpx.Client(
-            base_url=server_url,
-            timeout=10,
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+        self._offline = offline
+        self._client: httpx.Client | None = None
+        if not offline:
+            self._client = httpx.Client(
+                base_url=server_url,
+                timeout=10,
+                headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+            )
+        self._spool = Spool(run_id)
+        self._transport = Transport(
+            run_id,
+            self._client,
+            self._spool,
+            offline=offline,
+            meta_defaults={"server": server_url, "run_id": run_id},
+            create=create,
         )
+        self._stop = threading.Event()
 
         self._buffer: list[dict] = []
-        self._lock = threading.Lock()
+        self._wal_batch = ""  # batch id of the metrics currently buffered (and in the write-ahead log)
+        # Re-entrant: the SIGTERM handler runs finish() on the main thread, possibly while that very
+        # thread is inside log()/print() holding one of these locks; a plain Lock would deadlock it.
+        self._lock = threading.RLock()
         self._finished = False
         self._last_step = 0
+        self._step_known = False
+        self.resumed = False
+        """True if this run reattached to an existing run (``init(resume=...)``)."""
 
         # watch() state — gradient/weight monitoring
         self._watch_hooks: list = []
         self._param_stats_buffer: list[dict] = []
-        self._param_stats_lock = threading.Lock()
+        self._param_stats_batch = ""  # batch id of the buffered stats (and their write-ahead copy)
+        self._param_stats_lock = threading.RLock()
         self._watch_grad_norm_history: dict[str, list[float]] = {}
         self._watch_low_norm_streak: dict[str, int] = {}
 
         # stdout/stderr capture
         self._log_buffer: list[dict] = []
-        self._log_lock = threading.Lock()
+        self._log_batch = ""  # batch id of the buffered lines (and their write-ahead copy)
+        self._log_lock = threading.RLock()
         self._original_stdout = None
         self._original_stderr = None
         self._install_stdout_capture()
 
         # metric anomaly detection (loss spike, NaN)
-        self._metric_history: dict[str, list[float]] = {}
-        self._metric_cooldown: dict[str, int] = {}
+        self._anomaly_cfg = AnomalyConfig.from_option(anomaly_detection)
+        self._metric_detector = MetricDetector(self._anomaly_cfg)
+        self._grad_detector = GradDetector(self._anomaly_cfg)
+        self._anomaly_lock = threading.Lock()
 
         self._our_pid = os.getpid()
+        self.preset: str | None = preset.name if preset is not None else None
+        """Name of the preset this run was started with (``init(preset=...)``), or ``None``."""
+        self._reminders: tuple[str, ...] = preset.reminders if preset is not None else ()
+        self._samples_logged = False
+        self._monitor_interval = float(
+            monitor_interval if monitor_interval is not None else (preset.monitor_interval if preset else 2.0)
+        )
+        self._capture_throttle = bool(
+            capture_throttle if capture_throttle is not None else (preset.capture_throttle if preset else False)
+        )
+
+        # Liveness: a heartbeat every HEARTBEAT_INTERVAL s (sent immediately at start). Never spooled.
+        self._last_heartbeat = float("-inf")  # monotonic() can be < HEARTBEAT_INTERVAL right after boot
+        self._exit_status = "completed"
+        self._probe_thread: threading.Thread | None = None
+        self._exit_from_sys_exit = False  # status came from sys.exit(): cleared if the program carries on
+        autolog_opts = autolog if isinstance(autolog, dict) else {}
+        self.config = AutologConfig(**autolog_opts)
+        """Live autolog settings (:class:`pyrometer._autolog.AutologConfig`): ``run.config.log_every = 50``."""
+        self._autolog = _AutologEngine(self, isinstance(autolog, dict) or bool(autolog), self.config)
+        self._launcher_claimed = False  # set when ``pyrometer run`` handed this run to the script's init()
+        self._launcher_explicit: set[str] = set()  # launcher options given on the command line (win over init())
+        self._launcher_hp: dict = {}
+        self._launcher_guess: dict = {}  # argv-parsed hyperparams (fallback when the script has no argparse)
+        self._launcher_parsed: dict | None = None  # the script's parsed argparse Namespace, when it used argparse
+        self._launcher_script_hp: dict = {}  # hyperparams the script passed to its own init()
+        self._launcher_target: str | None = None
+        self._launcher_tags: list[str] = []
+        self._launcher_project: str | None = None
+        _active_runs.add(self)
+        _run_stack.append(self)
+        _install_exit_hooks()
+        atexit.register(self._atexit)
 
         self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._flush_thread.start()
@@ -113,8 +277,8 @@ class Run:
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
-    def log(self, metrics: dict, step: int) -> None:
-        """Log a dict of scalar metrics at a given training step.
+    def log(self, metrics: dict, step: int | None = None) -> None:
+        """Log a dict of scalar metrics at a training step.
 
         Buffers entries in memory and flushes to the server every 5 seconds or
         when the buffer reaches 100 entries — whichever comes first. This is
@@ -122,33 +286,221 @@ class Run:
 
         Args:
             metrics: Dict mapping metric names to float values.
-                     Names can use slash notation, e.g. ``"train/loss"``.
-            step: Global training step (integer). Used as the x-axis in charts.
+                     Names can use slash notation, e.g. ``"train/loss"``. (The ``auto/`` prefix is
+                     used by autolog; avoid it for your own metrics.)
+            step: Global training step (integer), the x-axis in charts. Optional while autolog is on:
+                  an explicit ``step`` always wins for that call; without one the run's automatic step
+                  is used: the number of optimizer steps completed so far (``run.step``), or, before
+                  any optimizer has stepped, a counter of step-less ``log`` calls. With
+                  ``autolog=False`` a step is required.
 
         Example::
 
-            run.log({"train/loss": loss.item(), "lr": scheduler.get_last_lr()[0]}, step=global_step)
+            run.log({"train/acc": acc})                 # step comes from the optimizer-step counter
+            run.log({"val/loss": val_loss}, step=epoch) # explicit step
         """
         if self._finished:
             return
+        if self._exit_from_sys_exit:  # a caught sys.exit(): the program is evidently still running
+            self._exit_status, self._exit_from_sys_exit = "completed", False
+        if step is None:
+            step = self._autolog.resolve_step()
+        self._log(metrics, int(step), time.time())
+
+    def _log(self, metrics: dict, step: int, ts: float) -> None:
+        if self._finished:
+            return
         self._last_step = step
-        ts = time.time()
+        self._step_known = True
         with self._lock:
-            for name, value in metrics.items():
-                self._buffer.append({
-                    "step": step,
-                    "timestamp": ts,
-                    "name": name,
-                    "value": float(value),
-                })
+            entries = [
+                {"step": step, "timestamp": ts, "name": name, "value": float(value)}
+                for name, value in metrics.items()
+            ]
+            if entries:
+                if not self._buffer:
+                    self._wal_batch = uuid.uuid4().hex
+                self._buffer.extend(entries)
+                self._transport.wal_append(self._wal_batch, entries)
             if len(self._buffer) >= 100:
                 self._flush_locked()
         # Anomaly checks run outside the buffer lock; HTTP calls happen in spawned threads.
         for name, value in metrics.items():
+            if name.startswith("auto/") and not (name.startswith("auto/loss") or name == "auto/grad_norm"):
+                continue  # rates and learning rates are not anomaly material
             try:
                 self._check_metric_anomaly(name, float(value), step)
             except (ValueError, TypeError):
                 pass
+
+    def __enter__(self) -> "Run":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Close the run with the status the block's outcome implies; never swallows the exception.
+
+        No exception: ``completed``. ``KeyboardInterrupt``: ``killed``. ``SystemExit``: ``completed`` for
+        code 0/None, ``failed`` otherwise. Any other exception: ``failed`` (an ``exception`` event with
+        the error is recorded first).
+        """
+        if exc_type is None:
+            status = "completed"
+        elif issubclass(exc_type, KeyboardInterrupt):
+            status = "killed"
+        elif issubclass(exc_type, SystemExit):
+            status = _exit_code_status(getattr(exc, "code", None))
+        else:
+            status = "failed"
+            try:
+                self.event(f"{exc_type.__name__}: {exc}"[:500], event_type="exception", severity="error")
+            except Exception:
+                pass
+        self._finish(status)
+        return False
+
+    @property
+    def step(self) -> int:
+        """Automatic step: optimizer steps completed so far (counted by autolog), starting from the last
+        stored step on a resumed run. ``0`` until the first ``optimizer.step()``."""
+        return self._autolog.step
+
+    def set_step(self, step: int) -> None:
+        """Set the automatic step counter (e.g. to align with your own numbering). The next completed
+        optimizer step is ``step + 1``."""
+        self._autolog.set_step(step)
+
+    def track(self, *, tokens_per_batch=None, samples_per_batch=None, model=None, dataloader=None):
+        """Tell autolog about your data so it can log ``tokens_seen`` / ``samples_seen`` and throughput.
+
+        Args:
+            tokens_per_batch: Tokens in one (micro-)batch: an int, or a callable ``batch -> int`` (needs
+                ``dataloader=``; use it for variable-length batches).
+            samples_per_batch: Samples in one batch (int or callable). With a wrapped dataloader it is
+                inferred from the first dimension of the batch's first tensor if omitted.
+            model: Optional. The module used for gradient statistics when ``run.config.grad_health``
+                is on (otherwise every module is discovered through a global hook).
+            dataloader: An iterable of batches. Returns a wrapped iterable that counts batches and
+                measures how long the loop waits for data (``auto/data_wait_ms``, ``auto/data_wait_frac``).
+                Wrap the training loader only.
+
+        Returns:
+            The wrapped dataloader if one was passed, else ``None``.
+
+        Example::
+
+            train_loader = run.track(dataloader=train_loader, tokens_per_batch=B * T, model=model)
+        """
+        return self._autolog.track(tokens_per_batch, samples_per_batch, model, dataloader)
+
+    def name_loss(self, name: str, loss):
+        """Name a loss tensor: its ``backward()`` is logged as ``auto/loss/<name>``. Returns ``loss``.
+
+        Without names, each ``backward`` call site is a stream (``auto/loss``, or ``auto/loss/0``,
+        ``auto/loss/1`` ... with several). Example: ``run.name_loss("d_loss", d_loss).backward()``.
+        """
+        return _name_loss(name, loss)
+
+    def log_episode(self, return_: float, length: int | None = None, step: int | None = None, **info: float) -> None:
+        """Record one finished reinforcement-learning episode; rolling statistics are logged for you.
+
+        Every ``run.config.episode_log_every`` episodes (default 10) this logs, over the last
+        ``run.config.episode_window`` episodes (default 100): ``episode/return_mean``, ``episode/return_min``,
+        ``episode/return_max``, ``episode/length_mean``, ``episode/count`` and the cumulative ``env_steps``
+        (the sum of the episode lengths) as an axis metric: pick it as the chart x-axis. Extra numeric
+        keyword arguments (``success=1.0``, ``shaped_reward=...``) get a rolling mean as ``episode/<key>_mean``.
+        Statistics not yet logged when the run ends are flushed by ``finish``.
+
+        Args:
+            return_: The episode's total reward.
+            length: Environment steps in the episode (optional; without it there is no ``env_steps``).
+            step: Step to log at. Optional with autolog on (the automatic step, ``run.step``).
+            **info: Extra numeric per-episode values.
+
+        Example::
+
+            run.log_episode(ep_return, ep_len, success=float(info["is_success"]))
+        """
+        if self._finished:
+            return
+        self._autolog.log_episode(return_, length, step, info)
+
+    @property
+    def server(self) -> str:
+        """Base URL of the Pyrometer server this run reports to (as resolved by :func:`pyrometer.init`)."""
+        return self._server
+
+    @property
+    def last_step(self) -> int | None:
+        """The most recent step known for this run, or ``None`` if there is none yet.
+
+        Fresh run: the last step you passed to :meth:`log`. Resumed run: starts as the highest
+        step already stored on the server, so you can continue with ``range(run.last_step + 1, ...)``.
+        ``None`` for a new run before the first :meth:`log`, and for a run resumed offline (the
+        server is not consulted).
+        """
+        return self._last_step if self._step_known else None
+
+    def _start_hardware_probe(self, known: dict) -> None:
+        """Fill in the torch/NVML-dependent hardware fields in the background.
+
+        ``import torch`` and ``nvmlInit`` take seconds, so ``init`` does not wait for them: this thread runs them and
+        PATCHes the run with whatever differs from the ``known`` (cheap) fingerprint. The PATCH goes
+        through the journal like any payload, so it also works after an outage or offline.
+        """
+        def probe() -> None:
+            try:
+                from pyrometer import _hardware
+
+                found = _hardware.fingerprint_slow()
+                delta = {k: v for k, v in found.items() if v is not None and v != known.get(k)}
+                if delta and not self._finished:
+                    self._transport.submit("PATCH", f"/runs/{self.run_id}", delta)
+            except Exception:
+                log.debug("hardware probe failed", exc_info=True)
+
+        self._probe_thread = threading.Thread(target=probe, daemon=True, name="pyrometer-hwprobe")
+        self._probe_thread.start()
+
+    def _seed_detectors(self) -> None:
+        """Best-effort, non-blocking: preload metric anomaly history of a resumed run from the server.
+
+        Without it a resumed process starts every detector cold and is blind for ``warmup`` samples.
+        """
+        if self._client is None or not self._anomaly_cfg.enabled:
+            return
+
+        def seed() -> None:
+            try:
+                resp = self._client.get(  # type: ignore[union-attr]
+                    f"/runs/{self.run_id}/metrics/recent", params={"limit": self._anomaly_cfg.window}, timeout=5
+                )
+                if resp.status_code < 300:
+                    history = resp.json().get("data") or {}
+                    with self._anomaly_lock:
+                        for name, values in history.items():
+                            self._metric_detector.seed(name, [v for v in values if isinstance(v, (int, float))])
+                resp = self._client.get(  # type: ignore[union-attr]
+                    f"/runs/{self.run_id}/param-stats/recent", params={"limit": self._anomaly_cfg.window}, timeout=5
+                )
+                if resp.status_code < 300:
+                    with self._anomaly_lock:
+                        for pname, values in (resp.json().get("data") or {}).items():
+                            self._grad_detector.seed(pname, [v for v in values if isinstance(v, (int, float))])
+            except Exception:
+                log.debug("could not seed anomaly detectors", exc_info=True)
+
+        threading.Thread(target=seed, daemon=True, name="pyrometer-seed").start()
+
+    def _mark_resumed(self, last_step: int | None, previous_status: str | None, changes: dict | None) -> None:
+        self.resumed = True
+        self._seed_detectors()
+        if last_step is not None:
+            self._last_step = int(last_step)
+            self._step_known = True
+        meta: dict = {"previous_status": previous_status, "last_step": last_step}
+        if changes:
+            meta["config_changes"] = changes
+        self.event("run resumed", event_type="run_resumed", severity="info", metadata=meta)
 
     def watch(self, model, log_freq: int = 100) -> None:
         """Monitor gradient and weight statistics for all trainable parameters.
@@ -158,9 +510,13 @@ class Run:
         statistics (L2 norm, min, max, mean, 32-bin histogram) and ships them to
         the server. Anomaly detection fires alert events automatically when:
 
-        - Any gradient norm exceeds 100× the rolling median (spike).
-        - Any gradient norm stays below 1e-8 for 50 consecutive samples (dead layer).
-        - NaN or Inf is detected in gradients or weights.
+        - NaN or Inf is detected in gradients or weights (reported once per parameter
+          until it recovers).
+        - A gradient norm exceeds 1000× its rolling median after a 20-sample warmup
+          (rate-limited per parameter and per run).
+        - A gradient norm stays below 1e-8 for 200 consecutive samples (dead layer).
+
+        Thresholds are tunable via ``init(anomaly_detection={...})``; pass ``False`` to disable.
 
         Call once after :func:`pyrometer.init` and before the training loop::
 
@@ -178,77 +534,81 @@ class Run:
 
         self._remove_watch_hooks()
 
-        def make_hook(param_name: str, param):
-            call_count = [0]
-
-            def hook(grad):
-                if grad is None:
-                    return
-                call_count[0] += 1
-                if call_count[0] % log_freq != 0:
-                    return
-                if self._finished:
-                    return
-
-                step = self._last_step
-                ts = time.time()
-                try:
-                    import torch as _torch
-
-                    # Move to CPU for all computations (safe across CUDA/CPU models)
-                    g = grad.detach().float().cpu()
-                    w = param.data.detach().float().cpu()
-                    flat_g = g.flatten()
-                    flat_w = w.flatten()
-
-                    grad_norm = float(flat_g.norm(2))
-                    has_nan_inf = (
-                        not bool(_torch.isfinite(g).all())
-                        or not bool(_torch.isfinite(w).all())
-                    )
-
-                    try:
-                        gh = _torch.histc(flat_g, bins=32).tolist()
-                        wh = _torch.histc(flat_w, bins=32).tolist()
-                    except Exception:
-                        gh, wh = [], []
-
-                    stat = {
-                        "step": step,
-                        "timestamp": ts,
-                        "param_name": param_name,
-                        "grad_norm": grad_norm,
-                        "grad_min": float(flat_g.min()),
-                        "grad_max": float(flat_g.max()),
-                        "grad_mean": float(flat_g.mean()),
-                        "weight_norm": float(flat_w.norm(2)),
-                        "weight_min": float(flat_w.min()),
-                        "weight_max": float(flat_w.max()),
-                        "weight_mean": float(flat_w.mean()),
-                        "grad_histogram": gh,
-                        "weight_histogram": wh,
-                    }
-
-                    with self._param_stats_lock:
-                        self._param_stats_buffer.append(stat)
-
-                    threading.Thread(
-                        target=self._check_grad_anomaly,
-                        args=(param_name, grad_norm, step, has_nan_inf),
-                        daemon=True,
-                    ).start()
-                except Exception:
-                    log.exception("Error computing param stats for %s", param_name)
-
-            return hook
-
         count = 0
         for name, param in model.named_parameters():
             if param.requires_grad:
-                h = param.register_hook(make_hook(name, param))
+                h = param.register_hook(self._make_param_hook(name, param, log_freq))
                 self._watch_hooks.append(h)
                 count += 1
         log.debug("Watching %d parameters (log_freq=%d)", count, log_freq)
+
+    def _make_param_hook(self, param_name: str, param, log_freq: int):
+        """Backward hook computing per-parameter gradient/weight statistics every ``log_freq`` calls."""
+        call_count = [0]
+
+        def hook(grad):
+            if grad is None:
+                return
+            call_count[0] += 1
+            if call_count[0] % log_freq != 0:
+                return
+            if self._finished:
+                return
+
+            step = self._last_step
+            ts = time.time()
+            try:
+                import torch as _torch
+
+                # Move to CPU for all computations (safe across CUDA/CPU models)
+                g = grad.detach().float().cpu()
+                w = param.data.detach().float().cpu()
+                flat_g = g.flatten()
+                flat_w = w.flatten()
+
+                grad_norm = float(flat_g.norm(2))
+                has_nan_inf = (
+                    not bool(_torch.isfinite(g).all())
+                    or not bool(_torch.isfinite(w).all())
+                )
+
+                try:
+                    gh = _torch.histc(flat_g, bins=32).tolist()
+                    wh = _torch.histc(flat_w, bins=32).tolist()
+                except Exception:
+                    gh, wh = [], []
+
+                stat = {
+                    "step": step,
+                    "timestamp": ts,
+                    "param_name": param_name,
+                    "grad_norm": grad_norm,
+                    "grad_min": float(flat_g.min()),
+                    "grad_max": float(flat_g.max()),
+                    "grad_mean": float(flat_g.mean()),
+                    "weight_norm": float(flat_w.norm(2)),
+                    "weight_min": float(flat_w.min()),
+                    "weight_max": float(flat_w.max()),
+                    "weight_mean": float(flat_w.mean()),
+                    "grad_histogram": gh,
+                    "weight_histogram": wh,
+                }
+
+                with self._param_stats_lock:
+                    if not self._param_stats_buffer:
+                        self._param_stats_batch = uuid.uuid4().hex
+                    self._param_stats_buffer.append(stat)
+                    self._transport.wal_append(self._param_stats_batch, [stat], "param-stats")
+
+                threading.Thread(
+                    target=self._check_grad_anomaly,
+                    args=(param_name, grad_norm, step, has_nan_inf),
+                    daemon=True,
+                ).start()
+            except Exception:
+                log.exception("Error computing param stats for %s", param_name)
+
+        return hook
 
     def event(
         self,
@@ -278,20 +638,14 @@ class Run:
         """
         if self._finished:
             return
-        try:
-            self._client.post(
-                f"/runs/{self.run_id}/events",
-                json={
-                    "timestamp": time.time(),
-                    "step": self._last_step,
-                    "event_type": event_type,
-                    "severity": severity,
-                    "message": message,
-                    "metadata": metadata or {},
-                },
-            )
-        except Exception:
-            log.exception("Failed to log event: %s", message)
+        self._transport.submit("POST", f"/runs/{self.run_id}/events", {
+            "timestamp": time.time(),
+            "step": self._last_step,
+            "event_type": event_type,
+            "severity": severity,
+            "message": message,
+            "metadata": metadata or {},
+        })
 
     def log_artifact(
         self,
@@ -325,26 +679,20 @@ class Run:
             size: int | None = os.path.getsize(path) if os.path.exists(path) else None
         except Exception:
             size = None
-        try:
-            self._client.post(
-                f"/runs/{self.run_id}/artifacts",
-                json={
-                    "timestamp": time.time(),
-                    "step": self._last_step,
-                    "artifact_type": artifact_type,
-                    "path": str(path),
-                    "size_bytes": size,
-                    "metadata": metadata or {},
-                },
-            )
-        except Exception:
-            log.exception("Failed to log artifact: %s", path)
+        self._transport.submit("POST", f"/runs/{self.run_id}/artifacts", {
+            "timestamp": time.time(),
+            "step": self._last_step,
+            "artifact_type": artifact_type,
+            "path": str(path),
+            "size_bytes": size,
+            "metadata": metadata or {},
+        })
 
     def log_image(self, name: str, image, step: int | None = None) -> None:
         """Log an image at a given training step.
 
         Accepts PIL Images, NumPy arrays, or PyTorch tensors. Converts to PNG
-        and ships to the server as a base64-encoded string. Float tensors are
+        and is journaled to disk as a binary file and shipped to the server base64-encoded. Float tensors are
         clamped to [0, 1] and scaled to uint8 automatically.
 
         Args:
@@ -364,7 +712,7 @@ class Run:
         if self._finished:
             return
         try:
-            data = self._image_to_b64(image)
+            data = self._image_to_png(image)
         except Exception:
             log.exception("Failed to encode image '%s'", name)
             return
@@ -408,7 +756,7 @@ class Run:
     def log_figure(self, name: str, figure, step: int | None = None) -> None:
         """Log a matplotlib figure at a given training step.
 
-        Saves the figure to a PNG in memory, base64-encodes it, and ships it
+        Renders the figure to a PNG, journals it as a binary file, and ships it
         to the server. Useful for confusion matrices, precision-recall curves,
         or any custom matplotlib visualisation you want tracked over training.
 
@@ -428,34 +776,182 @@ class Run:
         if self._finished:
             return
         try:
-            data = self._figure_to_b64(figure)
+            data = self._figure_to_png(figure)
         except Exception:
             log.exception("Failed to encode figure '%s'", name)
             return
         self._post_media(name, "figure", data, step)
+
+    def log_samples(
+        self,
+        step: int | list[dict] | None,
+        samples: list[dict] | None = None,
+        name: str = "samples",
+        mode: str = "replace",
+    ) -> None:
+        """Log generation samples (prompt / completion / reward ...) for a step.
+
+        Each sample is an arbitrary JSON-able ``dict``; common keys are ``prompt``,
+        ``completion``, ``reward`` and ``reference``. The dashboard's Samples tab
+        builds its columns from whatever keys you log and sorts by ``reward`` when
+        present. Non-JSON values are stringified. Limits: 64 KB per sample (the
+        longest string values are truncated with a warning) and 200 samples per
+        request (larger lists are split automatically). Log a few dozen samples
+        every N steps rather than every step.
+
+        Args:
+            step: Training step these samples belong to. Optional under autolog: pass only the samples
+                (``run.log_samples(samples)``) and the automatic step is used.
+            samples: List of dicts.
+            name: Sample stream name, e.g. ``"eval_generations"``.
+            mode: ``"replace"`` (default): the samples replace whatever is already stored for this
+                ``(name, step)`` - so a resumed run that re-logs a step does not duplicate it, and
+                calling ``log_samples`` again for the same step *overwrites* the earlier call.
+                ``"append"``: add to the samples already stored for the step (log one step's
+                samples in several calls).
+
+        Example::
+
+            run.log_samples(step, [{"prompt": p, "completion": c, "reward": r}], name="rollouts")
+        """
+        if self._finished:
+            return
+        if samples is None and isinstance(step, (list, tuple)):  # log_samples(samples): automatic step
+            step, samples = None, list(step)
+        if not samples:
+            return
+        self._samples_logged = True
+        if step is None:
+            step = self._autolog.resolve_step()
+        if mode not in ("replace", "append"):
+            raise ValueError(f"log_samples: mode must be 'replace' or 'append', not {mode!r}")
+        import json as _json
+
+        cleaned: list[dict] = []
+        truncated = 0
+        for smp in samples:
+            if not isinstance(smp, dict):
+                log.warning("log_samples: skipping non-dict sample of type %s", type(smp).__name__)
+                continue
+            smp = {str(k): v for k, v in smp.items()}
+            for _ in range(8):  # shrink the longest string until the sample fits
+                size = len(_json.dumps(smp, default=str))
+                if size <= _MAX_SAMPLE_BYTES:
+                    break
+                key = max(smp, key=lambda k: len(smp[k]) if isinstance(smp[k], str) else 0)
+                val = smp[key]
+                if not isinstance(val, str) or len(val) < 100:
+                    smp = {"error": "sample too large; dropped"}
+                    break
+                keep = max(50, len(val) - (size - _MAX_SAMPLE_BYTES) - 64)
+                smp[key] = val[:keep] + "...[truncated]"
+                truncated += 1
+            cleaned.append(smp)
+        if truncated:
+            log.warning("log_samples: truncated %d oversized string value(s) to fit %d bytes per sample",
+                        truncated, _MAX_SAMPLE_BYTES)
+        for i in range(0, len(cleaned), _MAX_SAMPLES_PER_REQUEST):
+            self._transport.submit(
+                "POST",
+                f"/runs/{self.run_id}/samples",
+                {
+                    "name": name,
+                    "step": step,
+                    "timestamp": time.time(),
+                    "samples": cleaned[i:i + _MAX_SAMPLES_PER_REQUEST],
+                    # a large list is split into several requests: only the first may replace
+                    "mode": mode if i == 0 else "append",
+                },
+                timeout=30,
+            )
 
     def finish(self) -> None:
         """Mark the run as completed, flush remaining metrics, and close the HTTP session.
 
         Always call this at the end of training — it flips the run status from
         ``running`` to ``completed`` in the database and ensures no metrics are lost.
+        If you forget, the run is still closed at interpreter exit: ``completed`` on a
+        normal exit, ``failed`` after an uncaught exception, ``killed`` on Ctrl-C or
+        SIGTERM. (A hard kill, e.g. SIGKILL or power loss, is detected by the server:
+        no heartbeat for 5 minutes marks the run ``crashed``.)
+        Undelivered data gets a short final delivery attempt; anything the server
+        still did not accept is saved to the spool directory and a single warning
+        names it (upload later with ``pyrometer sync``). In offline mode the whole
+        run is in the spool.
 
         Example::
 
             run.finish()
         """
+        self._finish("completed")
+
+    def _finish(self, status: str) -> None:
+        if self._finished:
+            return
+        try:
+            self._autolog.flush_episodes()
+        except Exception:
+            log.debug("episode flush failed", exc_info=True)
+        try:
+            self._autolog.stop(resolve=status != "killed")  # hooks off first; logs the last pending values
+        except Exception:
+            log.debug("autolog stop failed", exc_info=True)
+        self._print_reminders()
+        if self._probe_thread is not None and status != "killed":
+            # let a nearly finished hardware probe still report (it submits only while the run is open)
+            self._probe_thread.join(timeout=2)
         self._finished = True
+        _active_runs.discard(self)
+        try:
+            _run_stack.remove(self)
+        except ValueError:
+            pass
+        try:
+            atexit.unregister(self._atexit)
+        except Exception:
+            pass
+        self._stop.set()
+        self._flush_thread.join(timeout=5)
+        # Stop sampling before the transport closes, or a late snapshot would be spilled to disk.
+        if self._monitor_thread is not threading.current_thread():
+            self._monitor_thread.join(timeout=3)
         self._flush()
         self._restore_stdout_capture()
         self._remove_watch_hooks()
-        try:
-            self._client.patch(f"/runs/{self.run_id}", json={"status": "completed"})
-        except Exception:
-            pass
-        self._client.close()
+        self._transport.submit("PATCH", f"/runs/{self.run_id}", {"status": status})
+        left = self._transport.close(timeout=10.0)
+        if self._client is not None:
+            self._client.close()
+        if self._offline:
+            print(
+                f"pyrometer: run {self.run_id} saved offline in {self._spool.dir}. "
+                "Upload it with: pyrometer sync",
+                file=sys.stderr,
+            )
+        elif left or self._transport.dead:
+            extra = f" ({self._transport.dead} dead-lettered after repeated server errors)" if self._transport.dead else ""
+            print(
+                f"pyrometer: {left} payloads were not delivered{extra}; "
+                f"saved in {self._spool.dir}. Upload them with: pyrometer sync",
+                file=sys.stderr,
+            )
+
+    def _print_reminders(self) -> None:
+        """Preset hints for data the preset expects but never saw (printed once, at the end)."""
+        if not self._reminders:
+            return
+        eng = self._autolog
+        lines = []
+        if "tokens" in self._reminders and eng.enabled and not eng.tokens_seen:
+            lines.append("no tokens_per_batch hint was given; call run.track(tokens_per_batch=...) to log "
+                         "tokens_seen and tokens/sec")
+        if "samples" in self._reminders and not self._samples_logged:
+            lines.append("no run.log_samples(...) call was made; log generations to browse them in the Samples tab")
+        for line in lines:
+            print(f"pyrometer: preset {self.preset}: {line}", file=sys.stderr)
 
     @contextmanager
-    def profile(self, step: int):
+    def profile(self, step: int | None = None):
         """Profile a single training step using torch.profiler.
 
         Activates ``torch.profiler.profile`` with CPU + CUDA activity capture,
@@ -473,7 +969,8 @@ class Run:
 
         Args:
             step: The training step being profiled. Stored alongside all events
-                  so the dashboard can correlate profiler data with metric charts.
+                  so the dashboard can correlate profiler data with metric charts. Defaults to the
+                  step in progress under autolog (``run.step + 1``).
 
         Example::
 
@@ -486,6 +983,8 @@ class Run:
             yield
             return
 
+        if step is None:
+            step = self._autolog.step + 1
         ts = time.time()
         with _tp.profile(
             activities=[_tp.ProfilerActivity.CPU, _tp.ProfilerActivity.CUDA],
@@ -495,12 +994,11 @@ class Run:
         ) as _prof:
             yield
 
+        self._ship_profile_async(_prof, step, ts)
+
+    def _ship_profile_async(self, prof, step: int, ts: float) -> None:
         # Ship events off the hot path — failures are silently swallowed.
-        threading.Thread(
-            target=self._ship_profile,
-            args=(_prof, step, ts),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._ship_profile, args=(prof, step, ts), daemon=True).start()
 
     def _ship_profile(self, prof, step: int, ts: float) -> None:
         """Extract key_averages from a finished profiler session and POST to server."""
@@ -548,8 +1046,7 @@ class Run:
                 })
 
             if events:
-                resp = self._client.post(f"/runs/{self.run_id}/profile", json=events)
-                resp.raise_for_status()
+                self._transport.submit("POST", f"/runs/{self.run_id}/profile", events, timeout=30)
                 log.debug("Shipped %d profile events for step %d", len(events), step)
             else:
                 log.warning("Profile step %d produced no events (all sub-microsecond)", step)
@@ -563,27 +1060,40 @@ class Run:
     def _install_stdout_capture(self) -> None:
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
-        sys.stdout = _TeeWriter(sys.stdout, "stdout", self._on_log_line)
-        sys.stderr = _TeeWriter(sys.stderr, "stderr", self._on_log_line)
+        self._tee_out = sys.stdout = _TeeWriter(sys.stdout, "stdout", self._on_log_line)
+        self._tee_err = sys.stderr = _TeeWriter(sys.stderr, "stderr", self._on_log_line)
 
     def _restore_stdout_capture(self) -> None:
-        if self._original_stdout is not None:
-            sys.stdout = self._original_stdout
-            self._original_stdout = None
-        if self._original_stderr is not None:
-            sys.stderr = self._original_stderr
-            self._original_stderr = None
+        """Put the streams back, but never clobber what somebody else installed after us (another run, a
+        redirect helper): then our tee just stops capturing and passes through. A stale tee left under a
+        newer one by an earlier run is skipped over when the newer owner restores."""
+        for attr, tee_attr, orig_attr in (("stdout", "_tee_out", "_original_stdout"),
+                                          ("stderr", "_tee_err", "_original_stderr")):
+            tee, orig = getattr(self, tee_attr, None), getattr(self, orig_attr)
+            if tee is None:
+                continue
+            tee.detached = True
+            while isinstance(orig, _TeeWriter) and orig.detached:
+                orig = orig._orig
+            if getattr(sys, attr) is tee:
+                setattr(sys, attr, orig)
+            setattr(self, tee_attr, None)
+            setattr(self, orig_attr, None)
 
     def _on_log_line(self, line: str, stream: str) -> None:
         ts = time.time()
         should_flush = False
         with self._log_lock:
-            self._log_buffer.append({
+            entry = {
                 "timestamp": ts,
                 "stream": stream,
                 "line": line,
                 "step": self._last_step,
-            })
+            }
+            if not self._log_buffer:
+                self._log_batch = uuid.uuid4().hex
+            self._log_buffer.append(entry)
+            self._transport.wal_append(self._log_batch, [entry], "logs")
             should_flush = len(self._log_buffer) >= 50
         if should_flush:
             threading.Thread(target=self._flush_logs, daemon=True).start()
@@ -592,12 +1102,10 @@ class Run:
         with self._log_lock:
             if not self._log_buffer:
                 return
-            batch = self._log_buffer[:]
+            batch, bid = self._log_buffer[:], self._log_batch
             self._log_buffer.clear()
-        try:
-            self._client.post(f"/runs/{self.run_id}/logs", json=batch)
-        except Exception:
-            log.exception("Failed to flush %d log lines", len(batch))
+        self._transport.submit("POST", f"/runs/{self.run_id}/logs", batch, item_id=bid)
+        self._transport.wal_clear("logs", bid)
 
     # -- gradient/weight monitoring --
 
@@ -612,135 +1120,51 @@ class Run:
     def _check_grad_anomaly(
         self, param_name: str, grad_norm: float, step: int, has_nan_inf: bool
     ) -> None:
-        if has_nan_inf:
-            self._fire_anomaly_event(
-                param_name, step, "NaN or Inf detected in gradients or weights"
-            )
-            return
-
-        hist = self._watch_grad_norm_history.setdefault(param_name, [])
-        hist.append(grad_norm)
-        if len(hist) > 200:
-            del hist[0]
-
-        if len(hist) >= 10:
-            prev = sorted(hist[:-1])
-            median = prev[len(prev) // 2]
-            if median > 0 and grad_norm > 100 * median:
-                self._fire_anomaly_event(
-                    param_name,
-                    step,
-                    f"Gradient norm spike: {grad_norm:.4g} vs median {median:.4g}",
-                )
-
-        if grad_norm < 1e-8:
-            streak = self._watch_low_norm_streak.get(param_name, 0) + 1
-            self._watch_low_norm_streak[param_name] = streak
-            if streak == 50:  # fire once when threshold crossed
-                self._fire_anomaly_event(
-                    param_name,
-                    step,
-                    f"Gradient norm below 1e-8 for {streak} consecutive samples — possible dead layer",
-                )
-        else:
-            self._watch_low_norm_streak[param_name] = 0
+        with self._anomaly_lock:
+            msg = self._grad_detector.observe(param_name, grad_norm, step, has_nan_inf)
+        if msg:
+            self._fire_anomaly_event(param_name, step, msg)
 
     def _fire_anomaly_event(self, param_name: str, step: int, message: str) -> None:
         if self._finished:
             return
-        try:
-            self._client.post(
-                f"/runs/{self.run_id}/events",
-                json={
-                    "timestamp": time.time(),
-                    "step": step,
-                    "event_type": "anomaly_detected",
-                    "severity": "warning",
-                    "message": f"{param_name}: {message}",
-                    "metadata": {"param_name": param_name},
-                },
-            )
-        except Exception:
-            log.exception("Failed to fire anomaly event for %s", param_name)
+        self._transport.submit("POST", f"/runs/{self.run_id}/events", {
+            "timestamp": time.time(),
+            "step": step,
+            "event_type": "anomaly_detected",
+            "severity": "warning",
+            "message": f"{param_name}: {message}",
+            "metadata": {"param_name": param_name},
+        })
 
     def _check_metric_anomaly(self, name: str, value: float, step: int) -> None:
-        """Rolling z-score spike detection and NaN/Inf check for a single metric value."""
-        if math.isnan(value) or math.isinf(value):
-            threading.Thread(
-                target=self._fire_metric_spike_event,
-                args=(name, step, f"NaN or Inf in metric '{name}'", "error"),
-                daemon=True,
-            ).start()
-            return
-
-        hist = self._metric_history.setdefault(name, [])
-        hist.append(value)
-        if len(hist) > 30:
-            del hist[0]
-
-        cooldown = self._metric_cooldown.get(name, 0)
-        if cooldown > 0:
-            self._metric_cooldown[name] = cooldown - 1
-            return
-
-        # Require at least 5 samples — low enough that infrequent metrics (val/loss
-        # logged once per epoch) can still trigger detection early in training.
-        if len(hist) < 5:
-            return
-
-        # Compute median and std over the window excluding the current value
-        window = hist[:-1]
-        n = len(window)
-        sorted_w = sorted(window)
-        median = sorted_w[n // 2]
-        mean = sum(window) / n
-        std = (sum((x - mean) ** 2 for x in window) / n) ** 0.5
-
-        if std < 1e-10:
-            return
-
-        z = abs(value - median) / std
-        if z > 5.0:
-            self._metric_cooldown[name] = 10
-            threading.Thread(
-                target=self._fire_metric_spike_event,
-                args=(
-                    name,
-                    step,
-                    f"Spike in '{name}': {value:.4g} (z={z:.1f}, median={median:.4g})",
-                    "warning",
-                ),
-                daemon=True,
-            ).start()
+        """Run the (conservative, deterministic) metric detector and report any finding."""
+        with self._anomaly_lock:
+            found = self._metric_detector.observe(name, value, step)
+        if found:
+            severity, message = found
+            self._fire_metric_spike_event(name, step, message, severity)
 
     def _fire_metric_spike_event(self, name: str, step: int, message: str, severity: str) -> None:
         if self._finished:
             return
-        try:
-            self._client.post(
-                f"/runs/{self.run_id}/events",
-                json={
-                    "timestamp": time.time(),
-                    "step": step,
-                    "event_type": "anomaly_detected",
-                    "severity": severity,
-                    "message": message,
-                    "metadata": {"metric": name},
-                },
-            )
-        except Exception:
-            log.exception("Failed to fire spike event for metric %s", name)
+        self._transport.submit("POST", f"/runs/{self.run_id}/events", {
+            "timestamp": time.time(),
+            "step": step,
+            "event_type": "anomaly_detected",
+            "severity": severity,
+            "message": message,
+            "metadata": {"metric": name},
+        })
 
     def _flush_param_stats(self) -> None:
         with self._param_stats_lock:
             if not self._param_stats_buffer:
                 return
-            batch = self._param_stats_buffer[:]
+            batch, bid = self._param_stats_buffer[:], self._param_stats_batch
             self._param_stats_buffer.clear()
-        try:
-            self._client.post(f"/runs/{self.run_id}/param-stats", json=batch)
-        except Exception:
-            log.exception("Failed to flush %d param stats", len(batch))
+        self._transport.submit("POST", f"/runs/{self.run_id}/param-stats", batch, item_id=bid)
+        self._transport.wal_clear("param-stats", bid)
 
     def _flush(self) -> None:
         with self._lock:
@@ -754,24 +1178,21 @@ class Run:
             return
         batch = self._buffer[:]
         self._buffer.clear()
-        try:
-            self._client.post(f"/runs/{self.run_id}/metrics", json=batch)
-        except Exception:
-            log.exception("Failed to flush %d metrics to server", len(batch))
+        self._transport.submit("POST", f"/runs/{self.run_id}/metrics", batch, item_id=self._wal_batch)
+        self._transport.wal_clear("metrics", self._wal_batch)
 
     # ------------------------------------------------------------------
     # Media helpers
     # ------------------------------------------------------------------
 
-    def _image_to_b64(self, image) -> str:
-        """Convert an image-like object to a base64-encoded PNG string."""
-        import base64
+    def _image_to_png(self, image) -> bytes:
+        """Convert an image-like object to PNG bytes."""
         import io
 
         pil_img = self._to_pil(image)
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("ascii")
+        return buf.getvalue()
 
     def _to_pil(self, image):
         """Normalise various image formats to a PIL Image."""
@@ -816,15 +1237,13 @@ class Run:
                 arr = arr.clip(0, 255).astype(_np.uint8)
         return _PILImage.fromarray(arr)
 
-    def _figure_to_b64(self, figure) -> str:
-        """Render a matplotlib figure to a base64-encoded PNG string."""
-        import base64
+    def _figure_to_png(self, figure) -> bytes:
+        """Render a matplotlib figure to PNG bytes."""
         import io
 
         buf = io.BytesIO()
         figure.savefig(buf, format="png", bbox_inches="tight", dpi=96)
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode("ascii")
+        return buf.getvalue()
 
     def _compute_histogram(self, data, num_bins: int) -> dict:
         """Compute a histogram dict with keys 'edges' and 'counts'."""
@@ -846,152 +1265,99 @@ class Run:
         counts, edges = _np.histogram(arr, bins=num_bins)
         return {"edges": edges.tolist(), "counts": counts.tolist()}
 
-    def _post_media(self, name: str, media_type: str, data: str, step: int | None) -> None:
-        """Ship a media item to the server in a background thread."""
+    def _post_media(self, name: str, media_type: str, data: str | bytes, step: int | None) -> None:
+        """Queue a media item for delivery.
+
+        Raw bytes (images, figures) and large strings are journaled/spooled as separate binary
+        files referenced from the JSONL; base64 happens only on the wire.
+        """
         if self._finished:
             return
         resolved_step = step if step is not None else self._last_step
-
-        def _send():
-            try:
-                self._client.post(
-                    f"/runs/{self.run_id}/media",
-                    json={
-                        "step": resolved_step,
-                        "timestamp": time.time(),
-                        "name": name,
-                        "media_type": media_type,
-                        "data": data,
-                    },
-                    timeout=30,  # images can be large; use a longer timeout
-                )
-            except Exception:
-                log.exception("Failed to post media '%s'", name)
-
-        threading.Thread(target=_send, daemon=True).start()
+        body = {
+            "step": resolved_step,
+            "timestamp": time.time(),
+            "name": name,
+            "media_type": media_type,
+        }
+        blob: tuple[str, bytes, str] | None = None
+        if isinstance(data, bytes):
+            blob = ("data", data, "b64")
+        elif len(data) > _INLINE_MEDIA_MAX:
+            blob = ("data", data.encode("utf-8"), "utf8")
+        else:
+            body["data"] = data
+        self._transport.submit(
+            "POST",
+            f"/runs/{self.run_id}/media",
+            body,
+            timeout=30,  # images can be large; use a longer timeout
+            blob=blob,
+        )
 
     def _flush_loop(self) -> None:
-        while not self._finished:
-            time.sleep(5)
-            self._flush()
+        self._heartbeat()
+        while not self._stop.wait(5):
+            try:  # a bad batch must not end the thread (metrics would then only flush at finish)
+                self._flush()
+                self._heartbeat()
+            except Exception:
+                log.debug("periodic flush failed", exc_info=True)
         self._flush()  # drain on exit
+
+    def _heartbeat(self) -> None:
+        now = time.monotonic()
+        if self._offline or self._finished or now - self._last_heartbeat < HEARTBEAT_INTERVAL:
+            return
+        self._last_heartbeat = now
+        self._transport.submit("POST", f"/runs/{self.run_id}/heartbeat", None, timeout=5, ephemeral=True)
+
+    def _atexit(self) -> None:
+        """Interpreter is exiting without finish(): close the run with the status the exit implies."""
+        self._finish(self._exit_status)
 
     def _monitor_loop(self) -> None:
         try:
             import pynvml
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            handles = _gpu.resolve_handles(pynvml)
         except Exception:
             return  # no GPU or pynvml unavailable
+        if not handles:
+            return
 
-        while not self._finished:
+        throttle_state: dict[int, int] = {}
+        while not self._stop.is_set():
             try:
-                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-                power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW → W
-
-                fan: float | None = None
-                try:
-                    fan = float(pynvml.nvmlDeviceGetFanSpeed(handle))
-                except Exception:
-                    pass
-
-                sm_clock: int | None = None
-                mem_clock: int | None = None
-                try:
-                    sm_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
-                    mem_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
-                except Exception:
-                    pass
-
-                # --- Per-process attribution ---
-                #
-                # Layer 1 — exact VRAM: nvmlDeviceGetComputeRunningProcesses
-                #   gives our process's allocated VRAM directly, no root needed.
-                #
-                # Layer 2 — exact utilization: nvmlDeviceGetProcessUtilization
-                #   samples SM utilization per-process from hardware counters,
-                #   no root or accounting mode required on driver ≥ 346.x.
-                #   This is the preferred source for attributed_utilization.
-                #
-                # Layer 3 — fallbacks when layer 2 is unavailable:
-                #   • Exclusive process → device util/power are fully ours.
-                #   • Shared GPU → scale by VRAM fraction (estimate).
-
-                process_memory_used: int | None = None
-                process_exclusive: bool | None = None
-                attributed_utilization: float | None = None
-                attributed_power: float | None = None
-
-                # Layer 1: per-process VRAM
-                our_vram: int = 0
-                all_procs: list = []
-                try:
-                    all_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-                    our_entries = [p for p in all_procs if p.pid == self._our_pid]
-                    other_entries = [p for p in all_procs if p.pid != self._our_pid]
-                    if our_entries:
-                        our_vram = our_entries[0].usedGpuMemory or 0
-                        process_memory_used = our_vram
-                        process_exclusive = len(other_entries) == 0
-                except Exception:
-                    pass
-
-                # Layer 2: direct per-process SM utilization (no root needed)
-                try:
-                    # lastSeenTimeStamp=0 returns the most recent available samples.
-                    samples = pynvml.nvmlDeviceGetProcessUtilization(handle, 0)
-                    our_samples = [s for s in samples if s.pid == self._our_pid]
-                    if our_samples:
-                        latest = max(our_samples, key=lambda s: s.timeStamp)
-                        attributed_utilization = float(latest.smUtil)
-                except Exception:
-                    pass
-
-                # Layer 3: fallback util attribution
-                if attributed_utilization is None:
-                    if process_exclusive:
-                        attributed_utilization = float(util.gpu)
-                    elif our_vram > 0 and all_procs:
-                        total_compute_vram = sum(
-                            p.usedGpuMemory for p in all_procs if p.usedGpuMemory
-                        )
-                        if total_compute_vram > 0:
-                            attributed_utilization = (
-                                float(util.gpu) * our_vram / total_compute_vram
-                            )
-
-                # Power attribution: scale by util fraction when available,
-                # otherwise by VRAM fraction, otherwise full power if exclusive.
-                device_util = float(util.gpu)
-                if process_exclusive:
-                    attributed_power = power
-                elif attributed_utilization is not None and device_util > 0:
-                    attributed_power = power * (attributed_utilization / device_util)
-                elif our_vram > 0 and all_procs:
-                    total_compute_vram = sum(
-                        p.usedGpuMemory for p in all_procs if p.usedGpuMemory
-                    )
-                    if total_compute_vram > 0:
-                        attributed_power = power * our_vram / total_compute_vram
-
-                self._client.post(f"/runs/{self.run_id}/system", json={
-                    "timestamp": time.time(),
-                    "gpu_utilization": float(util.gpu),
-                    "memory_used": mem.used,
-                    "memory_total": mem.total,
-                    "temperature": float(temp),
-                    "power_draw": power,
-                    "fan_speed": fan,
-                    "sm_clock_mhz": sm_clock,
-                    "memory_clock_mhz": mem_clock,
-                    "process_memory_used": process_memory_used,
-                    "process_exclusive": process_exclusive,
-                    "attributed_utilization": attributed_utilization,
-                    "attributed_power": attributed_power,
-                })
+                for snap in _gpu.sample_all(pynvml, handles, self._our_pid):
+                    if self._stop.is_set():
+                        break
+                    self._transport.submit("POST", f"/runs/{self.run_id}/system", snap)
+                if self._capture_throttle:
+                    self._sample_throttle(pynvml, handles, throttle_state)
             except Exception:
                 pass
+            self._stop.wait(self._monitor_interval)
 
-            time.sleep(2)
+    def _sample_throttle(self, nvml, handles, state: dict[int, int]) -> None:
+        """Log ``hw/gpu<i>/throttle_reasons`` (NVML bitmask) when it changes, and a ``thermal_throttle`` event
+        when a thermal or power limit starts slowing the GPU."""
+        for index, handle in handles:
+            mask = _gpu.throttle_mask(nvml, handle)
+            if mask is None:
+                continue
+            prev = state.get(index)
+            state[index] = mask
+            if prev == mask:
+                continue
+            if prev is None and mask == 0:
+                continue
+            self._log({f"hw/gpu{index}/throttle_reasons": float(mask)}, self._last_step, time.time())
+            slowing = mask & _gpu.THROTTLE_SLOWDOWN_BITS
+            if slowing and not (prev or 0) & _gpu.THROTTLE_SLOWDOWN_BITS and not self._finished:
+                reasons = _gpu.decode_throttle(slowing)
+                self.event(
+                    f"GPU {index} clocks throttled: {', '.join(reasons)}",
+                    event_type="thermal_throttle", severity="warning",
+                    metadata={"gpu_index": index, "reasons": reasons, "mask": mask},
+                )

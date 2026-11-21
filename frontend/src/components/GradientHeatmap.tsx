@@ -1,11 +1,25 @@
 import * as d3 from 'd3'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ParamStat } from '../api/types.ts'
+import { api } from '../api/client.ts'
+import type { Metric } from '../api/types.ts'
+import { binHeatmap, columnAt, columnsToStepRange } from '../utils/heatmap.ts'
+import { useZoomFetch } from '../hooks/useZoomFetch.ts'
+import type { XZoom } from '../utils/series.ts'
+import type { XSource } from '../utils/xAxis.ts'
+import type { RangeQuery } from '../utils/series.ts'
 import MetricChart from './MetricChart.tsx'
 
 interface Props {
   stats: ParamStat[]
+  /** With a run id the detail charts of a selected parameter can be zoomed (refetched at full resolution). */
+  runId?: string
+  /** Bump when new stats arrive so zoomed windows refresh. */
+  refreshKey?: number
 }
+
+/** Gradient/weight detail charts offer step, wall time and elapsed on the x axis (no metric axes). */
+const DETAIL_SOURCE: XSource = {}
 
 const NAME_COL_W = 76
 const ROW_H = 13
@@ -24,12 +38,79 @@ function normColor(t: number): string {
   return `rgb(${Math.round(245 - u * 6)},${Math.round(158 - u * 90)},${Math.round(11 + u * 57)})`
 }
 
-export default function GradientHeatmap({ stats }: Props) {
+export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const svgRef = useRef<SVGSVGElement>(null)
   const tooltipRef = useRef<HTMLDivElement>(null)
   const [containerWidth, setContainerWidth] = useState(0)
   const [selectedParam, setSelectedParam] = useState<string | null>(null)
+
+  // Drag across columns to zoom: every parameter is refetched for that step window at full resolution.
+  const maxCols = Math.max(1, Math.floor((containerWidth - NAME_COL_W - LEFT_PAD) / (MIN_CELL_W + CELL_GAP)))
+  const maxColsRef = useRef(maxCols)
+  maxColsRef.current = maxCols
+  const zoomFetch = useZoomFetch<ParamStat[]>(
+    runId
+      ? async (z: XZoom) => {
+          const r = await api.getParamStatsSeries(runId, {
+            step_min: Math.floor(z.x0),
+            step_max: Math.ceil(z.x1),
+            max_points: maxColsRef.current,
+          })
+          return r.data.length > 0 ? r.data : null
+        }
+      : undefined,
+    refreshKey,
+  )
+  const stats = zoomFetch.data ?? allStats
+  const layout = useRef({ cellW: MIN_CELL_W, steps: [] as number[], ends: [] as number[] })
+  const dragRef = useRef<{ a: number; b: number } | null>(null)
+  const justDragged = useRef(false)
+  const [sel, setSel] = useState<[number, number] | null>(null)
+  const colFromEvent = (e: React.MouseEvent): number | null => {
+    const svg = svgRef.current
+    if (!svg) return null
+    const x = e.clientX - svg.getBoundingClientRect().left - NAME_COL_W - LEFT_PAD
+    if (x < 0) return null
+    return columnAt(x, layout.current.steps.length, layout.current.cellW + CELL_GAP)
+  }
+  const dragHandlers = runId
+    ? {
+        onMouseDown: (e: React.MouseEvent) => {
+          const c = colFromEvent(e)
+          if (c == null || e.button !== 0) return
+          dragRef.current = { a: c, b: c }
+        },
+        onMouseMove: (e: React.MouseEvent) => {
+          const d = dragRef.current
+          const c = colFromEvent(e)
+          if (!d || c == null) return
+          d.b = c
+          if (d.a !== d.b) setSel([Math.min(d.a, d.b), Math.max(d.a, d.b)])
+        },
+        onMouseUp: () => {
+          const d = dragRef.current
+          dragRef.current = null
+          setSel(null)
+          if (!d || d.a === d.b) return
+          justDragged.current = true // the click that follows a drag must not select a parameter
+          setTimeout(() => (justDragged.current = false), 0)
+          const r = columnsToStepRange(layout.current, d.a, d.b)
+          if (r) zoomFetch.select({ axis: 'step', x0: r.step_min, x1: r.step_max })
+        },
+        onMouseLeave: () => {
+          dragRef.current = null
+          setSel(null)
+        },
+      }
+    : {}
+  const selBox = useMemo(
+    () =>
+      sel
+        ? { left: NAME_COL_W + LEFT_PAD + sel[0] * (layout.current.cellW + CELL_GAP), width: (sel[1] - sel[0] + 1) * (layout.current.cellW + CELL_GAP) }
+        : null,
+    [sel],
+  )
 
   // Track container width
   useEffect(() => {
@@ -59,15 +140,11 @@ export default function GradientHeatmap({ stats }: Props) {
       }
     }
 
-    const steps = [...new Set(stats.map((s) => s.step))].sort((a, b) => a - b)
+    // Shared column grid, at most one column per MIN_CELL_W pixels (parameters are downsampled separately
+    // by the server, so their steps differ; binning aligns them).
+    const { steps, ends, cells: matrix } = binHeatmap(stats, maxCols)
 
     if (paramNames.length === 0 || steps.length === 0) return
-
-    // (paramName, step) → grad_norm lookup
-    const matrix = new Map<string, number>()
-    for (const s of stats) {
-      matrix.set(`${s.param_name}::${s.step}`, s.grad_norm)
-    }
 
     // Log-scale normalization
     const allNorms = stats.map((s) => s.grad_norm).filter((v) => v > 0)
@@ -83,6 +160,7 @@ export default function GradientHeatmap({ stats }: Props) {
 
     const availW = containerWidth - NAME_COL_W - LEFT_PAD
     const cellW = Math.max(MIN_CELL_W, availW / steps.length - CELL_GAP)
+    layout.current = { cellW, steps, ends }
     const totalW = Math.max(containerWidth, NAME_COL_W + LEFT_PAD + steps.length * (cellW + CELL_GAP))
     const totalH = TOP_AXIS_H + paramNames.length * ROW_H
 
@@ -132,7 +210,7 @@ export default function GradientHeatmap({ stats }: Props) {
 
       // Cells
       steps.forEach((step, colIdx) => {
-        const norm = matrix.get(`${pname}::${step}`) ?? 0
+        const norm = matrix.get(`${pname}::${colIdx}`) ?? 0
         const x = NAME_COL_W + LEFT_PAD + colIdx * (cellW + CELL_GAP)
 
         rowG
@@ -153,16 +231,16 @@ export default function GradientHeatmap({ stats }: Props) {
             tooltip.style.display = 'block'
             tooltip.innerHTML =
               `<span style="color:#8b8fa8">${displayName}</span><br/>` +
-              `step <span style="color:#f59e0b">${step}</span>&nbsp;&nbsp;` +
+              `step <span style="color:#f59e0b">${ends[colIdx] !== step ? `${step}–${ends[colIdx]}` : step}</span>&nbsp;&nbsp;` +
               `grad_norm <span style="color:#f59e0b">${norm > 0 ? norm.toExponential(3) : '—'}</span>`
           })
           .on('mouseleave', () => {
             if (tooltipRef.current) tooltipRef.current.style.display = 'none'
           })
-          .on('click', () => setSelectedParam((prev) => (prev === pname ? null : pname)))
+          .on('click', () => !justDragged.current && setSelectedParam((prev) => (prev === pname ? null : pname)))
       })
     })
-  }, [stats, containerWidth, selectedParam])
+  }, [stats, containerWidth, selectedParam, maxCols])
 
   // Detail data for selected param
   const selectedStats = selectedParam ? stats.filter((s) => s.param_name === selectedParam) : []
@@ -179,6 +257,14 @@ export default function GradientHeatmap({ stats }: Props) {
     value: s.weight_norm,
   }))
 
+  const fetchRange = runId && selectedParam
+    ? async (name: string, q: RangeQuery, maxPoints: number): Promise<Metric[]> => {
+        const rows = await api.getParamStats(runId, selectedParam, { ...q, max_points: maxPoints })
+        const key = name === 'weight_norm' ? 'weight_norm' : 'grad_norm'
+        return rows.map((r) => ({ step: r.step, timestamp: r.timestamp, name, value: r[key] }))
+      }
+    : undefined
+
   if (stats.length === 0) return null
 
   return (
@@ -190,6 +276,21 @@ export default function GradientHeatmap({ stats }: Props) {
       >
         <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
           Gradient Norm Heatmap
+          {runId && !zoomFetch.zoom && <span style={{ color: '#4a4e60' }}> · drag across columns to zoom</span>}
+          {zoomFetch.zoom && (
+            <>
+              <span style={{ color: '#f59e0b' }}>
+                {' '}· steps {Math.floor(zoomFetch.zoom.x0)}–{Math.ceil(zoomFetch.zoom.x1)}{zoomFetch.loading ? ' …' : ''}
+              </span>
+              <button
+                onClick={zoomFetch.reset}
+                className="ml-2 px-1.5 rounded"
+                style={{ background: 'none', border: '1px solid #252830', color: '#8b8fa8', cursor: 'pointer' }}
+              >
+                reset zoom
+              </button>
+            </>
+          )}
         </span>
         <div className="flex items-center gap-2">
           <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
@@ -214,7 +315,15 @@ export default function GradientHeatmap({ stats }: Props) {
         ref={containerRef}
         style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 480, position: 'relative' }}
       >
-        <svg ref={svgRef} style={{ display: 'block' }} />
+        <svg ref={svgRef} style={{ display: 'block', userSelect: 'none' }} {...dragHandlers} />
+        {selBox && (
+          <div
+            style={{
+              position: 'absolute', top: 0, bottom: 0, left: selBox.left, width: selBox.width,
+              background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.6)', pointerEvents: 'none',
+            }}
+          />
+        )}
         <div
           ref={tooltipRef}
           style={{
@@ -266,13 +375,13 @@ export default function GradientHeatmap({ stats }: Props) {
           </div>
           <div
             className="grid gap-4 p-4"
-            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' }}
+            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 280px), 1fr))' }}
           >
             {gradNormSeries.length > 0 && (
-              <MetricChart name="grad_norm" data={gradNormSeries} lineColor="#f59e0b" />
+              <MetricChart key={`g${selectedParam}`} name="grad_norm" data={gradNormSeries} lineColor="#f59e0b" source={DETAIL_SOURCE} fetchRange={fetchRange} refreshKey={refreshKey} />
             )}
             {weightNormSeries.length > 0 && (
-              <MetricChart name="weight_norm" data={weightNormSeries} lineColor="#60a5fa" />
+              <MetricChart key={`w${selectedParam}`} name="weight_norm" data={weightNormSeries} lineColor="#60a5fa" source={DETAIL_SOURCE} fetchRange={fetchRange} refreshKey={refreshKey} />
             )}
           </div>
         </div>

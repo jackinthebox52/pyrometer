@@ -1,5 +1,6 @@
-# Pyrometer server. Auth is required: create a key after the first start with
-#   docker compose exec pyrometer python -m pyrometer keys create --name <name> --scopes ingest
+# Pyrometer server. Auth is required. On first start the log prints a one-time setup token:
+#   docker compose logs pyrometer | grep "setup token"
+# Open the dashboard, enter it and choose an admin password, then create API keys under Settings.
 services:
   pyrometer:
     build: .
@@ -9,7 +10,7 @@ services:
     user: "1000:1000"
     environment:
       PYROMETER_DB_PATH: /data/data.duckdb      # DuckDB file
-      PYROMETER_KEYS_FILE: /data/keys.json      # hashed API keys
+      PYROMETER_AUTH_FILE: /data/auth.json      # admin password hash, API key hashes, sessions
       # PYROMETER_TRUSTED_PROXIES: 172.16.0.0/12 # set when an auth proxy (e.g. authentik) is in front
     volumes:
       - ./data:/data                             # must be writable by uid 1000
