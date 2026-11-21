@@ -11,12 +11,36 @@ export interface XSource {
   byName?: Record<string, Metric[]>
   /** Run start, unix seconds. Falls back to the first point's timestamp. */
   startTime?: number
+  /**
+   * The axis metric was downsampled by the server, so it rarely has a value at exactly the step of another
+   * (separately downsampled) series: place those points by linear interpolation between the neighbouring
+   * axis samples instead of skipping them. Points outside the axis metric's step range are still skipped.
+   */
+  interpolate?: boolean
 }
 
 export interface XPoint {
   x: number
   value: number
   step: number
+}
+
+/** Value of a step-sorted metric at `step`: exact if logged, else (when `interpolate`) linear between neighbours. */
+function axisValueAt(arr: Metric[], step: number, exact: Map<number, number>, interpolate: boolean): number | null {
+  const hit = exact.get(step)
+  if (hit != null || !interpolate || arr.length === 0) return hit ?? null
+  if (step < arr[0].step || step > arr[arr.length - 1].step) return null
+  let lo = 0
+  let hi = arr.length - 1
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1
+    if (arr[mid].step <= step) lo = mid
+    else hi = mid
+  }
+  const a = arr[lo]
+  const b = arr[hi]
+  if (b.step === a.step) return a.value
+  return a.value + ((b.value - a.value) * (step - a.step)) / (b.step - a.step)
 }
 
 export function axisMetricName(axis: XAxis): string | null {
@@ -58,9 +82,10 @@ export function resolveXs(
   const points: XPoint[] = []
   if (metric != null) {
     const lookup = new Map<number, number>()
-    for (const m of src.byName?.[metric] ?? []) lookup.set(m.step, m.value)
+    const axisSeries = src.byName?.[metric] ?? []
+    for (const m of axisSeries) lookup.set(m.step, m.value)
     for (const d of byStep) {
-      const x = lookup.get(d.step)
+      const x = axisValueAt(axisSeries, d.step, lookup, !!src.interpolate)
       if (x == null || !Number.isFinite(x)) skipped++
       else points.push({ x, value: d.value, step: d.step })
     }

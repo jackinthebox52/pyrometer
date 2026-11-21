@@ -46,9 +46,39 @@ export function sortRuns(runs: Run[], sort: SortKey): Run[] {
   })
 }
 
-/** True when the filter can only be evaluated in the browser (the server has no param for it). */
-export function hasClientFilters(f: RunFilters): boolean {
-  return f.tags.length > 0 || !!f.from || !!f.to || !!f.query.trim()
+/** Local-midnight Unix seconds of a `YYYY-MM-DD` day (`plusDays` moves the day); undefined when empty/invalid. */
+function dayStart(day: string, plusDays = 0): number | undefined {
+  if (!day) return undefined
+  const d = new Date(`${day}T00:00:00`)
+  if (Number.isNaN(d.getTime())) return undefined
+  d.setDate(d.getDate() + plusDays)
+  return d.getTime() / 1000
+}
+
+/**
+ * The `GET /runs` parameters for the filters: every filter is evaluated by the server, so the sidebar pages
+ * through matches instead of loading all runs. `to` is inclusive, so `created_before` is the next midnight.
+ */
+export function filtersToQuery(f: RunFilters): {
+  include_archived: boolean
+  project: string
+  group: string
+  status: string
+  q: string
+  tags: string
+  created_after?: number
+  created_before?: number
+} {
+  return {
+    include_archived: f.includeArchived,
+    project: f.project,
+    group: f.group,
+    status: f.status,
+    q: f.query.trim(),
+    tags: f.tags.join(','),
+    created_after: dayStart(f.from),
+    created_before: dayStart(f.to, 1),
+  }
 }
 
 /** Does a run pass the filters? Used to decide whether a live-updated run belongs in the list. */
@@ -95,9 +125,15 @@ export type SidebarItem =
 
 /** "3 running · 2 completed" for a group header, most active states first. */
 export function statusSummary(runs: Run[]): string {
+  const counts: Record<string, number> = {}
+  for (const r of runs) counts[r.status] = (counts[r.status] ?? 0) + 1
+  return summarizeStatuses(counts)
+}
+
+/** Same text from status counts (the server's facets cover runs that are not loaded yet). */
+export function summarizeStatuses(statuses: Record<string, number>): string {
   const order = ['running', 'crashed', 'failed', 'killed', 'completed']
-  const counts = new Map<string, number>()
-  for (const r of runs) counts.set(r.status, (counts.get(r.status) ?? 0) + 1)
+  const counts = new Map(Object.entries(statuses))
   const keys = [...counts.keys()].sort((a, b) => {
     const ia = order.indexOf(a)
     const ib = order.indexOf(b)
@@ -149,7 +185,7 @@ export function rangeBetween(order: string[], a: string, b: string): string[] {
   return order.slice(Math.min(i, j), Math.max(i, j) + 1)
 }
 
-/** Tags used across the loaded runs, most common first (feeds the tag filter chips). */
+/** Tags used across the loaded runs, most common first (fallback when the server's facets are unavailable). */
 export function collectTags(runs: Run[], limit = 12): string[] {
   const counts = new Map<string, number>()
   for (const r of runs) for (const t of r.tags) counts.set(t, (counts.get(t) ?? 0) + 1)

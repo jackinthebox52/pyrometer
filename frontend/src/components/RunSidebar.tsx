@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, useMatch, useNavigate } from 'react-router-dom'
 import { api, PINS_CHANGED, type RunSort } from '../api/client.ts'
-import type { BulkResponse, Project, Run } from '../api/types.ts'
+import type { BulkResponse, Project, Run, RunFacets } from '../api/types.ts'
 import { timeAgo } from '../utils/format.ts'
 import { RUN_COLORS } from '../pages/CompareView.tsx'
 import { useWebSocket } from '../hooks/useWebSocket.ts'
@@ -12,12 +12,13 @@ import {
   applyLiveRun,
   buildSidebarItems,
   collectTags,
-  hasClientFilters,
+  filtersToQuery,
   matchesFilters,
   mergeRuns,
   parseTags,
   rangeBetween,
   removeRun,
+  summarizeStatuses,
   visibleRunIds,
   type RunFilters,
   type SidebarItem,
@@ -32,6 +33,9 @@ const STATUS_COLOR: Record<string, string> = {
 }
 
 const PAGE_SIZE = 50
+const ACTIVITY_REFRESH_MS = 2000 // run_activity events refresh the first page at most this often
+const FACETS_REFRESH_MS = 3000
+const SEARCH_DEBOUNCE_MS = 300
 const field =
   'w-full rounded border border-py-border bg-py-base px-2 py-1 text-xs text-py-text outline-none focus:border-py-border-hi'
 const smallBtn = 'rounded border border-py-border px-2 py-1 text-xs font-mono text-py-muted disabled:opacity-40'
@@ -65,6 +69,8 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
   const [runs, setRuns] = useState<Run[]>([])
   const [pins, setPins] = useState<Run[]>([])
   const [projects, setProjects] = useState<Project[]>([])
+  const [facets, setFacets] = useState<RunFacets | null>(null)
+  const [debouncedQuery, setDebouncedQuery] = useState('')
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [serverDown, setServerDown] = useState(false)
@@ -79,13 +85,20 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
   const genRef = useRef(0) // bumped on every reset so late responses from an old query are dropped
   const loadingRef = useRef(false)
   const lastClicked = useRef<string | null>(null)
-  const stateRef = useRef({ filters, sort, pins, selectedIds })
-  stateRef.current = { filters, sort, pins, selectedIds }
+  // The server evaluates every filter; the search text is debounced so typing does not fire a query per key.
+  const serverFilters = useMemo(() => ({ ...filters, query: debouncedQuery }), [filters, debouncedQuery])
+  const stateRef = useRef({ filters, serverFilters, sort, pins, selectedIds })
+  stateRef.current = { filters, serverFilters, sort, pins, selectedIds }
 
-  const serverKey = JSON.stringify([sort, filters.status, filters.project, filters.group, filters.includeArchived])
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(filters.query), SEARCH_DEBOUNCE_MS)
+    return () => clearTimeout(t)
+  }, [filters.query])
+
+  const serverKey = JSON.stringify([sort, filtersToQuery(serverFilters)])
 
   const fetchPage = useCallback(async (reset: boolean) => {
-    const { filters: f, sort: s } = stateRef.current
+    const { serverFilters: f, sort: s } = stateRef.current
     if (!reset && loadingRef.current) return
     const gen = reset ? ++genRef.current : genRef.current
     const offset = reset ? 0 : offsetRef.current
@@ -96,10 +109,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
         sort: s,
         limit: PAGE_SIZE,
         offset,
-        include_archived: f.includeArchived,
-        project: f.project,
-        group: f.group,
-        status: f.status,
+        ...filtersToQuery(f),
       })
       if (gen !== genRef.current) return
       offsetRef.current = offset + page.length
@@ -140,30 +150,49 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
     refreshProjects()
   }, [serverKey, fetchPage, refreshPins, refreshProjects])
 
-  // Tag/date/text filters have no server parameter, so while one is active pull the remaining pages.
-  const needAll = hasClientFilters(filters)
+  const facetsTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refreshFacets = useCallback(async () => {
+    const f = stateRef.current.filters
+    try {
+      setFacets(await api.getRunFacets({ project: f.project, include_archived: f.includeArchived }))
+    } catch {
+      // keep the previous options
+    }
+  }, [])
+  /** Trailing-throttled: bursts of run events cost one facets query. */
+  const scheduleFacets = useCallback(() => {
+    if (facetsTimer.current) return
+    facetsTimer.current = setTimeout(() => {
+      facetsTimer.current = null
+      refreshFacets()
+    }, FACETS_REFRESH_MS)
+  }, [refreshFacets])
   useEffect(() => {
-    if (needAll && !loading && !serverDown && offsetRef.current < total) fetchPage(false)
-  }, [needAll, loading, serverDown, total, runs, fetchPage])
+    refreshFacets()
+  }, [filters.project, filters.includeArchived, refreshFacets])
 
-  // Live runs change without a run_updated event (metrics arrive); re-read the first page now and then.
-  const anyRunning = runs.some((r) => r.status === 'running') || pins.some((r) => r.status === 'running')
-  useEffect(() => {
-    if (!anyRunning) return
-    const t = setInterval(async () => {
-      const { filters: f, sort: s } = stateRef.current
+  // Live runs: the server pushes a throttled run_activity event when a run ingests data. Re-read the first
+  // page (cheap, one query) at most every ACTIVITY_REFRESH_MS instead of polling.
+  const activityTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const scheduleActivityRefresh = useCallback(() => {
+    if (activityTimer.current) return
+    activityTimer.current = setTimeout(async () => {
+      activityTimer.current = null
+      const { serverFilters: f, sort: s } = stateRef.current
       try {
-        const { runs: page } = await api.listRuns({
-          sort: s, limit: PAGE_SIZE, include_archived: f.includeArchived, project: f.project, group: f.group, status: f.status,
-        })
+        const { runs: page } = await api.listRuns({ sort: s, limit: PAGE_SIZE, ...filtersToQuery(f) })
         setRuns((prev) => mergeRuns(prev, page, s))
         setServerDown(false)
+        if (stateRef.current.pins.length > 0) refreshPins() // pinned runs may have changed status
       } catch {
         setServerDown(true)
       }
-    }, 10000)
-    return () => clearInterval(t)
-  }, [anyRunning])
+    }, ACTIVITY_REFRESH_MS)
+  }, [refreshPins])
+  useEffect(() => () => {
+    if (activityTimer.current) clearTimeout(activityTimer.current)
+    if (facetsTimer.current) clearTimeout(facetsTimer.current)
+  }, [])
 
   useEffect(() => {
     const h = () => refreshPins()
@@ -180,7 +209,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
   const upsert = useCallback(async (runId: string) => {
     try {
       const run = await api.getRun(runId)
-      const { filters: f, sort: s, pins: p } = stateRef.current
+      const { serverFilters: f, sort: s, pins: p } = stateRef.current
       setRuns((prev) => applyLiveRun(prev, run, f, s))
       const isPinned = p.some((x) => x.run_id === runId)
       if (isPinned && !matchesFilters(run, f)) setPins((prev) => removeRun(prev, runId))
@@ -193,18 +222,24 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
 
   useWebSocket((msg) => {
     switch (msg.type) {
+      case 'run_activity':
+        scheduleActivityRefresh()
+        break
       case 'run_created':
       case 'run_updated':
       case 'run_moved':
         upsert(msg.run_id)
+        scheduleFacets()
         break
       case 'run_deleted':
         drop(msg.run_id)
+        scheduleFacets()
         break
       case 'project_updated':
         fetchPage(true)
         refreshPins()
         refreshProjects()
+        refreshFacets()
         break
       case 'project_deleted': {
         const gone = (msg as { project?: string }).project
@@ -212,6 +247,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
         else fetchPage(true)
         refreshPins()
         refreshProjects()
+        refreshFacets()
         break
       }
     }
@@ -225,10 +261,21 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
     () => [...visiblePins.map((r) => r.run_id), ...visibleRunIds(items, collapsed)],
     [visiblePins, items, collapsed],
   )
-  const tagChoices = useMemo(() => [...new Set([...filters.tags, ...collectTags([...runs, ...pins])])], [runs, pins, filters.tags])
+  // Filter options come from the server (all visible runs, not just the loaded pages); loaded runs are the fallback.
+  const tagChoices = useMemo(
+    () => [...new Set([...filters.tags, ...(facets ? facets.tags.slice(0, 20).map((t) => t.tag) : collectTags([...runs, ...pins]))])],
+    [facets, runs, pins, filters.tags],
+  )
   const groupChoices = useMemo(
-    () => [...new Set([...(filters.group ? [filters.group] : []), ...runs.map((r) => r.group).filter((g): g is string => !!g)])].sort(),
-    [runs, filters.group],
+    () => [...new Set([
+      ...(filters.group ? [filters.group] : []),
+      ...(facets ? facets.groups.map((g) => g.group) : runs.map((r) => r.group).filter((g): g is string => !!g)),
+    ])].sort(),
+    [facets, runs, filters.group],
+  )
+  const groupFacets = useMemo(
+    () => new Map((facets?.groups ?? []).map((g) => [`${g.project}\u0000${g.group}`, g])),
+    [facets],
   )
   const selectedSet = new Set(selectedIds)
   const isComparing = selectedIds.length >= 2
@@ -323,6 +370,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
     if (it.kind === 'run') return renderRun(it.run, false)
     const open = !collapsed.has(it.key)
     const ids = it.runs.map((r) => r.run_id)
+    const gf = groupFacets.get(it.key)
     const allSel = ids.every((id) => selectedSet.has(id))
     return (
       <div key={it.key}>
@@ -349,9 +397,11 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
             <div className="flex items-center gap-1.5 min-w-0">
               <span style={{ color: '#8b8fa8', fontSize: 9 }}>{open ? '▾' : '▸'}</span>
               <span className="truncate text-xs font-semibold" style={{ color: '#e8eaf0' }}>{it.group}</span>
-              <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>{it.runs.length}</span>
+              <span className="text-xs font-mono" style={{ color: '#4a4e60' }} title={gf && gf.runs > it.runs.length ? `${it.runs.length} of ${gf.runs} runs loaded` : undefined}>
+                {gf && gf.runs > it.runs.length ? `${it.runs.length}/${gf.runs}` : it.runs.length}
+              </span>
             </div>
-            <div className="pl-[15px] text-xs font-mono truncate" style={{ color: '#4a4e60' }}>{it.summary}</div>
+            <div className="pl-[15px] text-xs font-mono truncate" style={{ color: '#4a4e60' }}>{gf ? summarizeStatuses(gf.statuses) : it.summary}</div>
           </button>
         </div>
         {open && it.runs.map((r) => renderRun(r, true))}
@@ -415,7 +465,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
             </select>
             <select aria-label="Status" value={filters.status} onChange={(e) => setFilter({ status: e.target.value })} className={field}>
               <option value="">Any status</option>
-              {Object.keys(STATUS_COLOR).map((s) => <option key={s} value={s}>{s}</option>)}
+              {Object.keys(STATUS_COLOR).map((s) => <option key={s} value={s}>{s}{facets?.statuses[s] ? ` (${facets.statuses[s]})` : ''}</option>)}
             </select>
             <select aria-label="Group" value={filters.group} onChange={(e) => setFilter({ group: e.target.value })} className={field}>
               <option value="">Any group</option>

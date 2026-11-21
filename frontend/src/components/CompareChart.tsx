@@ -1,9 +1,10 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Area,
   CartesianGrid,
   ComposedChart,
   Line,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
@@ -14,7 +15,12 @@ import type { Metric } from '../api/types.ts'
 import { formatMetricValue } from '../utils/format.ts'
 import { MAX_ALPHA, formatLogTick, logTicks, positiveRange, processSeries, useChartOptions } from '../utils/chartOptions.ts'
 import type { ChartOptions } from '../utils/chartOptions.ts'
-import { axisLabel, axisMetricName, formatXLabel, formatXTick, resolveXs, runHasAxis } from '../utils/xAxis.ts'
+import { axisLabel, axisMetricName, firstTimestamp, formatXLabel, formatXTick, resolveXs, runHasAxis } from '../utils/xAxis.ts'
+import { maxPointsForWidth, zoomQuery } from '../utils/series.ts'
+import type { RangeQuery } from '../utils/series.ts'
+import { useDragZoom } from '../hooks/useDragZoom.ts'
+import { useZoomFetch } from '../hooks/useZoomFetch.ts'
+import type { ExternalZoom } from './MetricChart.tsx'
 import type { XSource } from '../utils/xAxis.ts'
 import { aggregate } from '../utils/grouping.ts'
 import type { BandKind } from '../utils/grouping.ts'
@@ -46,6 +52,15 @@ interface Props {
   /** When set, runs are aggregated per group (mean line + band) instead of drawn individually. */
   groups?: GroupSeries[]
   band?: BandKind
+  /**
+   * Self-managed zoom: drag-select refetches the window at full resolution, per run (a step window for step and
+   * metric axes, a timestamp window for time axes), then the usual grouping/EMA/log options apply to it.
+   */
+  fetchRange?: (runId: string, name: string, query: RangeQuery, maxPoints: number) => Promise<Metric[]>
+  /** Zoom owned by the parent (series are already windowed). */
+  zoom?: ExternalZoom
+  /** Bump to re-fetch the zoomed window of live runs. */
+  refreshKey?: number
 }
 
 interface Merged {
@@ -140,13 +155,18 @@ function mergeGroupedData(
 
 export default function CompareChart({
   metricName,
-  series,
+  series: baseSeries,
   globalHiddenIds,
   expanded = false,
-  groups,
+  groups: baseGroups,
   band = 'std',
+  fetchRange,
+  zoom: externalZoom,
+  refreshKey,
 }: Props) {
   const [opts, setOpts, resetOpts, overridden] = useChartOptions(`compare:${metricName}`)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const shownRef = useRef<RunSeries[]>([])
   const { alpha } = opts
 
   const [isExpanded, setIsExpanded] = useState(false)
@@ -170,13 +190,73 @@ export default function CompareChart({
     setOpts({ alpha: Math.min(MAX_ALPHA, Math.max(0, alpha + (e.deltaY < 0 ? 0.05 : -0.05))) })
   }, [alpha, setOpts])
 
-  const hasAxisSelector = series.some((s) => s.source)
+  const hasAxisSelector = baseSeries.some((s) => s.source)
   const axisNames = useMemo(() => {
     const names = new Set<string>()
-    for (const s of series) for (const n of Object.keys(s.source?.byName ?? {})) names.add(n)
+    for (const s of baseSeries) for (const n of Object.keys(s.source?.byName ?? {})) names.add(n)
     return [...names].sort()
-  }, [series])
+  }, [baseSeries])
   const axis = hasAxisSelector ? opts.xAxis : 'step'
+
+  // Zoom: per run, fetch the window (metric + axis metric) at full resolution and show that instead.
+  const self = useZoomFetch<Record<string, { metrics: Metric[]; axisData: Metric[] | null }>>(
+    fetchRange && !externalZoom
+      ? async (z) => {
+          const mp = maxPointsForWidth(wrapRef.current?.clientWidth ?? 600)
+          const axisName = axisMetricName(z.axis)
+          let any = false
+          const entries = await Promise.all(
+            baseSeries.map(async (run) => {
+              const shown = shownRef.current.find((r) => r.runId === run.runId) ?? run
+              const pts = resolveXs(shown.metrics, z.axis, shown.source ?? {}).points
+              const q = zoomQuery(z, pts, run.source?.startTime ?? firstTimestamp(run.metrics) ?? 0)
+              if (!q) return [run.runId, { metrics: [], axisData: null }] as const
+              any = true
+              const [metrics, axisData] = await Promise.all([
+                fetchRange(run.runId, metricName, q, mp),
+                axisName ? fetchRange(run.runId, axisName, q, mp) : Promise.resolve(null),
+              ])
+              return [run.runId, { metrics, axisData }] as const
+            }),
+          )
+          return any ? Object.fromEntries(entries) : null
+        }
+      : undefined,
+    refreshKey,
+  )
+  useEffect(() => {
+    if (self.zoom && self.zoom.axis !== axis) self.reset()
+  }, [axis, self])
+  const zoomed = externalZoom ? externalZoom.active : !!(self.zoom && self.data)
+  const zoomable = !!(externalZoom || fetchRange)
+  const zoomWin = !externalZoom && self.zoom && self.data ? self.data : null
+  const zoomedRun = useCallback((run: RunSeries): RunSeries => {
+    const w = zoomWin?.[run.runId]
+    if (!w) return run
+    const axisName = axisMetricName(axis)
+    return {
+      ...run,
+      metrics: w.metrics,
+      source: run.source && {
+        ...run.source,
+        startTime: run.source.startTime ?? firstTimestamp(run.metrics),
+        byName: axisName && w.axisData ? { ...run.source.byName, [axisName]: w.axisData } : run.source.byName,
+        interpolate: true,
+      },
+    }
+  }, [zoomWin, axis])
+  const series = useMemo(() => baseSeries.map(zoomedRun), [baseSeries, zoomedRun])
+  shownRef.current = series
+  const groups = useMemo(
+    () => baseGroups?.map((g) => ({ ...g, runs: g.runs.map(zoomedRun) })),
+    [baseGroups, zoomedRun],
+  )
+  const onSelect = useMemo(
+    () => (zoomable ? (x0: number, x1: number) => (externalZoom ?? { onSelect: self.select }).onSelect({ axis, x0, x1 }) : undefined),
+    [zoomable, externalZoom, self.select, axis],
+  )
+  const resetZoom = externalZoom ? externalZoom.onReset : self.reset
+  const { area, handlers } = useDragZoom(onSelect)
   // Runs lacking the chosen axis metric cannot be placed: excluded with a note.
   const excluded = series.filter((s) => !runHasAxis(s.source ?? {}, axis))
   const visibleSeries = series.filter(
@@ -227,6 +307,7 @@ export default function CompareChart({
   return (
     <>
       <div
+        ref={wrapRef}
         className="rounded-lg p-4 flex flex-col"
         style={{ backgroundColor: '#111318', border: '1px solid #252830', height: '100%' }}
         onWheel={onWheel}
@@ -238,7 +319,19 @@ export default function CompareChart({
               {metricName}
             </span>
           </div>
-          {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
+          <div className="flex items-center gap-2">
+            {zoomed && (
+              <button
+                onClick={resetZoom}
+                title="Back to the full range"
+                className="text-xs font-mono"
+                style={{ background: 'none', border: '1px solid #353840', borderRadius: 4, color: '#f59e0b', padding: '0 6px', cursor: 'pointer' }}
+              >
+                reset zoom{self.loading ? ' …' : ''}
+              </button>
+            )}
+            {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
+          </div>
         </div>
         <ChartControls
           opts={opts}
@@ -287,7 +380,7 @@ export default function CompareChart({
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={chartHeight}>
-              <ComposedChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+              <ComposedChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 0 }} {...handlers} style={onSelect ? { cursor: 'crosshair', userSelect: 'none' } : undefined}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" vertical={false} />
                 <XAxis
                   dataKey="x"
@@ -336,6 +429,7 @@ export default function CompareChart({
                   itemStyle={{ padding: '1px 0' }}
                   cursor={{ stroke: '#353840', strokeWidth: 1 }}
                 />
+                {area && <ReferenceArea x1={area[0]} x2={area[1]} fill="#f59e0b" fillOpacity={0.12} stroke="#f59e0b" strokeOpacity={0.4} />}
                 {groups && visibleGroups.map((g) => (
                   <Area
                     key={`${g.id}__band`}
@@ -399,7 +493,7 @@ export default function CompareChart({
           {!expanded && (
             <div className="mt-1 text-right">
               <span className="text-xs font-mono" style={{ color: '#2a2d38' }}>
-                shift+scroll to smooth
+                {zoomable ? 'drag to zoom · ' : ''}shift+scroll to smooth{self.failed ? ' · zoom fetch failed' : ''}
               </span>
             </div>
           )}
@@ -410,10 +504,13 @@ export default function CompareChart({
         <ExpandModal onClose={() => setIsExpanded(false)}>
           <CompareChart
             metricName={metricName}
-            series={series}
+            series={baseSeries}
             globalHiddenIds={globalHiddenIds}
-            groups={groups}
+            groups={baseGroups}
             band={band}
+            fetchRange={fetchRange}
+            zoom={externalZoom}
+            refreshKey={refreshKey}
             expanded
           />
         </ExpandModal>

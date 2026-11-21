@@ -16,6 +16,11 @@ interface Props {
   runId: string
 }
 
+/** File-backed images load by URL (no base64 in the list response); rows without one fall back to inline data. */
+function imageSrc(item: MediaItem): string {
+  return item.url ?? `data:image/png;base64,${item.data ?? ''}`
+}
+
 function HistogramChart({ data }: { data: string }) {
   const parsed = useMemo(() => {
     try {
@@ -141,7 +146,7 @@ export default function MediaGallery({ runId }: Props) {
             no data
           </div>
         ) : mediaType === 'histogram' ? (
-          <HistogramChart data={currentItem.data} />
+          <HistogramChart data={currentItem.data ?? ''} />
         ) : (
           <div
             className="flex items-center justify-center"
@@ -149,7 +154,9 @@ export default function MediaGallery({ runId }: Props) {
             onClick={() => setExpandedItem(currentItem)}
           >
             <img
-              src={`data:image/png;base64,${currentItem.data}`}
+              src={imageSrc(currentItem)}
+              loading="lazy"
+              decoding="async"
               alt={currentItem.name}
               style={{ maxWidth: '100%', maxHeight: 280, objectFit: 'contain', borderRadius: 4 }}
             />
@@ -181,7 +188,7 @@ export default function MediaGallery({ runId }: Props) {
         <ExpandModal onClose={() => setExpandedItem(null)}>
           <div className="flex items-center justify-center p-4">
             <img
-              src={`data:image/png;base64,${expandedItem.data}`}
+              src={imageSrc(expandedItem)}
               alt={expandedItem.name}
               style={{ maxWidth: '90vw', maxHeight: '80vh', objectFit: 'contain' }}
             />

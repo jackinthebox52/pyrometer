@@ -1,10 +1,18 @@
 import * as d3 from 'd3'
 import { useEffect, useRef, useState } from 'react'
 import type { ParamStat } from '../api/types.ts'
+import { api } from '../api/client.ts'
+import type { Metric } from '../api/types.ts'
+import { binHeatmap } from '../utils/heatmap.ts'
+import type { RangeQuery } from '../utils/series.ts'
 import MetricChart from './MetricChart.tsx'
 
 interface Props {
   stats: ParamStat[]
+  /** With a run id the detail charts of a selected parameter can be zoomed (refetched at full resolution). */
+  runId?: string
+  /** Bump when new stats arrive so zoomed windows refresh. */
+  refreshKey?: number
 }
 
 const NAME_COL_W = 76
@@ -24,7 +32,7 @@ function normColor(t: number): string {
   return `rgb(${Math.round(245 - u * 6)},${Math.round(158 - u * 90)},${Math.round(11 + u * 57)})`
 }
 
-export default function GradientHeatmap({ stats }: Props) {
+export default function GradientHeatmap({ stats, runId, refreshKey }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const svgRef = useRef<SVGSVGElement>(null)
   const tooltipRef = useRef<HTMLDivElement>(null)
@@ -59,15 +67,12 @@ export default function GradientHeatmap({ stats }: Props) {
       }
     }
 
-    const steps = [...new Set(stats.map((s) => s.step))].sort((a, b) => a - b)
+    // Shared column grid, at most one column per MIN_CELL_W pixels (parameters are downsampled separately
+    // by the server, so their steps differ; binning aligns them).
+    const maxCols = Math.max(1, Math.floor((containerWidth - NAME_COL_W - LEFT_PAD) / (MIN_CELL_W + CELL_GAP)))
+    const { steps, ends, cells: matrix } = binHeatmap(stats, maxCols)
 
     if (paramNames.length === 0 || steps.length === 0) return
-
-    // (paramName, step) → grad_norm lookup
-    const matrix = new Map<string, number>()
-    for (const s of stats) {
-      matrix.set(`${s.param_name}::${s.step}`, s.grad_norm)
-    }
 
     // Log-scale normalization
     const allNorms = stats.map((s) => s.grad_norm).filter((v) => v > 0)
@@ -132,7 +137,7 @@ export default function GradientHeatmap({ stats }: Props) {
 
       // Cells
       steps.forEach((step, colIdx) => {
-        const norm = matrix.get(`${pname}::${step}`) ?? 0
+        const norm = matrix.get(`${pname}::${colIdx}`) ?? 0
         const x = NAME_COL_W + LEFT_PAD + colIdx * (cellW + CELL_GAP)
 
         rowG
@@ -153,7 +158,7 @@ export default function GradientHeatmap({ stats }: Props) {
             tooltip.style.display = 'block'
             tooltip.innerHTML =
               `<span style="color:#8b8fa8">${displayName}</span><br/>` +
-              `step <span style="color:#f59e0b">${step}</span>&nbsp;&nbsp;` +
+              `step <span style="color:#f59e0b">${ends[colIdx] !== step ? `${step}–${ends[colIdx]}` : step}</span>&nbsp;&nbsp;` +
               `grad_norm <span style="color:#f59e0b">${norm > 0 ? norm.toExponential(3) : '—'}</span>`
           })
           .on('mouseleave', () => {
@@ -178,6 +183,14 @@ export default function GradientHeatmap({ stats }: Props) {
     name: 'weight_norm',
     value: s.weight_norm,
   }))
+
+  const fetchRange = runId && selectedParam
+    ? async (name: string, q: RangeQuery, maxPoints: number): Promise<Metric[]> => {
+        const rows = await api.getParamStats(runId, selectedParam, { ...q, max_points: maxPoints })
+        const key = name === 'weight_norm' ? 'weight_norm' : 'grad_norm'
+        return rows.map((r) => ({ step: r.step, timestamp: r.timestamp, name, value: r[key] }))
+      }
+    : undefined
 
   if (stats.length === 0) return null
 
@@ -269,10 +282,10 @@ export default function GradientHeatmap({ stats }: Props) {
             style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' }}
           >
             {gradNormSeries.length > 0 && (
-              <MetricChart name="grad_norm" data={gradNormSeries} lineColor="#f59e0b" />
+              <MetricChart key={`g${selectedParam}`} name="grad_norm" data={gradNormSeries} lineColor="#f59e0b" fetchRange={fetchRange} refreshKey={refreshKey} />
             )}
             {weightNormSeries.length > 0 && (
-              <MetricChart name="weight_norm" data={weightNormSeries} lineColor="#60a5fa" />
+              <MetricChart key={`w${selectedParam}`} name="weight_norm" data={weightNormSeries} lineColor="#60a5fa" fetchRange={fetchRange} refreshKey={refreshKey} />
             )}
           </div>
         </div>

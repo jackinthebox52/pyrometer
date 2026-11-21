@@ -275,6 +275,11 @@ List the runs the caller can see, **most recently active first** by default.
 | `group` | Only runs with this `group` |
 | `project` | Only runs of this project |
 | `status` | Only runs with this status |
+| `q` | Case-insensitive substring of the run name, group or any tag (`%` and `_` are literal) |
+| `tags` | Comma-separated; the run must carry **all** of them (exact match) |
+| `created_after`, `created_before` | Bounds on `created_at`: Unix seconds or an ISO 8601 date/time (naive = UTC). After is inclusive, before exclusive. Anything else is a `400` |
+
+All filters are bound parameters and compose with each other, `include_archived`, `sort` and paging (`meta.total` counts matches).
 
 **Response**:
 
@@ -305,6 +310,23 @@ List the runs the caller can see, **most recently active first** by default.
 `pinned` is the caller's own pin (always `false` for API keys). Offset paging is not a snapshot: a run that becomes active between
 two page requests moves in the `updated` order, so a client paging live data may see a run twice or miss one. `GET /runs/{run_id}` returns the same extra fields
 (`updated_at`, `group`, `archived`, `pinned`) plus `notes` and the hardware fields.
+
+---
+
+### `GET /runs/facets`
+
+Filter options for the run list over every project the caller can see (so no project name or tag of a private project leaks).
+Params: `project` (restrict), `include_archived` (default `false`). Response `data`:
+
+```json
+{"groups": [{"project": "default", "group": "lr-sweep", "runs": 6, "running": 2,
+             "statuses": {"running": 2, "completed": 4}, "last_activity": "2024-01-15T11:02:11+00:00"}],
+ "tags": [{"tag": "baseline", "runs": 12}],
+ "statuses": {"running": 3, "completed": 20}}
+```
+
+`groups` are most recently active first, `tags` most used first (top 200). Unlike `GET /projects/{name}/groups` this works across projects
+and reports the status breakdown.
 
 ---
 
@@ -1402,6 +1424,7 @@ The server broadcasts JSON events to all connected clients:
 | `system` | `POST /runs/{id}/system` | New system snapshot |
 | `param_stats` | `POST /runs/{id}/param-stats` | New gradient stats |
 | `logs` | `POST /runs/{id}/logs` | New console logs |
+| `run_activity` | any successful ingest for a run (metrics, system, param stats, events, logs, artifacts, media, samples, profile) | `{"type", "run_id"}`. Throttled to one per run per 2 s (separate from the 500 ms per-type throttle) and delivered only to users who can read the run. Lets run lists refresh `updated_at`/order without polling |
 | `run_updated` (also) | archive / unarchive / bulk tag | Run organisation changed (refetch the run) |
 | `run_deleted` | `DELETE /runs/{id}`, bulk delete, or a move away from a project you can read | `{"type", "run_id", "project"?, "reason"?: "moved"}`: drop the run from lists |
 | `run_moved` | `POST /runs/{id}/move` | `{"type", "run_id", "project"}`: sent to users who can read both projects. Users who could only read the old project get `run_deleted` (`"reason": "moved"`), users who can only read the new one get `run_created` |

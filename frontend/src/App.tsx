@@ -1,11 +1,24 @@
-import { useState } from 'react'
-import { HashRouter, Route, Routes } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { HashRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { decodeIds } from './utils/compareState.ts'
 import LoginGate from './components/LoginGate.tsx'
 import RunSidebar from './components/RunSidebar.tsx'
 import CompareView from './pages/CompareView.tsx'
 import EmptyState from './pages/EmptyState.tsx'
 import RunDetailPage from './pages/RunDetailPage.tsx'
 import SettingsPage from './pages/SettingsPage.tsx'
+
+/** Opening or navigating (back/forward) to a compare URL makes its run ids the sidebar selection. */
+function SelectionFromUrl({ onIds }: { onIds: (ids: string[]) => void }) {
+  const { pathname, search } = useLocation()
+  const ids = pathname === '/compare' ? decodeIds(new URLSearchParams(search)).join(',') : null
+  useEffect(() => {
+    if (ids) onIds(ids.split(','))
+    // only a change of the URL's ids replaces the selection, not the user's later sidebar edits
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ids])
+  return null
+}
 
 export default function App() {
   const [selectedIds, setSelectedIds] = useState<string[]>([])
@@ -30,6 +43,7 @@ export default function App() {
   return (
     <LoginGate>
     <HashRouter>
+      <SelectionFromUrl onIds={setSelectedIds} />
       <div className="flex h-screen overflow-hidden bg-py-base">
         <RunSidebar
           selectedIds={selectedIds}

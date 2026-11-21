@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client.ts'
 import type { Metric, ProfileEvent, Run } from '../api/types.ts'
@@ -10,7 +10,17 @@ import KernelTimeline from '../components/KernelTimeline.tsx'
 import SamplesViewer from '../components/SamplesViewer.tsx'
 import StatusBadge from '../components/StatusBadge.tsx'
 import type { XSource } from '../utils/xAxis.ts'
-import { useCompareState } from '../utils/compareState.ts'
+import {
+  decodeChartDefaults,
+  decodeIds,
+  sameChartDefaults,
+  useCompareState,
+  withChartDefaults,
+  withCompareState,
+} from '../utils/compareState.ts'
+import { setChartDefaults, useChartDefaults } from '../utils/chartOptions.ts'
+import { maxPointsForWidth } from '../utils/series.ts'
+import type { RangeQuery } from '../utils/series.ts'
 import { groupRuns, parseIgnoreKeys } from '../utils/grouping.ts'
 import type { BandKind, GroupMode } from '../utils/grouping.ts'
 import { duration, timeAgo } from '../utils/format.ts'
@@ -36,23 +46,62 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 export default function CompareView() {
-  const [searchParams] = useSearchParams()
-  const runIds = useMemo(
-    () => (searchParams.get('ids') ?? '').split(',').filter(Boolean),
-    [searchParams],
-  )
+  const [searchParams, setSearchParams] = useSearchParams()
+  const runIds = useMemo(() => decodeIds(searchParams), [searchParams])
 
   const [runs, setRuns] = useState<Run[]>([])
   const [metricsMap, setMetricsMap] = useState<Map<string, Metric[]>>(new Map())
+  const [thinned, setThinned] = useState<Set<string>>(new Set()) // runs whose metrics the server downsampled
   const [profileMap, setProfileMap] = useState<Map<string, ProfileEvent[]>>(new Map())
   const [globalHiddenIds, setGlobalHiddenIds] = useState<Set<string>>(new Set())
-  const [{ groupMode, ignoreText, band }, setCompareState] = useCompareState()
+  const [compareState, setCompareState] = useCompareState()
+  const { groupMode, ignoreText, band } = compareState
+  const compareStateRef = useRef(compareState)
+  compareStateRef.current = compareState
   const [profilerOpen, setProfilerOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const runIdsKey = runIds.join(',')
+
+  // The URL is the source of truth for grouping and chart defaults; make it complete (so it can be shared)
+  // and keep the chart defaults (a global, localStorage-backed setting) and the URL in step both ways.
+  const chartDefaults = useChartDefaults()
+  const pendingApply = useRef(false)
+  useEffect(() => {
+    const fromUrl = decodeChartDefaults(searchParams)
+    if (fromUrl && !sameChartDefaults(fromUrl, chartDefaults)) {
+      pendingApply.current = true
+      setChartDefaults(fromUrl)
+    }
+    let next = searchParams
+    if (!fromUrl) next = withChartDefaults(next, chartDefaults)
+    if (!next.has('group')) next = withCompareState(next, compareStateRef.current)
+    if (next !== searchParams) setSearchParams(next, { replace: true })
+    // chartDefaults is read on purpose without being a dependency: this reacts to URL changes only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+  useEffect(() => {
+    if (pendingApply.current) {
+      pendingApply.current = false
+      return
+    }
+    const fromUrl = decodeChartDefaults(searchParams)
+    if (!fromUrl || !sameChartDefaults(fromUrl, chartDefaults)) {
+      setSearchParams((prev) => withChartDefaults(prev, chartDefaults), { replace: true })
+    }
+    // only a change of the defaults themselves writes the URL
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartDefaults])
+
+  /** Charts are at most ~1100px wide here: about two points per pixel from the server. */
+  const pageMax = useMemo(() => maxPointsForWidth(Math.min(Math.max(window.innerWidth - 320, 380), 1100)), [])
+  const fetchRange = useCallback(
+    async (runId: string, name: string, q: RangeQuery, maxPoints: number): Promise<Metric[]> =>
+      (await api.getMetricsSeries(runId, name, { ...q, max_points: maxPoints })).data,
+    [],
+  )
 
   useEffect(() => {
     if (runIds.length === 0) {
@@ -68,7 +117,7 @@ export default function CompareView() {
       try {
         const [runsData, metricsData, profileSteps] = await Promise.all([
           Promise.all(runIds.map((id) => api.getRun(id))),
-          Promise.all(runIds.map((id) => api.getMetrics(id))),
+          Promise.all(runIds.map((id) => api.getMetricsSeries(id, undefined, { max_points: pageMax }))),
           Promise.all(runIds.map((id) => api.getProfileSteps(id))),
         ])
         const profileData = await Promise.all(
@@ -81,8 +130,9 @@ export default function CompareView() {
         if (!mounted) return
         setRuns(runsData)
         const map = new Map<string, Metric[]>()
-        runIds.forEach((id, i) => map.set(id, metricsData[i]))
+        runIds.forEach((id, i) => map.set(id, metricsData[i].data))
         setMetricsMap(map)
+        setThinned(new Set(runIds.filter((_, i) => metricsData[i].downsampled)))
         const pmap = new Map<string, ProfileEvent[]>()
         runIds.forEach((id, i) => pmap.set(id, profileData[i]))
         setProfileMap(pmap)
@@ -109,10 +159,10 @@ export default function CompareView() {
       const byName: Record<string, Metric[]> = {}
       for (const m of metricsMap.get(run.run_id) ?? []) (byName[m.name] ??= []).push(m)
       for (const k of Object.keys(byName)) byName[k].sort((a, b) => a.step - b.step)
-      out.set(run.run_id, { byName, startTime: Date.parse(run.created_at) / 1000 })
+      out.set(run.run_id, { byName, startTime: Date.parse(run.created_at) / 1000, interpolate: thinned.has(run.run_id) })
     }
     return out
-  }, [runs, metricsMap])
+  }, [runs, metricsMap, thinned])
 
   const grouped = groupMode !== 'none'
   const groups = useMemo(
@@ -269,7 +319,7 @@ export default function CompareView() {
               <span>ignore</span>
               <input
                 value={ignoreText}
-                onChange={(e) => changeGrouping(() => setCompareState({ ignoreText: e.target.value }))}
+                onChange={(e) => changeGrouping(() => setCompareState({ ignoreText: e.target.value }, true))}
                 placeholder="seed"
                 title="Comma-separated hyperparam keys to ignore when matching runs"
                 style={{ width: 90, backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4, padding: '0 4px' }}
@@ -314,6 +364,7 @@ export default function CompareView() {
                   }))}
                   globalHiddenIds={globalHiddenIds}
                   band={band}
+                  fetchRange={fetchRange}
                   groups={
                     grouped
                       ? groups.map((g, gi) => ({

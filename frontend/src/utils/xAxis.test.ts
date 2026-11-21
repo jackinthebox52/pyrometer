@@ -130,3 +130,17 @@ describe('formatting', () => {
     expect(formatXLabel('rel', 61)).toBe('elapsed 1m 1s')
   })
 })
+
+describe('resolveXs with an interpolated (downsampled) axis metric', () => {
+  const axisSeries = [m(0, 0, 0, 'tok'), m(100, 1000, 0, 'tok')]
+  it('skips missing steps by default', () => {
+    const r = resolveXs([m(50, 1)], 'metric:tok', { byName: { tok: axisSeries } })
+    expect(r.points).toEqual([])
+    expect(r.skipped).toBe(1)
+  })
+  it('interpolates inside the axis range, skips outside, prefers exact hits', () => {
+    const r = resolveXs([m(0, 1), m(50, 2), m(100, 3), m(150, 4)], 'metric:tok', { byName: { tok: axisSeries }, interpolate: true })
+    expect(r.points.map((p) => p.x)).toEqual([0, 500, 1000])
+    expect(r.skipped).toBe(1)
+  })
+})

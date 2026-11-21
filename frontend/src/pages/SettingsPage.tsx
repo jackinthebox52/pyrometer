@@ -60,6 +60,7 @@ function RetentionEditor({ project, onError }: { project: string; onError: (m: s
     }).catch((e) => onError(msg(e, 'Failed to load retention policy')))
   }, [open, project, onError])
 
+  const [confirmRun, setConfirmRun] = useState(false)
   const invalid = Object.values(days).some((v) => v !== '' && !(Number(v) > 0 && Number(v) <= 36500))
 
   async function run(fn: () => Promise<string>) {
@@ -110,16 +111,27 @@ function RetentionEditor({ project, onError }: { project: string; onError: (m: s
           </div>
           <div className="flex items-center gap-2">
             <button className={ghost} disabled={busy || invalid} onClick={save}>Save policy</button>
-            <button
-              className={ghost} disabled={busy}
-              onClick={() => window.confirm('Apply the saved policy now? Matching rows are deleted permanently.') && runNow()}
-            >
+            <button className={ghost} disabled={busy} onClick={() => setConfirmRun(true)}>
               Run now
             </button>
             {invalid && <span className="text-py-crashed">Days must be between 1 and 36500.</span>}
             {note && <span role="status" className="text-py-running">{note}</span>}
           </div>
         </div>
+      )}
+      {confirmRun && (
+        <ConfirmDialog
+          title={`Apply the retention policy to ${project} now?`}
+          confirmLabel="Delete matching rows"
+          danger
+          onCancel={() => setConfirmRun(false)}
+          onConfirm={async () => {
+            setConfirmRun(false)
+            await runNow()
+          }}
+        >
+          <p>The saved policy is applied immediately: rows older than the configured number of days are deleted permanently and the affected run summaries are recomputed. This cannot be undone.</p>
+        </ConfirmDialog>
       )}
     </div>
   )

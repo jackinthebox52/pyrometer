@@ -76,6 +76,20 @@ export interface Run {
   pinned?: boolean
 }
 
+/** `GET /runs/facets`: what the run list can be filtered by. */
+export interface RunFacets {
+  groups: {
+    project: string
+    group: string
+    runs: number
+    running: number
+    statuses: Record<string, number>
+    last_activity: string | null
+  }[]
+  tags: { tag: string; runs: number }[]
+  statuses: Record<string, number>
+}
+
 export interface Metric {
   step: number
   timestamp: number
@@ -161,7 +175,7 @@ export interface MediaItem {
   timestamp: number
   name: string
   media_type: 'image' | 'histogram' | 'figure'
-  data: string  // base64 PNG for image/figure (omitted with ?inline=false), JSON string for histogram
+  data: string | null  // base64 PNG for image/figure (omitted with ?inline=false), JSON string for histogram
   url?: string | null  // file-backed images/figures: GET this for the PNG
 }
 

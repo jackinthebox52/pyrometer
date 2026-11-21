@@ -9,7 +9,9 @@ import {
   parseTags,
   rangeBetween,
   sortRuns,
+  filtersToQuery,
   statusSummary,
+  summarizeStatuses,
   visibleRunIds,
 } from './runList.ts'
 
@@ -127,5 +129,23 @@ describe('helpers', () => {
   })
   it('parseTags trims, strips #, dedupes', () => {
     expect(parseTags(' a, #b ,a,, ')).toEqual(['a', 'b'])
+  })
+})
+
+describe('filtersToQuery', () => {
+  it('maps every filter to a server parameter', () => {
+    const q = filtersToQuery({ ...EMPTY_FILTERS, status: 'running', tags: ['a', 'b'], query: '  res ', project: 'p', group: 'g', includeArchived: true, from: '2024-03-01', to: '2024-03-01' })
+    expect(q).toMatchObject({ status: 'running', tags: 'a,b', q: 'res', project: 'p', group: 'g', include_archived: true })
+    expect(q.created_before! - q.created_after!).toBeGreaterThanOrEqual(82800) // one day (23-25h around DST)
+    expect(q.created_before! - q.created_after!).toBeLessThanOrEqual(90000)
+    expect(new Date(q.created_after! * 1000).getHours()).toBe(0)
+  })
+  it('leaves dates undefined when empty or invalid', () => {
+    const q = filtersToQuery({ ...EMPTY_FILTERS, from: 'nope' })
+    expect(q.created_after).toBeUndefined()
+    expect(q.created_before).toBeUndefined()
+  })
+  it('summarizes server status counts', () => {
+    expect(summarizeStatuses({ completed: 2, running: 1 })).toBe('1 running · 2 completed')
   })
 })

@@ -19,6 +19,21 @@ import { RunActions, RunNotes, RunTitle } from '../components/RunOrganizer.tsx'
 import { useSession } from '../hooks/useSession.ts'
 import { duration, formatBytes, formatMicroseconds, timeAgo } from '../utils/format.ts'
 import { useWebSocket } from '../hooks/useWebSocket.ts'
+import { maxPointsForWidth, mergeBuckets, needsResample, tailStart } from '../utils/series.ts'
+import type { RangeQuery, XZoom } from '../utils/series.ts'
+import type { ExternalZoom } from '../components/MetricChart.tsx'
+
+/** Chart cards are at most ~1000px wide on this page: ask the server for about two points per pixel. */
+function pagePoints(): number {
+  return maxPointsForWidth(Math.min(Math.max(window.innerWidth - 320, 320), 1000))
+}
+
+const metricKey = (m: Metric) => `${m.name}\u0000${m.step}`
+const metricOrder = (a: Metric, b: Metric) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.step - b.step)
+const snapKey = (s: SystemSnapshot) => `${s.gpu_index ?? 0}\u0000${s.timestamp}`
+const snapOrder = (a: SystemSnapshot, b: SystemSnapshot) => a.timestamp - b.timestamp || (a.gpu_index ?? 0) - (b.gpu_index ?? 0)
+const statKey = (p: ParamStat) => `${p.param_name}\u0000${p.step}`
+const statOrder = (a: ParamStat, b: ParamStat) => a.timestamp - b.timestamp || (a.param_name < b.param_name ? -1 : 1)
 
 const EFFICIENCY_COLOR: Record<string, string> = {
   A: '#22c55e',
@@ -266,6 +281,8 @@ function CollapsiblePanel({
 
 function ModelHealthSection({
   paramStats,
+  runId,
+  refreshKey,
   runEvents,
   heatmapOpen,
   setHeatmapOpen,
@@ -273,6 +290,8 @@ function ModelHealthSection({
   setAnomalyOpen,
 }: {
   paramStats: ParamStat[]
+  runId?: string
+  refreshKey?: number
   runEvents: RunEvent[]
   heatmapOpen: boolean
   setHeatmapOpen: React.Dispatch<React.SetStateAction<boolean>>
@@ -300,7 +319,7 @@ function ModelHealthSection({
 
       {heatmapOpen && (
         <>
-          <GradientHeatmap stats={paramStats} />
+          <GradientHeatmap stats={paramStats} runId={runId} refreshKey={refreshKey} />
 
           <CollapsiblePanel
             label="Events"
@@ -357,6 +376,22 @@ export default function RunDetailPage() {
   const [logs, setLogs] = useState<RunLog[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
 
+  // Series are downsampled by the server; live updates fetch only the new tail and merge it in.
+  const [metricsDownsampled, setMetricsDownsampled] = useState(false)
+  const [liveTick, setLiveTick] = useState(0) // bumps when new metrics/system/stats arrive (refreshes zoomed windows)
+  const [gpuZoom, setGpuZoom] = useState<{ t_min: number; t_max: number } | null>(null)
+  const [gpuZoomSnaps, setGpuZoomSnaps] = useState<SystemSnapshot[] | null>(null)
+  const metricsRef = useRef<Metric[]>([])
+  const snapsRef = useRef<SystemSnapshot[]>([])
+  const statsRef = useRef<ParamStat[]>([])
+  const locks = useRef<Record<string, Promise<unknown>>>({})
+  /** Serialize refreshes of one slice so two overlapping tail fetches cannot overwrite each other's merge. */
+  const serial = useCallback((key: string, fn: () => Promise<void>): Promise<void> => {
+    const next = (locks.current[key] ?? Promise.resolve()).then(fn, fn)
+    locks.current[key] = next.catch(() => {})
+    return next
+  }, [])
+
   // Stable refs so WebSocket callbacks never go stale
   const runRef = useRef<Run | null>(null)
   const mountedRef = useRef(false)
@@ -371,26 +406,70 @@ export default function RunDetailPage() {
     setRun(data)
   }, [runId])
 
-  const fetchMetrics = useCallback(async () => {
-    if (!runId || !mountedRef.current) return
-    const data = await api.getMetrics(runId)
+  const loadMetrics = useCallback(async () => {
+    const r = await api.getMetricsSeries(runId!, undefined, { max_points: pagePoints() })
     if (!mountedRef.current) return
-    setMetrics(data)
+    metricsRef.current = r.data
+    setMetrics(r.data)
+    setMetricsDownsampled(r.downsampled)
   }, [runId])
 
-  const fetchSystem = useCallback(async () => {
+  const fetchMetrics = useCallback(() => serial('metrics', async () => {
     if (!runId || !mountedRef.current) return
-    const data = await api.getSystemSnapshots(runId)
+    const held = metricsRef.current
+    const t = tailStart(held)
+    if (t === undefined) return loadMetrics()
+    const r = await api.getMetricsSeries(runId, undefined, { t_min: t })
     if (!mountedRef.current) return
-    setSnapshots(data)
+    if (r.data.length === 0) return
+    const merged = mergeBuckets(held, r.data, metricKey, metricOrder)
+    if (needsResample(merged.length, new Set(merged.map((m) => m.name)).size, pagePoints())) return loadMetrics()
+    metricsRef.current = merged
+    setMetrics(merged)
+    setLiveTick((n) => n + 1)
+  }), [runId, serial, loadMetrics])
+
+  const loadSystem = useCallback(async () => {
+    const r = await api.getSystemSeries(runId!, { max_points: pagePoints() })
+    if (!mountedRef.current) return
+    snapsRef.current = r.data
+    setSnapshots(r.data)
   }, [runId])
 
-  const fetchParamStats = useCallback(async () => {
+  const fetchSystem = useCallback(() => serial('system', async () => {
     if (!runId || !mountedRef.current) return
-    const data = await api.getParamStats(runId)
+    const held = snapsRef.current
+    const t = tailStart(held)
+    if (t === undefined) return loadSystem()
+    const r = await api.getSystemSeries(runId, { t_min: t })
+    if (!mountedRef.current || r.data.length === 0) return
+    const merged = mergeBuckets(held, r.data, snapKey, snapOrder)
+    if (needsResample(merged.length, new Set(merged.map((s) => s.gpu_index ?? 0)).size, pagePoints())) return loadSystem()
+    snapsRef.current = merged
+    setSnapshots(merged)
+    setLiveTick((n) => n + 1)
+  }), [runId, serial, loadSystem])
+
+  const loadParamStats = useCallback(async () => {
+    const r = await api.getParamStatsSeries(runId!, { max_points: pagePoints() })
     if (!mountedRef.current) return
-    setParamStats(data)
+    statsRef.current = r.data
+    setParamStats(r.data)
   }, [runId])
+
+  const fetchParamStats = useCallback(() => serial('stats', async () => {
+    if (!runId || !mountedRef.current) return
+    const held = statsRef.current
+    const t = tailStart(held)
+    if (t === undefined) return loadParamStats()
+    const r = await api.getParamStatsSeries(runId, { t_min: t })
+    if (!mountedRef.current || r.data.length === 0) return
+    const merged = mergeBuckets(held, r.data, statKey, statOrder)
+    if (needsResample(merged.length, new Set(merged.map((s) => s.param_name)).size, pagePoints())) return loadParamStats()
+    statsRef.current = merged
+    setParamStats(merged)
+    setLiveTick((n) => n + 1)
+  }), [runId, serial, loadParamStats])
 
   const fetchEvents = useCallback(async () => {
     if (!runId || !mountedRef.current) return
@@ -426,11 +505,12 @@ export default function RunDetailPage() {
 
     async function initialLoad() {
       try {
+        const pts = pagePoints()
         const [runData, metricsData, snapshotsData, paramStatsData, eventsData, logsData, artifactsData, summaryData] = await Promise.all([
           api.getRun(runId!),
-          api.getMetrics(runId!),
-          api.getSystemSnapshots(runId!),
-          api.getParamStats(runId!),
+          api.getMetricsSeries(runId!, undefined, { max_points: pts }),
+          api.getSystemSeries(runId!, { max_points: pts }),
+          api.getParamStatsSeries(runId!, { max_points: pts }),
           api.getEvents(runId!),
           api.getLogs(runId!),
           api.getArtifacts(runId!),
@@ -439,9 +519,13 @@ export default function RunDetailPage() {
         if (!mountedRef.current) return
         runRef.current = runData
         setRun(runData)
-        setMetrics(metricsData)
-        setSnapshots(snapshotsData)
-        setParamStats(paramStatsData)
+        metricsRef.current = metricsData.data
+        snapsRef.current = snapshotsData.data
+        statsRef.current = paramStatsData.data
+        setMetrics(metricsData.data)
+        setMetricsDownsampled(metricsData.downsampled)
+        setSnapshots(snapshotsData.data)
+        setParamStats(paramStatsData.data)
         setRunEvents(eventsData)
         setLogs(logsData)
         setArtifacts(artifactsData)
@@ -467,6 +551,7 @@ export default function RunDetailPage() {
 
     setLoading(true)
     setError(null)
+    setGpuZoom(null)
     initialLoad()
 
     return () => {
@@ -560,8 +645,8 @@ export default function RunDetailPage() {
   }, [metrics])
 
   const sortedSnapshots = useMemo(
-    () => [...snapshots].sort((a, b) => a.timestamp - b.timestamp),
-    [snapshots],
+    () => [...(gpuZoom && gpuZoomSnaps ? gpuZoomSnaps : snapshots)].sort((a, b) => a.timestamp - b.timestamp),
+    [snapshots, gpuZoom, gpuZoomSnaps],
   )
   const gpuIndices = useMemo(
     () => [...new Set(sortedSnapshots.map((s) => s.gpu_index ?? 0))].sort((a, b) => a - b),
@@ -572,9 +657,41 @@ export default function RunDetailPage() {
     () => ({
       byName: metricsByName,
       startTime: run ? Date.parse(run.created_at) / 1000 : undefined,
+      interpolate: metricsDownsampled,
     }),
-    [metricsByName, run],
+    [metricsByName, run, metricsDownsampled],
   )
+
+  /** Zoom refetch for metric charts: one series (or axis metric) over a step/time window at full resolution. */
+  const fetchRange = useCallback(
+    async (name: string, q: RangeQuery, maxPoints: number): Promise<Metric[]> =>
+      (await api.getMetricsSeries(runId!, name, { ...q, max_points: maxPoints })).data,
+    [runId],
+  )
+
+  // GPU charts share one zoom (they share the time axis); x is elapsed seconds since the first snapshot.
+  const gpuT0 = useMemo(() => snapshots.reduce((m, s) => Math.min(m, s.timestamp), Infinity), [snapshots])
+  const gpuExternalZoom: ExternalZoom = useMemo(
+    () => ({
+      active: gpuZoom != null,
+      onSelect: (z: XZoom) => setGpuZoom({ t_min: gpuT0 + z.x0, t_max: gpuT0 + z.x1 }),
+      onReset: () => {
+        setGpuZoom(null)
+        setGpuZoomSnaps(null)
+      },
+    }),
+    [gpuZoom, gpuT0],
+  )
+  useEffect(() => {
+    if (!gpuZoom || !runId) return
+    let live = true
+    api.getSystemSeries(runId, { ...gpuZoom, max_points: pagePoints() })
+      .then((r) => live && setGpuZoomSnaps(r.data))
+      .catch(() => {})
+    return () => {
+      live = false
+    }
+  }, [gpuZoom, runId, liveTick])
 
   if (deleted) {
     return (
@@ -613,7 +730,7 @@ export default function RunDetailPage() {
     .join(' · ')
 
   // GPUs that reported snapshots (CUDA ordinals); X-axis is elapsed seconds from the first snapshot
-  const t0 = sortedSnapshots[0]?.timestamp ?? 0
+  const t0 = Number.isFinite(gpuT0) ? gpuT0 : 0
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -776,6 +893,8 @@ export default function RunDetailPage() {
                 data={metricsByName[name]}
                 events={showEvents ? runEvents : []}
                 source={axisSource}
+                fetchRange={fetchRange}
+                refreshKey={liveTick}
               />
             ))}
           </div>
@@ -826,11 +945,11 @@ export default function RunDetailPage() {
               const displayLabel = preferKey && !hasProcess ? `${label} (device)` : label
               if (nonEmpty.length === 1) {
                 return (
-                  <MetricChart key={key} name={displayLabel} data={nonEmpty[0].metrics} lineColor={color} />
+                  <MetricChart key={key} name={displayLabel} data={nonEmpty[0].metrics} lineColor={color} zoom={gpuExternalZoom} />
                 )
               }
               return (
-                <CompareChart key={key} metricName={displayLabel} series={nonEmpty} />
+                <CompareChart key={key} metricName={displayLabel} series={nonEmpty} zoom={gpuExternalZoom} />
               )
             })}
           </div>
@@ -841,6 +960,8 @@ export default function RunDetailPage() {
       {paramStats.length > 0 && (
         <ModelHealthSection
           paramStats={paramStats}
+          runId={runId}
+          refreshKey={liveTick}
           runEvents={runEvents}
           heatmapOpen={heatmapOpen}
           setHeatmapOpen={setHeatmapOpen}

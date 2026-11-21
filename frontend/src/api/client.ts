@@ -1,4 +1,4 @@
-import type { BulkResponse, RetentionPolicy, RunListMeta, AlertRule, AlertRuleInput, ApiKey, ApiResponse, Artifact, CreatedApiKey, CreatedProject, Project, UserAccount, MediaItem, Metric, SampleStep, SamplesPage, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, Session, SystemSnapshot } from './types.ts'
+import type { RunFacets, BulkResponse, RetentionPolicy, RunListMeta, AlertRule, AlertRuleInput, ApiKey, ApiResponse, Artifact, CreatedApiKey, CreatedProject, Project, UserAccount, MediaItem, Metric, SampleStep, SamplesPage, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, Session, SystemSnapshot } from './types.ts'
 
 async function apiFetchFull<T>(path: string): Promise<{ data: T; meta?: ApiResponse<T>['meta'] }> {
   const res = await fetch(path)
@@ -38,6 +38,21 @@ async function authSend<T>(method: 'POST' | 'PATCH' | 'PUT' | 'DELETE', path: st
 
 export type RunSort = 'updated' | 'created' | 'name'
 
+/** Server-side downsampling / zoom window of the series reads (see docs/server-api.md). */
+export interface SeriesQuery {
+  max_points?: number
+  step_min?: number
+  step_max?: number
+  t_min?: number
+  t_max?: number
+}
+
+export interface SeriesResult<T> {
+  data: T[]
+  /** `downsampled` is true when the server thinned the series. */
+  downsampled: boolean
+}
+
 export interface RunQuery {
   sort?: RunSort
   limit?: number
@@ -46,12 +61,19 @@ export interface RunQuery {
   group?: string
   project?: string
   status?: string
+  /** Case-insensitive substring of name, group or a tag */
+  q?: string
+  /** Comma-separated; the run must have all of them */
+  tags?: string
+  /** Unix seconds or ISO date; created_after inclusive, created_before exclusive */
+  created_after?: string | number
+  created_before?: string | number
 }
 
-function qs(params: Record<string, string | number | boolean | undefined>): string {
+function qs(params: Record<string, string | number | boolean | undefined | null>): string {
   const p = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== '' && v !== false) p.set(k, String(v))
+    if (v !== undefined && v !== null && v !== '' && v !== false) p.set(k, String(v))
   }
   const s = p.toString()
   return s ? `?${s}` : ''
@@ -129,30 +151,40 @@ export const api = {
   }) => authSend<BulkResponse>('POST', '/runs/bulk', body),
   getRun: (id: string) => apiFetch<Run>(`/runs/${id}`),
   getMetricNames: (id: string) => apiFetch<string[]>(`/runs/${id}/metric-names`),
-  getMetrics: (id: string, name?: string) =>
-    apiFetch<Metric[]>(
-      `/runs/${id}/metrics${name ? `?name=${encodeURIComponent(name)}` : ''}`,
-    ),
-  getSystemSnapshots: (id: string) => apiFetch<SystemSnapshot[]>(`/runs/${id}/system`),
+  getMetrics: (id: string, name?: string, query: SeriesQuery = {}) =>
+    apiFetch<Metric[]>(`/runs/${id}/metrics${qs({ name, ...query })}`),
+  getMetricsSeries: async (id: string, name: string | undefined, query: SeriesQuery): Promise<SeriesResult<Metric>> => {
+    const { data, meta } = await apiFetchFull<Metric[]>(`/runs/${id}/metrics${qs({ name, ...query })}`)
+    return { data, downsampled: !!meta?.downsampled }
+  },
+  getSystemSnapshots: (id: string, query: SeriesQuery = {}) =>
+    apiFetch<SystemSnapshot[]>(`/runs/${id}/system${qs({ ...query })}`),
+  getSystemSeries: async (id: string, query: SeriesQuery): Promise<SeriesResult<SystemSnapshot>> => {
+    const { data, meta } = await apiFetchFull<SystemSnapshot[]>(`/runs/${id}/system${qs({ ...query })}`)
+    return { data, downsampled: !!meta?.downsampled }
+  },
+  getRunFacets: (opts: { project?: string; include_archived?: boolean } = {}) =>
+    apiFetch<RunFacets>(`/runs/facets${qs({ ...opts })}`),
   getProfileSteps: (id: string) => apiFetch<number[]>(`/runs/${id}/profile/steps`),
   getProfileEvents: (id: string, step?: number) =>
     apiFetch<ProfileEvent[]>(
       `/runs/${id}/profile${step !== undefined ? `?step=${step}` : ''}`,
     ),
   getParamStatNames: (id: string) => apiFetch<string[]>(`/runs/${id}/param-stats/names`),
-  getParamStats: (id: string, name?: string) =>
-    apiFetch<ParamStat[]>(
-      `/runs/${id}/param-stats${name ? `?name=${encodeURIComponent(name)}` : ''}`,
-    ),
+  getParamStats: (id: string, name?: string, query: SeriesQuery = {}) =>
+    apiFetch<ParamStat[]>(`/runs/${id}/param-stats${qs({ name, ...query })}`),
+  getParamStatsSeries: async (id: string, query: SeriesQuery): Promise<SeriesResult<ParamStat>> => {
+    const { data, meta } = await apiFetchFull<ParamStat[]>(`/runs/${id}/param-stats${qs({ ...query })}`)
+    return { data, downsampled: !!meta?.downsampled }
+  },
   getEvents: (id: string) => apiFetch<RunEvent[]>(`/runs/${id}/events`),
   getLogs: (id: string, stream?: string) =>
     apiFetch<RunLog[]>(`/runs/${id}/logs${stream ? `?stream=${encodeURIComponent(stream)}` : ''}`),
   getArtifacts: (id: string) => apiFetch<Artifact[]>(`/runs/${id}/artifacts`),
   getMediaNames: (id: string) => apiFetch<string[]>(`/runs/${id}/media/names`),
+  /** Images are loaded lazily through each item's `url` (`inline=false`: no base64 in the list). */
   getMedia: (id: string, name?: string) =>
-    apiFetch<MediaItem[]>(
-      `/runs/${id}/media${name ? `?name=${encodeURIComponent(name)}` : ''}`,
-    ),
+    apiFetch<MediaItem[]>(`/runs/${id}/media${qs({ name, inline: 'false' })}`),
   getSampleSteps: (id: string) => apiFetch<SampleStep[]>(`/runs/${id}/samples/steps`),
   getSamples: (
     id: string,

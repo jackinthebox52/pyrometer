@@ -1,6 +1,7 @@
 """FastAPI application — route handlers only. All DB access goes through db.py."""
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import duckdb
+from starlette.requests import HTTPConnection
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.background import BackgroundTask
@@ -36,6 +38,7 @@ from pyrometer.server.db import (
     db_get_media_file,
     db_is_pinned,
     db_list_groups,
+    db_run_facets,
     db_list_run_ids,
     db_move_run,
     db_pin_run,
@@ -187,11 +190,22 @@ async def _retention_sweeper() -> None:
 # Every API route requires auth by default (see auth.require_auth). Interactive docs expose the
 # schema without credentials, so they are only served in local no-auth mode.
 _local = not auth_enabled()
+
+
+async def _announce_activity(conn: HTTPConnection):
+    """Dependency: after a request that ingested data for a run (``_ingest_once`` flags it), tell the dashboards
+    with a throttled ``run_activity`` event so run lists can refresh ``updated_at`` without polling."""
+    yield
+    run_id = getattr(conn.state, "activity_run", None)
+    if run_id:
+        await _ws.broadcast({"type": "run_activity", "run_id": run_id}, throttle_key=(run_id, "activity"), throttle_ms=2000)
+
+
 app = FastAPI(
     title="Pyrometer API",
     version="0.1.0",
     lifespan=_lifespan,
-    dependencies=[Depends(require_auth)],
+    dependencies=[Depends(require_auth), Depends(_announce_activity)],
     docs_url="/docs" if _local else None,
     redoc_url="/redoc" if _local else None,
     openapi_url="/openapi.json" if _local else None,
@@ -1050,6 +1064,8 @@ def _ingest_once(run_id: str, request: Request, insert):
                 db_release_batch(run_id, batch_id[:64])
                 raise
         db_touch_run(run_id)
+        if (state := getattr(request, "state", None)) is not None:
+            state.activity_run = run_id
         return result
 
 
@@ -1147,6 +1163,10 @@ def list_runs(
     status: str | None = None,
     limit: int | None = None,
     offset: int = 0,
+    q: str | None = None,
+    tags: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
 ):
     """Visible runs. ``sort``: ``updated`` (last activity, default), ``created`` or ``name``. Archived runs
     (and runs of archived projects) are left out unless ``include_archived=true``. Optional ``group``,
@@ -1159,15 +1179,46 @@ def list_runs(
         err("limit must be at least 1", 400)
     if offset < 0:
         err("offset must not be negative", 400)
+    after, before = _parse_time(created_after, "created_after"), _parse_time(created_before, "created_before")
     principal = _principal(request)
     rows, total = db_list_runs_page(
         auth.visible_projects(principal), sort, include_archived, group, project, status,
         pinned_by=_pin_user(principal), limit=limit, offset=offset,
+        q=q, tags=_split_tags(tags), created_after=after, created_before=before,
     )
     out = ok(rows)
     if limit is not None or offset:
         out["meta"] = {"total": total, "limit": limit, "offset": offset, "returned": len(rows)}
     return out
+
+
+def _split_tags(tags: str | None) -> list[str] | None:
+    return [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+
+
+def _parse_time(value: str | None, field: str) -> float | None:
+    """Unix seconds, or an ISO 8601 date/time (naive values are UTC); ``400`` otherwise."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        err(f"{field} must be Unix seconds or an ISO 8601 date", 400)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+@app.get("/runs/facets")
+def run_facets(request: Request, project: str | None = None, include_archived: bool = False):
+    """What the run list can be filtered by, across every project the caller can see: ``groups`` (per project:
+    ``runs``, ``running``, ``statuses`` counts, ``last_activity``), ``tags`` (most used first) and ``statuses``
+    (counts over all matching runs)."""
+    return ok(db_run_facets(auth.visible_projects(_principal(request)), project, include_archived))
 
 
 @app.get("/pins")

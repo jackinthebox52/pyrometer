@@ -627,9 +627,12 @@ def db_list_runs(
     run_ids: list[str] | None = None,
     limit: int | None = None,
     offset: int = 0,
+    **filters,
 ) -> list[dict]:
     """Runs the caller may see; see ``db_list_runs_page`` (this drops the ``total``)."""
-    return db_list_runs_page(projects, sort, include_archived, group, project, status, pinned_by, run_ids, limit, offset)[0]
+    return db_list_runs_page(
+        projects, sort, include_archived, group, project, status, pinned_by, run_ids, limit, offset, **filters
+    )[0]
 
 
 def db_list_runs_page(
@@ -643,6 +646,10 @@ def db_list_runs_page(
     run_ids: list[str] | None = None,
     limit: int | None = None,
     offset: int = 0,
+    q: str | None = None,
+    tags: list[str] | None = None,
+    created_after: float | None = None,
+    created_before: float | None = None,
 ) -> tuple[list[dict], int]:
     """``(runs, total)``: runs the caller may see (``projects``: ``None`` = no restriction), newest activity first.
 
@@ -652,6 +659,9 @@ def db_list_runs_page(
     ``sort``: ``updated`` (``updated_at`` desc, the default), ``created`` (desc) or ``name`` (a-z).
     Archived runs, and runs of archived projects, are hidden unless ``include_archived``.
     ``pinned_by`` fills each run's ``pinned`` flag for that user; ``run_ids`` restricts to those runs.
+    ``q``: case-insensitive substring of the run name, group or any tag; ``tags``: the run has ALL of these
+    tags (exact); ``created_after`` (inclusive) / ``created_before`` (exclusive): Unix seconds on ``created_at``.
+    All values are bound parameters.
     """
     db_mark_stale_runs()
     clauses: list[str] = []
@@ -677,6 +687,22 @@ def db_list_runs_page(
             return [], 0
         clauses.append("r.run_id IN (SELECT unnest(?::VARCHAR[]))")
         params.append(run_ids)
+    if q and q.strip():
+        like = "%" + q.strip().lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        clauses.append(
+            "(lower(r.name) LIKE ? ESCAPE '\\' OR lower(COALESCE(r.run_group, '')) LIKE ? ESCAPE '\\' OR "
+            "len(list_filter(COALESCE(from_json(r.tags, '[\"VARCHAR\"]'), []::VARCHAR[]), lambda x: lower(x) LIKE ? ESCAPE '\\')) > 0)"
+        )
+        params += [like, like, like]
+    for tag in tags or []:
+        clauses.append("list_contains(COALESCE(from_json(r.tags, '[\"VARCHAR\"]'), []::VARCHAR[]), ?)")
+        params.append(tag)
+    if created_after is not None:
+        clauses.append("r.created_at >= ?")
+        params.append(float(created_after))
+    if created_before is not None:
+        clauses.append("r.created_at < ?")
+        params.append(float(created_before))
     order = {
         "created": "r.created_at DESC, r.run_id",
         "name": "lower(r.name) ASC, r.created_at DESC, r.run_id",
@@ -1090,6 +1116,51 @@ def db_list_groups(project: str, include_archived: bool = False) -> list[dict]:
         {"group": r[0], "runs": r[1], "last_activity": _ts_to_iso(r[2]), "first_created": _ts_to_iso(r[3]), "running": r[4]}
         for r in rows
     ]
+
+
+def db_run_facets(projects: list[str] | None, project: str | None = None, include_archived: bool = False) -> dict:
+    """Filter options for the run list over the runs the caller may see: groups (with counts and a status
+    breakdown), tags (most used first) and status counts. ``projects=None`` means no restriction."""
+    if projects is not None and not projects:
+        return {"groups": [], "tags": [], "statuses": {}}
+    clauses: list[str] = []
+    params: list = []
+    if projects is not None:
+        clauses.append(f"r.project IN ({', '.join('?' * len(projects))})")
+        params += projects
+    if project is not None:
+        clauses.append("r.project = ?")
+        params.append(project)
+    if not include_archived:
+        clauses.append("r.archived_at IS NULL AND p.archived_at IS NULL")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    frm = "FROM runs r LEFT JOIN projects p ON p.name = r.project"
+    with _lock:
+        conn = get_conn()
+        status_rows = conn.execute(f"SELECT r.status, count(*) {frm} {where} GROUP BY r.status", params).fetchall()
+        group_rows = conn.execute(
+            f"SELECT r.project, r.run_group, r.status, count(*), max(COALESCE(r.updated_at, r.created_at)) {frm} "
+            f"{where}{' AND' if where else 'WHERE'} r.run_group IS NOT NULL GROUP BY r.project, r.run_group, r.status",
+            params,
+        ).fetchall()
+        tag_rows = conn.execute(
+            f"SELECT t, count(*) c FROM (SELECT unnest(COALESCE(from_json(r.tags, '[\"VARCHAR\"]'), []::VARCHAR[])) t {frm} {where}) "
+            "GROUP BY t ORDER BY c DESC, t LIMIT 200",
+            params,
+        ).fetchall()
+    groups: dict[tuple[str, str], dict] = {}
+    for proj, grp, status, n, last in group_rows:
+        g = groups.setdefault(
+            (proj, grp), {"project": proj, "group": grp, "runs": 0, "running": 0, "statuses": {}, "_last": 0.0}
+        )
+        g["runs"] += n
+        g["statuses"][status] = n
+        g["running"] += n if status == "running" else 0
+        g["_last"] = max(g["_last"], last or 0.0)
+    out = sorted(groups.values(), key=lambda g: (-g["_last"], g["project"], g["group"]))
+    for g in out:
+        g["last_activity"] = _ts_to_iso(g.pop("_last"))
+    return {"groups": out, "tags": [{"tag": t, "runs": c} for t, c in tag_rows], "statuses": dict(status_rows)}
 
 
 # --- pins ------------------------------------------------------------------
