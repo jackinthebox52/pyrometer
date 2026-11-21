@@ -84,6 +84,7 @@ from pyrometer.server.db import (
     db_insert_system_snapshot,
     db_list_projects,
     db_list_runs,
+    db_list_runs_page,
     db_set_members,
     db_set_project_visibility,
     db_update_run,
@@ -1073,6 +1074,7 @@ async def create_run(req: CreateRunRequest, request: Request):
             if req.project is not None and req.project != existing:
                 err(f"Run {req.run_id} belongs to project {existing!r}, not {req.project!r}", 409)
             info = db_resume_run(req.run_id)
+            # Resuming an archived run brings it back to the lists (plain ingest into one does not).
             await _ws.broadcast({"type": "run_updated", "run_id": req.run_id})
             return ok(info)
         if req.resume == "must":
@@ -1143,17 +1145,29 @@ def list_runs(
     group: str | None = None,
     project: str | None = None,
     status: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ):
     """Visible runs. ``sort``: ``updated`` (last activity, default), ``created`` or ``name``. Archived runs
     (and runs of archived projects) are left out unless ``include_archived=true``. Optional ``group``,
     ``project`` and ``status`` filters. Each run carries ``updated_at``, ``group``, ``archived`` and the
-    caller's ``pinned`` flag."""
+    caller's ``pinned`` flag. Without ``limit``/``offset`` every run comes back and there is no ``meta``;
+    with them a top-level ``meta`` carries ``total`` (all matches), ``limit``, ``offset`` and ``returned``."""
     if sort not in RUN_SORTS:
         err(f"sort must be one of {', '.join(RUN_SORTS)}", 400)
+    if limit is not None and limit < 1:
+        err("limit must be at least 1", 400)
+    if offset < 0:
+        err("offset must not be negative", 400)
     principal = _principal(request)
-    return ok(db_list_runs(
-        auth.visible_projects(principal), sort, include_archived, group, project, status, pinned_by=_pin_user(principal),
-    ))
+    rows, total = db_list_runs_page(
+        auth.visible_projects(principal), sort, include_archived, group, project, status,
+        pinned_by=_pin_user(principal), limit=limit, offset=offset,
+    )
+    out = ok(rows)
+    if limit is not None or offset:
+        out["meta"] = {"total": total, "limit": limit, "offset": offset, "returned": len(rows)}
+    return out
 
 
 @app.get("/pins")

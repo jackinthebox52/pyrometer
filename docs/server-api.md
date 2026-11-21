@@ -270,6 +270,7 @@ List the runs the caller can see, **most recently active first** by default.
 | Parameter | Description |
 |-----------|-------------|
 | `sort` | `updated` (default: `updated_at` desc, bumped by every successful ingest and every status/metadata change), `created` (desc) or `name` (a-z). Anything else is a `400` |
+| `limit`, `offset` | Optional paging (`limit` >= 1, `offset` >= 0; otherwise `400`). Without either, **every** run is returned and there is no `meta`. With either, the response gets a top-level `meta`: `{"total", "limit", "offset", "returned"}` (`total` counts all matches, like the `meta` of downsampled reads). Every sort ends in `run_id`, so ties page stably |
 | `include_archived` | `true` also lists archived runs and runs of archived projects (hidden by default) |
 | `group` | Only runs with this `group` |
 | `project` | Only runs of this project |
@@ -301,7 +302,8 @@ List the runs the caller can see, **most recently active first** by default.
 }
 ```
 
-`pinned` is the caller's own pin (always `false` for API keys). `GET /runs/{run_id}` returns the same extra fields
+`pinned` is the caller's own pin (always `false` for API keys). Offset paging is not a snapshot: a run that becomes active between
+two page requests moves in the `updated` order, so a client paging live data may see a run twice or miss one. `GET /runs/{run_id}` returns the same extra fields
 (`updated_at`, `group`, `archived`, `pinned`) plus `notes` and the hardware fields.
 
 ---
@@ -398,7 +400,7 @@ except pins (any signed-in dashboard user) and bulk `tag` (also API keys that ca
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/runs/{run_id}/archive` | Hide the run from lists (`GET /runs` needs `include_archived=true` to show it). Data is kept; opening it by id and ingesting into it keep working |
+| `POST` | `/runs/{run_id}/archive` | Hide the run from lists (`GET /runs` needs `include_archived=true` to show it). Data is kept; opening it by id and ingesting into it keep working (plain ingest does **not** unarchive). `POST /runs` with `resume` on an archived run **auto-unarchives** it (response has `"unarchived": true`) and broadcasts `run_updated` |
 | `POST` | `/runs/{run_id}/unarchive` | Undo |
 | `POST` | `/runs/{run_id}/move` | Body `{"project", "force"?: false}`. The target must exist (`404`) and not be archived (`409`). A run that is still `running` needs `force=true` (`409` otherwise): a key bound to the old project can no longer write it afterwards (its ingests get `404`) and a retried create naming the old project gets `409` |
 | `DELETE` | `/runs/{run_id}` | **Hard delete**: the run row and every row of it in every table (metrics, system snapshots, param stats, profile events, events, logs, artifacts, media, samples, run summaries, dedupe batch ids, alert state, pins) plus its media files on disk. Irreversible |
@@ -424,7 +426,7 @@ Returns `{"data": {"alive": true}}`, or 404 for an unknown run.
 
 **Crash detection**: a `running` run whose `last_heartbeat` is older than `PYROMETER_HEARTBEAT_TIMEOUT` seconds
 (default 300) becomes `crashed` (checked on every run read and by a 30 s background sweep that broadcasts
-`run_updated`). Runs created before heartbeats existed have no timestamp and are never swept; instead a one-time
+`run_updated`); the transition bumps `updated_at`. Runs created before heartbeats existed have no timestamp and are never swept; instead a one-time
 migration at database open handles them: a `running` run with no heartbeat whose newest data (any table) is older than
 the timeout becomes `crashed` (`finished_at` = that last data time; no alert is sent), and one with newer data gets its
 last data time as `last_heartbeat` so the normal sweep takes over.
@@ -1256,6 +1258,8 @@ response: `runs`, `metrics`, `system_snapshots`, `param_stats`, `profile_events`
 `samples`, `run_summaries`, plus the image files under `media/<run_id>/` (the `media` table's `path` column points at them).
 The project export covers every run of the project, archived ones included. Same visibility as reading the run/project
 (`404` otherwise). Credentials, alert rules and dedupe ids are never exported.
+The tables are read on a separate DuckDB cursor in one transaction (a consistent snapshot) without the global write lock, so a
+large export does not stall ingestion.
 
 ---
 
@@ -1272,7 +1276,7 @@ curl -X PATCH $URL/admin/projects/team-a -H "Cookie: ..." -H "Origin: $URL" -H '
 
 Allowed tables: `system_snapshots`, `logs`, `profile_events`, `param_stats`, `events`, `artifacts`, `media` (files removed too), `samples`
 and `metrics` (only when named explicitly). Runs are never deleted by it. `{"retention": null}` (or `{}`) switches it off; unknown tables or
-days outside (0, 36500] are a `400`. `GET /admin/projects/{name}` shows the policy. The `seen_batches` dedupe ids are not aged out: they live
+days outside (0, 36500] are a `400`. When a sweep deletes `metrics`, `system_snapshots` or `events` rows of a run that had a stored summary, that summary is recomputed. `GET /admin/projects/{name}` shows the policy. The `seen_batches` dedupe ids are not aged out: they live
 and die with their run.
 
 ---

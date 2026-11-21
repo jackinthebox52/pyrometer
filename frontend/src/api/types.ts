@@ -189,6 +189,8 @@ export interface RunSummary {
 export interface ApiResponse<T> {
   data: T
   error: string | null
+  /** Present on paged/downsampled reads: `GET /runs?limit=` gives total/limit/offset/returned. */
+  meta?: Record<string, number | boolean | null>
 }
 
 export interface SampleStep {

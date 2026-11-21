@@ -625,8 +625,29 @@ def db_list_runs(
     status: str | None = None,
     pinned_by: str | None = None,
     run_ids: list[str] | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict]:
-    """Runs the caller may see (``projects``: ``None`` = no restriction), newest activity first.
+    """Runs the caller may see; see ``db_list_runs_page`` (this drops the ``total``)."""
+    return db_list_runs_page(projects, sort, include_archived, group, project, status, pinned_by, run_ids, limit, offset)[0]
+
+
+def db_list_runs_page(
+    projects: list[str] | None = None,
+    sort: str = "updated",
+    include_archived: bool = False,
+    group: str | None = None,
+    project: str | None = None,
+    status: str | None = None,
+    pinned_by: str | None = None,
+    run_ids: list[str] | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """``(runs, total)``: runs the caller may see (``projects``: ``None`` = no restriction), newest activity first.
+
+    ``total`` counts every match, ignoring ``limit``/``offset``. ``limit=None`` returns all of them. Every
+    sort ends in ``run_id`` so ties page stably.
 
     ``sort``: ``updated`` (``updated_at`` desc, the default), ``created`` (desc) or ``name`` (a-z).
     Archived runs, and runs of archived projects, are hidden unless ``include_archived``.
@@ -637,7 +658,7 @@ def db_list_runs(
     params: list = []
     if projects is not None:
         if not projects:
-            return []
+            return [], 0
         clauses.append(f"r.project IN ({', '.join('?' * len(projects))})")
         params += projects
     if not include_archived:
@@ -653,19 +674,23 @@ def db_list_runs(
         params.append(status)
     if run_ids is not None:
         if not run_ids:
-            return []
+            return [], 0
         clauses.append("r.run_id IN (SELECT unnest(?::VARCHAR[]))")
         params.append(run_ids)
     order = {
-        "created": "r.created_at DESC",
-        "name": "lower(r.name) ASC, r.created_at DESC",
-    }.get(sort, "COALESCE(r.updated_at, r.created_at) DESC, r.created_at DESC")
+        "created": "r.created_at DESC, r.run_id",
+        "name": "lower(r.name) ASC, r.created_at DESC, r.run_id",
+    }.get(sort, "COALESCE(r.updated_at, r.created_at) DESC, r.created_at DESC, r.run_id")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    page = ""
+    if limit is not None:
+        page = f" LIMIT {int(limit)} OFFSET {max(int(offset), 0)}"
+    elif offset:
+        page = f" LIMIT 9223372036854775807 OFFSET {max(int(offset), 0)}"
+    frm = "FROM runs r LEFT JOIN projects p ON p.name = r.project"
     with _lock:
-        rows = get_conn().execute(
-            f"SELECT {_LIST_COLS} FROM runs r LEFT JOIN projects p ON p.name = r.project {where} ORDER BY {order}",
-            params,
-        ).fetchall()
+        total = get_conn().execute(f"SELECT count(*) {frm} {where}", params).fetchone()[0]
+        rows = get_conn().execute(f"SELECT {_LIST_COLS} {frm} {where} ORDER BY {order}{page}", params).fetchall()
         pinned = (
             {r[0] for r in get_conn().execute("SELECT run_id FROM pinned_runs WHERE username = ?", [pinned_by]).fetchall()}
             if pinned_by else set()
@@ -673,7 +698,7 @@ def db_list_runs(
     out = [_row_to_run_summary(r) for r in rows]
     for run in out:
         run["pinned"] = run["run_id"] in pinned
-    return out
+    return out, int(total)
 
 
 def db_get_run_project(run_id: str) -> str | None:
@@ -870,11 +895,11 @@ def db_mark_stale_runs(now: float | None = None) -> list[str]:
     with _lock:
         rows = get_conn().execute(
             """
-            UPDATE runs SET status = 'crashed', finished_at = last_heartbeat
+            UPDATE runs SET status = 'crashed', finished_at = last_heartbeat, updated_at = ?
             WHERE status = 'running' AND last_heartbeat IS NOT NULL AND last_heartbeat < ?
             RETURNING run_id
             """,
-            [now - heartbeat_timeout()],
+            [time.time(), now - heartbeat_timeout()],
         ).fetchall()
     ids = [r[0] for r in rows]
     # This UPDATE is the one place a run turns crashed, so alerting here fires once per crash
@@ -926,9 +951,10 @@ def db_resume_run(run_id: str) -> dict:
     """
     with _lock:
         conn = get_conn()
-        prev = conn.execute("SELECT status FROM runs WHERE run_id = ?", [run_id]).fetchone()[0]
+        prev, archived_at = conn.execute("SELECT status, archived_at FROM runs WHERE run_id = ?", [run_id]).fetchone()
         conn.execute(
-            "UPDATE runs SET status = 'running', finished_at = NULL, last_heartbeat = ?, updated_at = ? WHERE run_id = ?",
+            "UPDATE runs SET status = 'running', finished_at = NULL, last_heartbeat = ?, updated_at = ?, archived_at = NULL "
+            "WHERE run_id = ?",
             [time.time(), time.time(), run_id],
         )
         last_step = conn.execute("SELECT MAX(step) FROM metrics WHERE run_id = ?", [run_id]).fetchone()[0]
@@ -937,6 +963,7 @@ def db_resume_run(run_id: str) -> dict:
         **{k: run[k] for k in ("run_id", "name", "status", "created_at", "project", "hyperparams", "tags")},
         "resumed": True,
         "previous_status": prev,
+        "unarchived": archived_at is not None,
         "last_step": last_step,
     }
 
@@ -2237,6 +2264,9 @@ RETENTION_TABLES = (
 )
 
 
+SUMMARY_TABLES = ("metrics", "system_snapshots", "events")  # what db_compute_run_summary reads
+
+
 def validate_retention(policy: object) -> dict:
     """Normalise ``{"older_than_days": {table: days}}``; ``ValueError`` on anything else."""
     if not isinstance(policy, dict) or set(policy) - {"older_than_days"}:
@@ -2269,10 +2299,12 @@ def db_apply_retention(project: str | None = None, now: float | None = None) -> 
     """Delete rows older than each project's policy (all projects with one, or just ``project``).
 
     Returns ``{project: {table: rows_deleted}}`` for what was removed. Media files of deleted media rows
-    go too. Only the tables a policy names are touched.
+    go too. Only the tables a policy names are touched. A run whose ``metrics``, ``system_snapshots`` or
+    ``events`` lost rows has its stored summary recomputed (if it had one) so it never reports deleted data.
     """
     now = time.time() if now is None else now
     out: dict[str, dict[str, int]] = {}
+    touched: set[str] = set()
     with _lock:
         conn = get_conn()
         where, params = "retention IS NOT NULL", []
@@ -2295,9 +2327,18 @@ def db_apply_retention(project: str | None = None, now: float | None = None) -> 
                             (media_root() / rel).unlink()
                         except OSError:
                             pass
-                n = conn.execute(f"DELETE FROM {table} WHERE {sub}", [cutoff, name]).fetchone()[0]
-                if n:
-                    out.setdefault(name, {})[table] = int(n)
+                gone = conn.execute(f"DELETE FROM {table} WHERE {sub} RETURNING run_id", [cutoff, name]).fetchall()
+                if gone:
+                    out.setdefault(name, {})[table] = len(gone)
+                    if table in SUMMARY_TABLES:
+                        touched.update(r[0] for r in gone)
+        if touched:
+            have = conn.execute(
+                "SELECT run_id FROM run_summaries WHERE run_id IN (SELECT unnest(?::VARCHAR[]))", [sorted(touched)]
+            ).fetchall()
+            touched = {r[0] for r in have}
+    for run_id in sorted(touched):  # each recompute takes the lock itself; do not hold it across all of them
+        db_compute_run_summary(run_id)
     return out
 
 
@@ -2318,9 +2359,12 @@ def _sql_str(value: str) -> str:
 def db_export_parquet(dest: Path, run_id: str | None = None, project: str | None = None) -> dict[str, int]:
     """Write one Parquet file per table (``runs`` plus ``EXPORT_TABLES``) for a run or a whole project.
 
-    Returns ``{table: rows}``. Runs under the lock with DuckDB ``COPY``; ``dest`` must exist. Credentials,
-    alert rules and the dedupe table are never exported. File-backed media is described by its ``path``
-    column (relative to the media directory); the caller adds the files themselves.
+    Returns ``{table: rows}``. ``dest`` must exist. Credentials, alert rules and the dedupe table are never
+    exported. File-backed media is described by its ``path`` column (relative to the media directory); the
+    caller adds the files themselves.
+
+    The reads run on their own DuckDB cursor inside one transaction, **without the global lock**: DuckDB's
+    MVCC gives the export a consistent snapshot while ingestion keeps writing on the main connection.
     """
     assert (run_id is None) != (project is None)
     if run_id is not None:
@@ -2328,13 +2372,17 @@ def db_export_parquet(dest: Path, run_id: str | None = None, project: str | None
     else:
         runs_where = f"project = {_sql_str(project)}"
     counts: dict[str, int] = {}
-    with _lock:
-        conn = get_conn()
+    cur = get_conn().cursor()
+    try:
+        cur.execute("BEGIN TRANSACTION")
         for table in ("runs", *EXPORT_TABLES):
             where = runs_where if table == "runs" else f"run_id IN (SELECT run_id FROM runs WHERE {runs_where})"
             target = _sql_str(str(dest / f"{table}.parquet"))
-            conn.execute(f"COPY (SELECT * FROM {table} WHERE {where}) TO {target} (FORMAT PARQUET)")
-            counts[table] = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}").fetchone()[0]
+            cur.execute(f"COPY (SELECT * FROM {table} WHERE {where}) TO {target} (FORMAT PARQUET)")
+            counts[table] = cur.execute(f"SELECT count(*) FROM {table} WHERE {where}").fetchone()[0]
+        cur.execute("COMMIT")
+    finally:
+        cur.close()
     return counts
 
 
