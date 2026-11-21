@@ -145,3 +145,36 @@ def sample_all(nvml: Any, handles: list[tuple[int, Any]], own_pid: int) -> list[
         snap["timestamp"] = now
         out.append(snap)
     return out
+
+
+# NVML clocks-throttle-reason bits (nvmlClocksThrottleReason*), documented in the NVML reference.
+THROTTLE_REASONS: dict[int, str] = {
+    0x1: "gpu_idle",
+    0x2: "applications_clocks_setting",
+    0x4: "sw_power_cap",
+    0x8: "hw_slowdown",
+    0x10: "sync_boost",
+    0x20: "sw_thermal_slowdown",
+    0x40: "hw_thermal_slowdown",
+    0x80: "hw_power_brake_slowdown",
+    0x100: "display_clock_setting",
+}
+THROTTLE_SLOWDOWN_BITS = 0x4 | 0x8 | 0x20 | 0x40 | 0x80  # reasons that actually cost performance
+
+
+def decode_throttle(mask: int) -> list[str]:
+    """Names of the throttle reasons set in an NVML bitmask (unknown bits are ignored)."""
+    return [name for bit, name in THROTTLE_REASONS.items() if mask & bit]
+
+
+def throttle_mask(nvml: Any, handle: Any) -> int | None:
+    """Current NVML clock-throttle-reason bitmask of a device, or ``None`` if the driver cannot tell."""
+    for fn in ("nvmlDeviceGetCurrentClocksEventReasons", "nvmlDeviceGetCurrentClocksThrottleReasons"):
+        f = getattr(nvml, fn, None)
+        if f is None:
+            continue
+        try:
+            return int(f(handle))
+        except Exception:
+            continue
+    return None

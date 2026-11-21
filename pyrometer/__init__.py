@@ -13,6 +13,7 @@ import httpx
 
 from pyrometer._autolog import AutologConfig, NullRun, name_loss, rank_info
 from pyrometer._hardware import fingerprint_fast
+from pyrometer._presets import PRESETS, Preset, get_preset
 from pyrometer._run import Run, _run_stack
 from pyrometer._transport import spool_root
 
@@ -34,6 +35,8 @@ def init(
     group: str | None = None,
     autolog: bool | dict | None = None,
     rank_zero_only: bool = True,
+    preset: str | None = None,
+    monitor_interval: float | None = None,
 ) -> Run:
     """Initialize a new training run and register it with the Pyrometer server.
 
@@ -101,6 +104,18 @@ def init(
             by ``torchrun``) only rank 0 creates a run; other ranks get an inert stand-in whose
             methods all do nothing (and ``run.run_id`` is ``None``). Pass ``False`` for one run per rank.
 
+        preset: Named defaults for a kind of job: ``"llm-pretrain"``, ``"finetune"``, ``"rlhf"``, ``"rl"`` or
+            ``"benchmark"`` (``pyrometer presets`` lists what each one sets). A preset only chooses
+            :class:`AutologConfig` options and the GPU sampling interval, never anything about your model.
+            Anything you pass explicitly wins: ``autolog={...}`` options beat the preset's, ``monitor_interval=``
+            beats its interval, and ``run.config.<option> = ...`` changes the live value later. Defaults to
+            ``$PYROMETER_PRESET``. Unknown names raise ``ValueError``.
+        monitor_interval: Seconds between GPU snapshots (default 2.0, or the preset's value; minimum 0.1).
+
+    Under ``pyrometer run script.py`` the launcher has already created the run: the script's first
+    ``init()`` call returns that same run instead of creating another (see the "Launcher" section of
+    ``docs/sdk-reference.md``).
+
     ``Run`` is a context manager: ``with pyrometer.init(...) as run:`` finishes the run when the block
     ends (``completed``; ``killed`` on Ctrl-C; ``failed`` on any other exception or a non-zero
     ``SystemExit``) and never swallows the exception.
@@ -133,8 +148,19 @@ def init(
         ) as run:
             train(model, optimizer)   # loss, lr, step, steps/sec are logged automatically
     """
+    claimed = _launcher_run
+    if claimed is not None and not claimed._launcher_claimed and not claimed._finished:
+        return _attach_launcher_run(
+            claimed, name=name, hyperparams=hyperparams, tags=tags, notes=notes, server=server, project=project,
+            group=group, autolog=autolog, resume=resume, offline=offline, preset=preset,
+        )
+    preset_obj = get_preset(preset or os.environ.get("PYROMETER_PRESET"))
+    if monitor_interval is not None and not (isinstance(monitor_interval, (int, float)) and monitor_interval >= 0.1):
+        raise ValueError("monitor_interval must be a number of seconds >= 0.1")
     if autolog is None:
         autolog = os.environ.get("PYROMETER_AUTOLOG", "1").strip().lower() not in ("0", "false", "off", "no")
+    if preset_obj is not None and (autolog is True or isinstance(autolog, dict)):
+        autolog = {**preset_obj.autolog, **(autolog if isinstance(autolog, dict) else {})}
     if rank_zero_only:
         rank, _world = rank_info()
         if rank not in (None, 0):
@@ -186,7 +212,8 @@ def init(
 
         Spool(run_id).write_meta(server=server, created=False, run_id=run_id, create=payload)
         run = Run(run_id=run_id, server_url=server, api_key=None, offline=True,
-                  anomaly_detection=anomaly_detection, autolog=autolog)
+                  anomaly_detection=anomaly_detection, autolog=autolog,
+                  preset=preset_obj, monitor_interval=monitor_interval)
         if resume_mode:
             run._mark_resumed(None, None, {"offline": True})
         _probe_hardware(run, hw)
@@ -214,7 +241,7 @@ def init(
             file=sys.stderr,
         )
         run = Run(run_id=run_id, server_url=server, api_key=api_key, anomaly_detection=anomaly_detection,
-                  create=payload, autolog=autolog)
+                  create=payload, autolog=autolog, preset=preset_obj, monitor_interval=monitor_interval)
         if resume_mode:
             run._mark_resumed(None, None, {"deferred": True})
         _probe_hardware(run, hw)
@@ -240,7 +267,8 @@ def init(
 
     run = Run(
         run_id=run_data["run_id"], server_url=server, api_key=api_key,
-        anomaly_detection=anomaly_detection, autolog=autolog,
+        anomaly_detection=anomaly_detection, autolog=autolog, preset=preset_obj,
+        monitor_interval=monitor_interval,
     )
     if run_data.get("resumed"):
         changes = _diff_config(run_data, hyperparams, tags)
@@ -252,6 +280,77 @@ def init(
             )
         run._mark_resumed(run_data.get("last_step"), run_data.get("previous_status"), changes)
     _probe_hardware(run, hw)
+    return run
+
+
+# The run ``pyrometer run`` created for the script it launches (set by ``pyrometer._launcher``).
+_launcher_run: Run | None = None
+
+
+def _set_launcher_run(run: "Run | None") -> None:
+    global _launcher_run
+    _launcher_run = run
+
+
+def _attach_launcher_run(
+    run: Run, *, name, hyperparams, tags, notes, server, project, group, autolog, resume, offline, preset
+) -> Run:
+    """The script's first ``init()`` under ``pyrometer run``: adopt the launcher's run instead of creating a second.
+
+    Applied to the existing run: ``name`` (unless ``--name`` was given), ``hyperparams`` (merged over the ones parsed
+    from argv, the script's win), ``tags`` (union), ``notes``, ``group`` (unless ``--group`` was given),
+    ``autolog={...}`` options and ``preset`` (unless ``--preset`` was given), ``autolog=False`` (stops autolog).
+    Options that decide where or how the run exists (``server``, ``api_key``, ``project``, ``offline``, ``resume``,
+    ``anomaly_detection``, ``rank_zero_only``) cannot change any more: a differing value is reported once and ignored.
+    Later ``init()`` calls create independent runs as usual.
+    """
+    run._launcher_claimed = True
+    body: dict = {}
+    explicit = run._launcher_explicit  # type: ignore[attr-defined]
+    if name and "name" not in explicit:
+        body["name"] = name
+    if hyperparams:
+        merged = {**run._launcher_hp, **hyperparams}  # type: ignore[attr-defined]
+        run._launcher_hp = merged  # type: ignore[attr-defined]
+        body["hyperparams"] = merged
+    if tags:
+        union = list(dict.fromkeys([*run._launcher_tags, *tags]))  # type: ignore[attr-defined]
+        run._launcher_tags = union  # type: ignore[attr-defined]
+        body["tags"] = union
+    if notes is not None:
+        body["notes"] = notes
+    if group and "group" not in explicit:
+        body["group"] = group[:128]
+    if body:
+        run._transport.submit("PATCH", f"/runs/{run.run_id}", body)
+    ignored = []
+    if project is not None and project != run._launcher_project:  # type: ignore[attr-defined]
+        ignored.append("project")
+    if resume is not None:
+        ignored.append("resume")
+    if offline:
+        ignored.append("offline")
+    if server and server.rstrip("/") != run.server:
+        ignored.append("server")
+    if ignored:
+        print(
+            f"pyrometer: init() attached to the run started by `pyrometer run`; ignoring {', '.join(ignored)} "
+            "(set them on the launcher command line or environment).",
+            file=sys.stderr,
+        )
+    pobj = get_preset(preset)
+    if pobj is not None and "preset" not in explicit:
+        for k, v in pobj.autolog.items():
+            setattr(run.config, k, v)
+        run.preset = pobj.name
+        run._reminders = pobj.reminders
+        run._monitor_interval = pobj.monitor_interval
+        run._capture_throttle = pobj.capture_throttle
+    if isinstance(autolog, dict):
+        for k, v in autolog.items():
+            setattr(run.config, k, v)
+    elif autolog is False:
+        run._autolog.stop()
     return run
 
 
@@ -421,4 +520,4 @@ def run(
     return deco(fn) if callable(fn) else deco
 
 
-__all__ = ["init", "create_project", "run", "current_run", "name_loss", "AutologConfig", "Run"]
+__all__ = ["init", "create_project", "run", "current_run", "name_loss", "AutologConfig", "Run", "PRESETS", "Preset"]

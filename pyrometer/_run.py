@@ -9,6 +9,7 @@ import threading
 import uuid
 import time
 from contextlib import contextmanager
+from typing import Any
 
 import httpx
 
@@ -174,6 +175,9 @@ class Run:
         anomaly_detection: bool | dict | None = True,
         create: dict | None = None,
         autolog: bool | dict = True,
+        preset: "Any" = None,
+        monitor_interval: float | None = None,
+        capture_throttle: bool | None = None,
     ) -> None:
         self.run_id = run_id
         self._server = server_url
@@ -230,6 +234,16 @@ class Run:
         self._anomaly_lock = threading.Lock()
 
         self._our_pid = os.getpid()
+        self.preset: str | None = preset.name if preset is not None else None
+        """Name of the preset this run was started with (``init(preset=...)``), or ``None``."""
+        self._reminders: tuple[str, ...] = preset.reminders if preset is not None else ()
+        self._samples_logged = False
+        self._monitor_interval = float(
+            monitor_interval if monitor_interval is not None else (preset.monitor_interval if preset else 2.0)
+        )
+        self._capture_throttle = bool(
+            capture_throttle if capture_throttle is not None else (preset.capture_throttle if preset else False)
+        )
 
         # Liveness: a heartbeat every HEARTBEAT_INTERVAL s (sent immediately at start). Never spooled.
         self._last_heartbeat = float("-inf")  # monotonic() can be < HEARTBEAT_INTERVAL right after boot
@@ -239,7 +253,12 @@ class Run:
         autolog_opts = autolog if isinstance(autolog, dict) else {}
         self.config = AutologConfig(**autolog_opts)
         """Live autolog settings (:class:`pyrometer._autolog.AutologConfig`): ``run.config.log_every = 50``."""
-        self._autolog = _AutologEngine(self, bool(autolog), self.config)
+        self._autolog = _AutologEngine(self, isinstance(autolog, dict) or bool(autolog), self.config)
+        self._launcher_claimed = False  # set when ``pyrometer run`` handed this run to the script's init()
+        self._launcher_explicit: set[str] = set()  # launcher options given on the command line (win over init())
+        self._launcher_hp: dict = {}
+        self._launcher_tags: list[str] = []
+        self._launcher_project: str | None = None
         _active_runs.add(self)
         _run_stack.append(self)
         _install_exit_hooks()
@@ -373,6 +392,30 @@ class Run:
         ``auto/loss/1`` ... with several). Example: ``run.name_loss("d_loss", d_loss).backward()``.
         """
         return _name_loss(name, loss)
+
+    def log_episode(self, return_: float, length: int | None = None, step: int | None = None, **info: float) -> None:
+        """Record one finished reinforcement-learning episode; rolling statistics are logged for you.
+
+        Every ``run.config.episode_log_every`` episodes (default 10) this logs, over the last
+        ``run.config.episode_window`` episodes (default 100): ``episode/return_mean``, ``episode/return_min``,
+        ``episode/return_max``, ``episode/length_mean``, ``episode/count`` and the cumulative ``env_steps``
+        (the sum of the episode lengths) as an axis metric: pick it as the chart x-axis. Extra numeric
+        keyword arguments (``success=1.0``, ``shaped_reward=...``) get a rolling mean as ``episode/<key>_mean``.
+        Statistics not yet logged when the run ends are flushed by ``finish``.
+
+        Args:
+            return_: The episode's total reward.
+            length: Environment steps in the episode (optional; without it there is no ``env_steps``).
+            step: Step to log at. Optional with autolog on (the automatic step, ``run.step``).
+            **info: Extra numeric per-episode values.
+
+        Example::
+
+            run.log_episode(ep_return, ep_len, success=float(info["is_success"]))
+        """
+        if self._finished:
+            return
+        self._autolog.log_episode(return_, length, step, info)
 
     @property
     def server(self) -> str:
@@ -770,6 +813,7 @@ class Run:
             step, samples = None, list(step)
         if not samples:
             return
+        self._samples_logged = True
         if step is None:
             step = self._autolog.resolve_step()
         if mode not in ("replace", "append"):
@@ -838,9 +882,14 @@ class Run:
         if self._finished:
             return
         try:
+            self._autolog.flush_episodes()
+        except Exception:
+            log.debug("episode flush failed", exc_info=True)
+        try:
             self._autolog.stop(resolve=status != "killed")  # hooks off first; logs the last pending values
         except Exception:
             log.debug("autolog stop failed", exc_info=True)
+        self._print_reminders()
         if self._probe_thread is not None and status != "killed":
             # let a nearly finished hardware probe still report (it submits only while the run is open)
             self._probe_thread.join(timeout=2)
@@ -879,6 +928,20 @@ class Run:
                 f"saved in {self._spool.dir}. Upload them with: pyrometer sync",
                 file=sys.stderr,
             )
+
+    def _print_reminders(self) -> None:
+        """Preset hints for data the preset expects but never saw (printed once, at the end)."""
+        if not self._reminders:
+            return
+        eng = self._autolog
+        lines = []
+        if "tokens" in self._reminders and eng.enabled and not eng.tokens_seen:
+            lines.append("no tokens_per_batch hint was given; call run.track(tokens_per_batch=...) to log "
+                         "tokens_seen and tokens/sec")
+        if "samples" in self._reminders and not self._samples_logged:
+            lines.append("no run.log_samples(...) call was made; log generations to browse them in the Samples tab")
+        for line in lines:
+            print(f"pyrometer: preset {self.preset}: {line}", file=sys.stderr)
 
     @contextmanager
     def profile(self, step: int | None = None):
@@ -1244,12 +1307,38 @@ class Run:
         if not handles:
             return
 
+        throttle_state: dict[int, int] = {}
         while not self._stop.is_set():
             try:
                 for snap in _gpu.sample_all(pynvml, handles, self._our_pid):
                     if self._stop.is_set():
                         break
                     self._transport.submit("POST", f"/runs/{self.run_id}/system", snap)
+                if self._capture_throttle:
+                    self._sample_throttle(pynvml, handles, throttle_state)
             except Exception:
                 pass
-            self._stop.wait(2)
+            self._stop.wait(self._monitor_interval)
+
+    def _sample_throttle(self, nvml, handles, state: dict[int, int]) -> None:
+        """Log ``hw/gpu<i>/throttle_reasons`` (NVML bitmask) when it changes, and a ``thermal_throttle`` event
+        when a thermal or power limit starts slowing the GPU."""
+        for index, handle in handles:
+            mask = _gpu.throttle_mask(nvml, handle)
+            if mask is None:
+                continue
+            prev = state.get(index)
+            state[index] = mask
+            if prev == mask:
+                continue
+            if prev is None and mask == 0:
+                continue
+            self._log({f"hw/gpu{index}/throttle_reasons": float(mask)}, self._last_step, time.time())
+            slowing = mask & _gpu.THROTTLE_SLOWDOWN_BITS
+            if slowing and not (prev or 0) & _gpu.THROTTLE_SLOWDOWN_BITS and not self._finished:
+                reasons = _gpu.decode_throttle(slowing)
+                self.event(
+                    f"GPU {index} clocks throttled: {', '.join(reasons)}",
+                    event_type="thermal_throttle", severity="warning",
+                    metadata={"gpu_index": index, "reasons": reasons, "mask": mask},
+                )

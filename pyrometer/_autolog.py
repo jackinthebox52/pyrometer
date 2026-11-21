@@ -29,6 +29,9 @@ from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
+# Backwards (of one loss stream) without any optimizer step before the loss fallback starts logging. Far above any
+# realistic gradient-accumulation window, so a program that does step an optimizer never triggers it.
+_FALLBACK_AFTER = 1024
 _LOSS_PENDING_MAX = 4096  # per loss stream, between two optimizer steps (guards a loop that never steps)
 
 
@@ -54,6 +57,11 @@ class AutologConfig:
             Expensive; default False.
         grad_log_freq: Backward passes between per-parameter statistics (grad_health). Default 100.
         profile_every: Profile one whole iteration every N driving steps (``None`` = never). Default None.
+        capture_grad: Also capture ``torch.autograd.grad(loss, ...)`` calls as losses (for hand-rolled
+            update rules). Off by default because libraries and gradient penalties call it with scalar
+            outputs that are not training losses. Default False.
+        episode_window: Episodes in the rolling window of ``run.log_episode`` statistics. Default 100.
+        episode_log_every: ``run.log_episode`` logs the statistics every N episodes. Default 10.
     """
 
     _DEFAULTS: dict[str, Any] = {
@@ -66,6 +74,9 @@ class AutologConfig:
         "grad_health": False,
         "grad_log_freq": 100,
         "profile_every": None,
+        "capture_grad": False,
+        "episode_window": 100,
+        "episode_log_every": 10,
     }
 
     def __init__(self, **overrides: Any) -> None:
@@ -78,7 +89,7 @@ class AutologConfig:
     def __setattr__(self, name: str, value: Any) -> None:
         if name not in self._DEFAULTS:
             raise AttributeError(f"unknown autolog option {name!r}; valid options: {sorted(self._DEFAULTS)}")
-        if name in ("log_every", "grad_log_freq"):
+        if name in ("log_every", "grad_log_freq", "episode_window", "episode_log_every"):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         elif name == "profile_every":
@@ -184,6 +195,55 @@ def _uninstall_backward(engine: "_AutologEngine") -> None:
             torch.autograd.backward = _orig_autograd_backward  # type: ignore[assignment]
 
 
+_grad_engines: tuple = ()  # engines with config.capture_grad on (copy-on-write)
+_orig_autograd_grad: Callable | None = None
+
+
+def _w_autograd_grad(outputs, *args, **kwargs):
+    if not getattr(_tls, "active", False):
+        engines = _grad_engines
+        if engines:
+            try:
+                import torch
+
+                ts = (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
+                f = sys._getframe(1)
+                key = (f.f_code, f.f_lineno)
+                for t in ts:
+                    if isinstance(t, torch.Tensor):
+                        for e in engines:
+                            e._on_backward(key, t)
+            except Exception:
+                pass
+    return _orig_autograd_grad(outputs, *args, **kwargs)  # type: ignore[misc]
+
+
+def _install_grad(engine: "_AutologEngine") -> None:
+    global _grad_engines, _orig_autograd_grad
+    import torch
+
+    with _wrap_lock:
+        if engine in _grad_engines:
+            return
+        _grad_engines = _grad_engines + (engine,)
+        if torch.autograd.grad is not _w_autograd_grad:
+            _orig_autograd_grad = torch.autograd.grad
+            torch.autograd.grad = functools.wraps(_orig_autograd_grad)(_w_autograd_grad)  # type: ignore[assignment]
+
+
+def _uninstall_grad(engine: "_AutologEngine") -> None:
+    """Same contract as :func:`_uninstall_backward` for the ``torch.autograd.grad`` wrapper."""
+    global _grad_engines
+    import torch
+
+    with _wrap_lock:
+        _grad_engines = tuple(e for e in _grad_engines if e is not engine)
+        if _grad_engines:
+            return
+        if torch.autograd.grad is _w_autograd_grad and _orig_autograd_grad is not None:
+            torch.autograd.grad = _orig_autograd_grad  # type: ignore[assignment]
+
+
 def name_loss(name: str, loss):
     """Tag a loss tensor so its ``backward`` is logged as ``auto/loss/<name>``; returns the tensor."""
     try:
@@ -251,7 +311,7 @@ class _TrackedLoader:
 class _Stream:
     """One loss stream: all backwards from one call site (or one ``name_loss`` tag)."""
 
-    __slots__ = ("order", "tag", "pending", "count", "metric")
+    __slots__ = ("order", "tag", "pending", "count", "metric", "total", "fb")
 
     def __init__(self, order: int, tag: str | None) -> None:
         self.order = order
@@ -259,6 +319,8 @@ class _Stream:
         self.pending: collections.deque = collections.deque(maxlen=_LOSS_PENDING_MAX)
         self.count = 0  # backwards since the last driving step (micro-batches)
         self.metric: str | None = None  # fixed at the first emission
+        self.total = 0  # backwards of this stream ever (the loss fallback's step)
+        self.fb = False  # the loss fallback is active for this stream
 
 
 class _AutologEngine:
@@ -302,6 +364,16 @@ class _AutologEngine:
         self._seen_modules: "weakref.WeakSet" = weakref.WeakSet()
         self._module_n = 0
 
+        # episode statistics (run.log_episode)
+        self._ep_lock = threading.Lock()
+        self._ep_returns: collections.deque = collections.deque(maxlen=100)
+        self._ep_lengths: collections.deque = collections.deque(maxlen=100)
+        self._ep_info: dict[str, collections.deque] = {}
+        self._ep_count = 0
+        self._ep_since_emit = 0
+        self._ep_step = 0  # step of the most recent episode (where the final flush logs)
+        self.env_steps = 0
+
         self._prof: tuple | None = None
         config._listeners.append(self._on_config)
 
@@ -321,6 +393,8 @@ class _AutologEngine:
         self._hook_handle = register_optimizer_step_post_hook(self._on_optimizer_step)
         self._active = True
         _install_backward(self)
+        if self.config.capture_grad:
+            _install_grad(self)
         self._sync_grad_health()
 
     def stop(self, resolve: bool = True) -> None:
@@ -332,6 +406,7 @@ class _AutologEngine:
         except Exception:
             pass
         _uninstall_backward(self)
+        _uninstall_grad(self)
         self._gh_off()
         if self._prof is not None:
             try:
@@ -343,6 +418,9 @@ class _AutologEngine:
             if resolve:
                 if self.saw_step and self.step != self._last_emit_k:
                     self._emit(self.step, None)
+                elif not self.saw_step:
+                    for s in list(self._streams.values()):
+                        self._fallback_flush(s, True)
                 self._resolve_lazy()
         except Exception:
             log.debug("autolog final flush failed", exc_info=True)
@@ -413,6 +491,69 @@ class _AutologEngine:
             if samples:
                 self.samples_seen += int(samples)
 
+    # -- episode statistics --
+
+    def log_episode(self, return_: float, length: int | None, step: int | None, info: dict[str, Any]) -> None:
+        """Record one finished episode; every ``episode_log_every`` episodes log rolling statistics."""
+        ret = float(return_)
+        n = None if length is None else int(length)
+        window = self.config.episode_window
+        extras: dict[str, float] = {}
+        for k, v in info.items():
+            if isinstance(v, bool):
+                v = float(v)
+            if isinstance(v, (int, float)):
+                extras[str(k)] = float(v)
+            else:
+                try:
+                    extras[str(k)] = float(v)  # 0-d tensors / numpy scalars
+                except (TypeError, ValueError):
+                    pass
+        with self._ep_lock:
+            if self._ep_returns.maxlen != window:
+                self._ep_returns = collections.deque(self._ep_returns, maxlen=window)
+                self._ep_lengths = collections.deque(self._ep_lengths, maxlen=window)
+                self._ep_info = {k: collections.deque(d, maxlen=window) for k, d in self._ep_info.items()}
+            self._ep_returns.append(ret)
+            if n is not None:
+                self._ep_lengths.append(n)
+                self.env_steps += n
+            for k, v in extras.items():
+                self._ep_info.setdefault(k, collections.deque(maxlen=window)).append(v)
+            self._ep_count += 1
+            self._ep_step = step if step is not None else self.step
+            self._ep_since_emit += 1
+            due = self._ep_since_emit >= self.config.episode_log_every
+        if due:
+            if step is None:
+                step = self.resolve_step()
+            self._emit_episodes(step)
+
+    def flush_episodes(self) -> None:
+        """Log the statistics of episodes recorded since the last emission (called when the run ends)."""
+        if self._ep_since_emit:
+            self._emit_episodes(self._ep_step)
+
+    def _emit_episodes(self, step: int) -> None:
+        with self._ep_lock:
+            if not self._ep_returns:
+                return
+            self._ep_since_emit = 0
+            r = list(self._ep_returns)
+            metrics: dict[str, float] = {
+                "episode/return_mean": sum(r) / len(r),
+                "episode/return_min": min(r),
+                "episode/return_max": max(r),
+                "episode/count": float(self._ep_count),
+            }
+            if self._ep_lengths:
+                metrics["episode/length_mean"] = sum(self._ep_lengths) / len(self._ep_lengths)
+                metrics["env_steps"] = float(self.env_steps)
+            for k, d in self._ep_info.items():
+                if d:
+                    metrics[f"episode/{k}_mean"] = sum(d) / len(d)
+        self.run._log(metrics, step, time.time())
+
     # -- backward capture --
 
     def _on_backward(self, key: Any, t: Any) -> None:
@@ -432,6 +573,12 @@ class _AutologEngine:
                 s = self._streams[skey] = _Stream(len(self._streams), tag)
             s.pending.append(d)
             s.count += 1
+            s.total += 1
+            due = not self.saw_step and (s.fb or s.total >= _FALLBACK_AFTER) and s.total % self.config.log_every == 0
+            if due:
+                s.fb = True
+        if due:
+            self._fallback_flush(s, False)
 
     # -- optimizer step hook --
 
@@ -523,6 +670,10 @@ class _AutologEngine:
             gn = self._grad_norm_tensor(opt)
             if gn is not None:
                 device_vals["auto/grad_norm"] = gn
+        self._ship(k, ts, metrics, device_vals)
+
+    def _ship(self, k: int, ts: float, metrics: dict[str, float], device_vals: dict[str, Any]) -> None:
+        """Log ready values now; device tensors are queued and read at the next cadence (no GPU sync)."""
         # Values from earlier cadences are certainly computed by now: reading them cannot stall the GPU.
         self._resolve_lazy()
         if metrics:
@@ -540,6 +691,56 @@ class _AutologEngine:
         if pending:
             with self._lock:
                 self._lazy.append((k, ts, pending))
+
+    def _fallback_flush(self, s: "_Stream", final: bool) -> None:
+        """Loss fallback for programs that never step an optimizer (manual updates, custom rules): the loss of
+        each stream is logged as the mean of every ``log_every`` backwards, at the stream's own backward count.
+        ``final`` also logs the trailing partial chunk (when the run ends)."""
+        L = self.config.log_every
+        with self._lock:
+            vals = list(s.pending)
+            n, total = len(vals), s.total
+            first = total - n + 1
+            chunks: list[tuple[int, list[Any]]] = []
+            consumed = 0
+            e = ((first - 1) // L + 1) * L  # first multiple of L covered by the pending values
+            while e <= total:
+                lo = max(e - L + 1, first)
+                chunks.append((e, vals[lo - first:e - first + 1]))
+                consumed = e - first + 1
+                e += L
+            if final and consumed < n:
+                chunks.append((total, vals[consumed:]))
+                consumed = n
+            s.pending = collections.deque(vals[consumed:], maxlen=_LOSS_PENDING_MAX)
+            metric = self._stream_metric(s)
+        ts = time.time()
+        for step, chunk in chunks:
+            mean = self._mean(chunk)
+            if mean is not None:
+                self._ship(self.step + step, ts, {}, {metric: mean})
+
+    def _stream_metric(self, s: "_Stream") -> str:
+        if s.metric is None:
+            if s.tag:
+                s.metric = f"auto/loss/{s.tag}"
+            elif len(self._streams) >= 2:
+                s.metric = f"auto/loss/{s.order}"
+            else:
+                s.metric = "auto/loss"
+        return s.metric
+
+    @staticmethod
+    def _mean(vals: list[Any]) -> Any:
+        import torch
+
+        try:
+            return torch.stack([v.reshape(()).float() for v in vals]).mean()
+        except Exception:  # tensors on different devices
+            try:
+                return torch.tensor(sum(float(v) for v in vals) / len(vals))
+            except Exception:
+                return None
 
     def _driver_opt(self) -> Any:
         chosen = self.config.step_optimizer
@@ -568,27 +769,12 @@ class _AutologEngine:
         return out
 
     def _loss_values(self) -> dict[str, Any]:
-        import torch
-
         out: dict[str, Any] = {}
-        live = [s for s in self._streams.values() if s.pending]
-        for s in live:
-            if s.metric is None:
-                if s.tag:
-                    s.metric = f"auto/loss/{s.tag}"
-                elif len(self._streams) >= 2:
-                    s.metric = f"auto/loss/{s.order}"
-                else:
-                    s.metric = "auto/loss"
-            vals = list(s.pending)
-            try:
-                mean = torch.stack([v.reshape(()).float() for v in vals]).mean()
-            except Exception:  # tensors on different devices
-                try:
-                    mean = torch.tensor(sum(float(v) for v in vals) / len(vals))
-                except Exception:
-                    continue
-            out[s.metric] = mean
+        for s in [s for s in self._streams.values() if s.pending]:
+            metric = self._stream_metric(s)
+            mean = self._mean(list(s.pending))
+            if mean is not None:
+                out[metric] = mean
         return out
 
     def _grad_norm_tensor(self, opt: Any) -> Any:
@@ -649,6 +835,11 @@ class _AutologEngine:
     # -- gradient health --
 
     def _on_config(self, name: str) -> None:
+        if name == "capture_grad" and self._active:
+            if self.config.capture_grad:
+                _install_grad(self)
+            else:
+                _uninstall_grad(self)
         if name in ("grad_health", "grad_log_freq") and self._active:
             self._gh_off()
             self._sync_grad_health()

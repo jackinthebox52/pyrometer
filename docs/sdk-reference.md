@@ -14,6 +14,9 @@ Complete API reference for the Pyrometer Python SDK.
   - [`run.profile()`](#runprofile)
   - [`run.finish()`](#runfinish)
 - [Autolog](#autolog)
+- [Presets](#presets)
+- [Launcher: `pyrometer run`](#launcher-pyrometer-run)
+- [`run.log_episode()`](#runlog_episode)
 - [Media Logging](#media-logging)
   - [`run.log_image()`](#runlog_image)
   - [`run.log_histogram()`](#runlog_histogram)
@@ -62,6 +65,8 @@ run = pyrometer.init(
 | `resume` | `str \| None` | `$PYROMETER_RUN_ID` implies `"auto"` | Continue an existing run: a run id, or `"auto"` (use `$PYROMETER_RUN_ID`; resume if it exists, create it with that id otherwise). See [Resuming a run](#resuming-a-run). |
 | `anomaly_detection` | `bool \| dict` | `True` | `False` disables automatic anomaly events; a dict overrides thresholds. See [Anomaly Detection](#anomaly-detection). |
 | `autolog` | `bool \| dict \| None` | `True` (`PYROMETER_AUTOLOG=0` flips the default) | Automatic step counter, learning rate, loss, throughput while the run is open. `False` disables; a dict presets [`run.config`](#autolog) options. See [Autolog](#autolog). |
+| `preset` | `str \| None` | `$PYROMETER_PRESET` | `"llm-pretrain"`, `"finetune"`, `"rlhf"`, `"rl"` or `"benchmark"`: documented defaults for autolog options and GPU sampling. Explicit `autolog={...}` options win. See [Presets](#presets). |
+| `monitor_interval` | `float \| None` | `2.0`, or the preset's | Seconds between GPU snapshots (min 0.1). |
 | `rank_zero_only` | `bool` | `True` | In a distributed job (`RANK`/`LOCAL_RANK`/`WORLD_SIZE`) only rank 0 creates a run; other ranks get an inert stand-in (`run_id is None`, every method a no-op). `False`: one run per rank. |
 
 Raises `PermissionError` if the server rejects the key, `LookupError` if the project doesn't exist or the key can't use it (or `resume` names an unknown run), `ValueError` if `resume` is malformed or the run belongs to another project. See [auth.md](auth.md).
@@ -515,6 +520,9 @@ Live-editable options (assignment takes effect immediately; `init(autolog={...})
 | `grad_health` | `False` | Per-parameter gradient/weight stats and anomaly detection, as `run.watch`. Expensive. Without a model hint every module is discovered through a global forward hook (parameters named `<Class>.<n>.<param>`); with `run.track(model=...)` only that model is watched under its normal names. |
 | `grad_log_freq` | `100` | Backward passes between per-parameter statistics (`grad_health`). |
 | `profile_every` | `None` | Profile one whole iteration (forward, backward, step) every N steps; `None` = never. |
+| `capture_grad` | `False` | Also capture `torch.autograd.grad(loss, ...)` calls as losses; see [Loss without an optimizer step](#loss-without-an-optimizer-step-and-torchautogradgrad). |
+| `episode_window` | `100` | Episodes in the rolling window of [`run.log_episode`](#runlog_episode). |
+| `episode_log_every` | `10` | `run.log_episode` logs its statistics every N episodes. |
 
 ### Auto metrics
 
@@ -540,10 +548,39 @@ ignored). Several backwards per optimizer step on the same stream are gradient a
 **mean** over the step. Different streams (GAN generator and discriminator, a multi-task loss backpropagated in parts) are
 logged separately. With one stream the metric is `auto/loss`; once a second one exists the new ones are `auto/loss/1`,
 `auto/loss/2`... (a stream keeps the name it was first logged under, so `auto/loss` stays stream 0).
-Name them for readable charts: `run.name_loss("disc", d_loss).backward()`. Only the optimizer step closes a window, so a
-program that calls `backward()` without ever stepping an optimizer logs no loss.
+Name them for readable charts: `run.name_loss("disc", d_loss).backward()`. Only an optimizer step closes a
+window; for programs that never step one see the fallback below.
 
 NaN/Inf in the loss is reported by the normal anomaly detection when the value is read (one cadence later).
+
+### Loss without an optimizer step, and `torch.autograd.grad`
+
+**Fallback.** A program that calls `backward()` but never steps an optimizer (hand-written updates such as
+`p -= lr * p.grad`, a custom update rule, a script that only measures gradients) would otherwise log no loss. While no
+optimizer has stepped, the loss is logged anyway, counted in **backward calls**: each stream logs the mean of every
+`log_every` backwards, at *that stream's* own backward count as the step (`auto/loss` at 10, 20, 30, ... with
+`log_every=10`; the step counter `run.step` stays 0). To stay out of the way of gradient accumulation, nothing is logged
+live until a stream has made 1024 backwards without any optimizer step; at that point the values kept since the start
+are logged retroactively in `log_every` chunks, and logging continues live. Short programs get their chunks (plus one for the
+trailing partial chunk) when the run ends. The fallback ends for good the first time an optimizer steps (accumulation
+windows longer than 1024 backwards before the *first* step are therefore misread; step an optimizer earlier or set
+`run.config.loss = False` and log the loss yourself). Throughput and learning rates are not logged in this mode.
+
+**`torch.autograd.grad`.** Some update rules never call `backward()`: `grads = torch.autograd.grad(loss, params)`. Set
+`run.config.capture_grad = True` (or `autolog={"capture_grad": True}`) and scalar floating-point `outputs` of
+`torch.autograd.grad` are captured exactly like a `backward()` loss (same streams, naming and fallback). It is **off by
+default** because libraries and gradient penalties (`grad(critic(x).sum(), x, create_graph=True)`) call it with scalars that are
+not training losses; with it on, those show up as extra `auto/loss/<n>` streams (tag the real loss with `run.name_loss`).
+The wrapper is installed only while the option is on and removed at `finish`.
+
+### `torch.compile`
+
+Autolog works with a compiled model (`torch.compile(model)`): the backward pass goes through `Tensor.backward` as usual.
+A compiled **optimizer step** (`torch.compile` around a function that calls `optimizer.step()`, or `optimizer.step =
+torch.compile(optimizer.step)`) is also counted: PyTorch's global optimizer post-hook still fires for it. This is covered by tests with the
+`eager` and `inductor` backends (`tests/test_launcher_presets.py`, CPU). Not verified: a step captured into a CUDA graph
+(`mode="reduce-overhead"`) replays without running Python, so the hook may not fire there (check on your setup; if steps go
+uncounted use `run.set_step(n)` or an explicit `step=`).
 
 ### `run.track(...)`
 
@@ -573,6 +610,112 @@ learning rates, stacking loss references, `.item()`) happens once per `log_every
 `tests/test_autolog.py::test_overhead_is_small` prints the numbers on your machine). Real GPU steps take milliseconds, so the relative cost is lower still. `grad_health` is the
 exception: it computes per-parameter statistics on the CPU every `grad_log_freq` backward passes and should be used
 deliberately.
+
+---
+
+## Presets
+
+`init(preset=NAME)` (or `$PYROMETER_PRESET`, or `pyrometer run --preset NAME`) applies documented defaults for a kind of
+job. A preset only sets [`run.config`](#runconfig) options, the GPU sampling interval and a few reminders; it never looks
+at your model. **Precedence**, lowest to highest: library defaults, preset, explicit `init(autolog={...})` options,
+`run.config.<option> = ...` assignments at any time. `autolog=False` (or `PYROMETER_AUTOLOG=0`) turns autolog off and
+leaves the preset's non-autolog settings in place. `pyrometer presets` prints this table from the code.
+
+| Preset | autolog options | GPU sampling | Reminder at finish | Naming convention |
+|--------|-----------------|--------------|--------------------|-------------------|
+| `llm-pretrain` | `log_every=10`, `grad_norm=True`, `profile_every=500`, `throughput=True` | 2 s | no `run.track(tokens_per_batch=...)` | `eval/loss`, `eval/ppl`; `tokens_seen` is the axis |
+| `finetune` | `log_every=10`, `grad_norm=True`, `throughput=True` | 2 s | no tokens hint; no `run.log_samples` | `train/loss`, `eval/loss`, `eval/<metric>`; samples keys `prompt`, `completion`, `reference`, `reward` |
+| `rlhf` | `log_every=10`, `grad_norm=True`, `throughput=True` | 2 s | no `run.log_samples` | `reward/mean`, `reward/std`, `kl`, `policy/entropy`, `policy/clip_frac` |
+| `rl` | `log_every=10`, `grad_norm=True`, `episode_window=100`, `episode_log_every=10` | 2 s | none | [`run.log_episode`](#runlog_episode) -> `episode/*` and the `env_steps` axis |
+| `benchmark` | `loss=False`, `lr=False`, `throughput=True`, `log_every=10` | **0.5 s**, plus clock-throttle capture | none | compare `auto/steps_per_sec`, `auto/tokens_per_sec`, system charts |
+
+*Reminders* are one-line hints printed once to stderr when the run finishes if the data the preset is meant for never
+arrived (`preset finetune: no run.log_samples(...) call was made ...`). They never raise.
+
+*Clock-throttle capture* (`benchmark`): clocks and temperature are always in the system snapshots; with this on, the monitor
+also reads NVML's clock-throttle reasons and logs `hw/gpu<i>/throttle_reasons` (the NVML bitmask) whenever it changes, and a
+`thermal_throttle` warning event when a power or thermal limit starts slowing a GPU (`sw_power_cap`, `hw_slowdown`,
+`sw_thermal_slowdown`, `hw_thermal_slowdown`, `hw_power_brake_slowdown`; idle and application-clock reasons are logged in the
+bitmask but raise no event). Not available without NVML.
+
+```python
+with pyrometer.init(name="gpt-small", preset="llm-pretrain", autolog={"profile_every": 200}) as run:   # override one option
+    loader = run.track(dataloader=loader, tokens_per_batch=B * T)
+    run.config.log_every = 25                                                                          # live change
+```
+
+---
+
+## Launcher: `pyrometer run`
+
+```
+pyrometer run [--name N] [--project P] [--group G] [--preset X] [--tag T ...] [--no-autolog]
+              (script.py | -m module) [script arguments ...]
+```
+
+Runs an unmodified script with a run already open and autolog hooks live: no code changes. It opens the run with
+`pyrometer.init`, executes the script **in the same process** (`runpy`, `__name__ == "__main__"`, `sys.argv` and `sys.path[0]` as
+`python script.py` would have them), and closes the run in a `with`-style block. Options before the script belong to the
+launcher; everything after the script (or `-m module`) is the script's. Default run name: the script's file name without
+`.py` (or the module name).
+
+**Hyperparams from argv.** The script's arguments are parsed best effort into the run's hyperparams: `--key value`,
+`--key=value`, `-k value`, bare `--flag` (`True`), repeated keys (a list), dashes in keys become underscores; values that
+look like ints, floats, `true`/`false` or `none`/`null` are converted, the rest stay strings; arguments that belong to no
+option go under `positional`. Two extra keys are always stored: `argv` (the raw argument list) and `script` (the target).
+It cannot know your parser: a flag directly followed by a bare word takes it as its value (`--bf16 data.txt` -> `bf16:
+"data.txt"`; write `--bf16=true` or put positionals first), and `--no-x` is stored as the key `no_x`. The raw `argv` is
+the source of truth.
+
+**Exit status** is exactly the context manager's: normal end or `SystemExit(0)`/`SystemExit()` -> `completed`;
+`SystemExit(<non-zero or message>)` and any uncaught exception -> `failed` (with an `exception` event); `KeyboardInterrupt` ->
+`killed`. The exception is never swallowed, so the process exits with the script's own code and traceback.
+
+**A script that calls `pyrometer.init()` itself** (typical: it already has one) does not create a second run. Its *first*
+`init()` call returns the launcher's run (the same `Run` object) and applies what it passes to it:
+
+| `init()` argument | Effect on the launcher's run |
+|---|---|
+| `name` | Renames the run, unless `--name` was given (the command line wins). |
+| `hyperparams` | Merged over the ones parsed from argv (the script's values win on a clash; `argv`/`script` stay). |
+| `tags` | Union with `--tag`s. |
+| `notes` | Set. |
+| `group` | Set, unless `--group` was given. |
+| `autolog={...}` | Options applied to `run.config`. `autolog=False` stops autolog for the run (`--no-autolog` itself cannot be overridden by `autolog=True`). |
+| `preset` | Applied (options, GPU sampling interval, reminders), unless `--preset` was given. |
+| `project`, `server`, `offline`, `resume`, `anomaly_detection`, `rank_zero_only`, `api_key` | **Ignored**; a differing `project`/`server`, or any `resume`/`offline`, prints one warning. They decide where and how the run exists, which the launcher already did: set them on the launcher command line or in the environment (`PYROMETER_SERVER`, `PYROMETER_API_KEY`, `PYROMETER_RUN_ID`, `PYROMETER_MODE`, `PYROMETER_GROUP`, `PYROMETER_PRESET`). |
+
+Every later `init()` creates an independent run as usual (a sweep inside one script gets one attached run plus the others).
+The script finishing the run (`with` block or `run.finish()`) ends the launcher's run; the launcher then has nothing left to do.
+`pyrometer.current_run()` returns the run from anywhere in the script.
+
+**Distributed.** `torchrun --nproc_per_node N -m pyrometer run train.py --lr 1e-3` (`torchrun` accepts `-m`): every rank runs the
+launcher, rank 0 creates the run, the other ranks just run the script (their `init()` returns the inert stand-in, as with `rank_zero_only`).
+With `python -m torch.distributed.run` or `accelerate launch` put `-m pyrometer run` the same way. A script that spawns
+workers itself (`mp.spawn`, `DataLoader` workers) is unaffected: hooks live in the launcher process only.
+
+---
+
+## `run.log_episode()`
+
+```python
+run.log_episode(return_, length=None, step=None, **info)
+```
+
+For reinforcement learning (the `rl` preset configures it, but it works anywhere): call it when an episode ends. Each call
+adds to a rolling window of the last `run.config.episode_window` episodes (default 100); every
+`run.config.episode_log_every` episodes (default 10) it logs, at `step` (default: the automatic step `run.step`):
+
+| Metric | Meaning |
+|--------|---------|
+| `episode/return_mean`, `episode/return_min`, `episode/return_max` | Statistics of the episode return over the window. |
+| `episode/length_mean` | Mean episode length (when `length` is given). |
+| `episode/count` | Episodes recorded so far. |
+| `env_steps` | Cumulative sum of `length` (an axis metric: select it as the dashboard x-axis). |
+| `episode/<key>_mean` | Rolling mean of each extra numeric keyword (`success=1.0`, ...). |
+
+Statistics recorded since the last emission are flushed when the run finishes. Reinforcement-learning loops usually step an
+optimizer every N environment steps, so `run.step` counts updates while `env_steps` counts interaction; chart against `env_steps`.
 
 ---
 

@@ -425,6 +425,7 @@ class UpdateRunRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     tags: list[str] | None = Field(default=None, max_length=50)
     group: str | None = Field(default=None, max_length=128)  # "" or null clears it
+    hyperparams: dict | None = None  # SDK keys only (a `pyrometer run` launcher adopting the script's init())
     # Hardware/environment fields the SDK fills in after init (probing torch takes seconds).
     git_hash: str | None = None
     git_dirty: bool | None = None
@@ -1258,7 +1259,7 @@ def _clean_tags(tags: list[str]) -> list[str]:
     return out
 
 
-_HW_FIELDS = ("status", *RUN_INFO_FIELDS)
+_HW_FIELDS = ("status", "hyperparams", *RUN_INFO_FIELDS)
 
 
 @app.patch("/runs/{run_id}")
@@ -1279,6 +1280,8 @@ async def update_run(run_id: str, req: UpdateRunRequest, request: Request):
         meta["tags"] = _clean_tags(req.tags)
     if "group" in req.model_fields_set:
         meta["run_group"] = (req.group or "").strip() or None
+    if req.hyperparams is not None:
+        meta["hyperparams"] = req.hyperparams
     # An explicit status always wins, including a replayed one after the sweeper marked the run crashed.
     before = db_get_run_status(run_id)
     if before is None:

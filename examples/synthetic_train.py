@@ -3,12 +3,20 @@
 Uses either real PyTorch (random tensors, no torchvision needed) or a pure-Python
 simulation if torch isn't installed.
 
+The run is opened with ``with pyrometer.init(...) as run:`` and the ``llm-pretrain`` preset, so the step counter,
+loss, learning rate, gradient norm, tokens/sec and the per-parameter gradient health are logged by autolog without
+a single ``run.log`` call for them. Only what autolog cannot know is logged by hand: accuracy, validation
+metrics, an image, generation samples, a checkpoint artifact and events.
+
 Usage:
     # Start the server first
     pyrometer serve
 
     # In another terminal
     python examples/synthetic_train.py
+
+    # The same script with zero SDK calls in the loop, through the launcher (init() below attaches to its run)
+    pyrometer run --preset llm-pretrain examples/synthetic_train.py
 
     # Continue an earlier run (same run, steps carry on after its last logged step)
     python examples/synthetic_train.py --resume <run_id>
@@ -33,14 +41,15 @@ except ImportError:
 import pyrometer
 
 SEED = 0
-TOKENS_PER_STEP = 64 * 128  # batch 64 x sequence length 128; logged as the "tokens_seen" x-axis metric
+TOKENS_PER_STEP = 64 * 128  # batch 64 x sequence length 128; autolog logs the "tokens_seen" x-axis metric
+SPIKE_STEP = 300  # a deliberate loss spike so the dashboard shows a real anomaly event
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", metavar="RUN_ID", help="continue this existing run instead of starting a new one")
     args = parser.parse_args()
-    run = pyrometer.init(
+    with pyrometer.init(
         name="synthetic-mlp-baseline",
         hyperparams={
             "lr": 3e-4,
@@ -52,15 +61,16 @@ def main() -> None:
         tags=["synthetic", "mlp", "baseline"],
         group="synthetic-baselines",  # groups related runs; filter by it in the dashboard
         resume=args.resume,
-    )
-    print(f"Run ID: {run.run_id}" + (f" (resumed after step {run.last_step})" if run.resumed else ""))
-
-    if HAS_TORCH:
-        _train_torch(run)
-    else:
-        _train_simulated(run)
-
-    run.finish()
+        preset="llm-pretrain",  # grad_norm on, tokens/sec, profile every 500 steps
+        # Short run: log every step (the anomaly detector needs ~50 samples), profile every 100 steps,
+        # and watch per-parameter gradient/weight statistics every 20 backward passes.
+        autolog={"log_every": 1, "profile_every": 100, "grad_health": True, "grad_log_freq": 20},
+    ) as run:
+        print(f"Run ID: {run.run_id}" + (f" (resumed after step {run.last_step})" if run.resumed else ""))
+        if HAS_TORCH:
+            _train_torch(run)
+        else:
+            _train_simulated(run)
     print(f"Done. Check: {run.server}/#/runs/{run.run_id}")
 
 
@@ -84,41 +94,25 @@ def _train_torch(run: pyrometer.Run) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     criterion = nn.CrossEntropyLoss()
 
-    # Monitor gradient and weight statistics every 20 backward passes
-    run.watch(model, log_freq=20)
+    # Hints autolog cannot guess: tokens per batch (-> tokens_seen axis, tokens/sec) and the model to watch.
+    run.track(tokens_per_batch=TOKENS_PER_STEP, samples_per_batch=64, model=model)
 
     best_val_loss = float("inf")
-    global_step = run.last_step + 1 if run.resumed and run.last_step is not None else 0
     for epoch in range(5):
-        for step_in_epoch in range(100):
+        for _ in range(100):
             x = torch.randn(64, 784, device=device)
             y = torch.randint(0, 10, (64,), device=device)
 
-            # Profile one step per epoch so the profiler view has data to show.
-            if step_in_epoch == 0:
-                with run.profile(step=global_step):
-                    optimizer.zero_grad()
-                    logits = model(x)
-                    loss = criterion(logits, y)
-                    loss.backward()
-                    optimizer.step()
-            else:
-                optimizer.zero_grad()
-                logits = model(x)
-                loss = criterion(logits, y)
-                loss.backward()
-                optimizer.step()
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            if run.step == SPIKE_STEP - 1:  # the step about to complete is SPIKE_STEP
+                loss = loss * 50  # autolog records this loss; its anomaly detector flags the spike
+            loss.backward()  # <- autolog captures the loss here
+            optimizer.step()  # <- ... and counts the step, reads the lr, the gradient norm and the throughput
 
-            acc = (logits.argmax(1) == y).float().mean().item()
-            grad_norm = (
-                sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-            )
-            # Deliberately inject one loss spike at step 300 so the dashboard shows a real
-            # anomaly event (the detector is conservative: ordinary noise never fires).
-            logged_loss = loss.item() * 50 if global_step == 300 else loss.item()
-            run.log({"train/loss": logged_loss, "train/accuracy": acc, "train/grad_norm": grad_norm, "lr": 3e-4,
-                     "tokens_seen": (global_step + 1) * TOKENS_PER_STEP}, step=global_step)
-            global_step += 1
+            # Only what autolog cannot know: accuracy (step-less log: lands on the optimizer-step counter).
+            run.log({"train/accuracy": (logits.argmax(1) == y).float().mean().item()})
 
         with torch.no_grad():
             x_val = torch.randn(256, 784, device=device)
@@ -127,9 +121,8 @@ def _train_torch(run: pyrometer.Run) -> None:
             val_loss = criterion(val_logits, y_val).item()
             val_acc = (val_logits.argmax(1) == y_val).float().mean().item()
 
-        run.log({"val/loss": val_loss, "val/accuracy": val_acc,
-                 "tokens_seen": global_step * TOKENS_PER_STEP}, step=global_step)
-        print(f"Epoch {epoch + 1}/5 — train_loss={loss.item():.4f}  val_loss={val_loss:.4f}")
+        run.log({"val/loss": val_loss, "val/accuracy": val_acc})
+        print(f"Epoch {epoch + 1}/5 — step={run.step}  val_loss={val_loss:.4f}")
 
         # Log a synthetic prediction confidence image (H=10 class probs, W=8 samples)
         with torch.no_grad():
@@ -137,15 +130,14 @@ def _train_torch(run: pyrometer.Run) -> None:
             probs = torch.softmax(model(sample_x), dim=1).cpu()  # (8, 10)
         # Reshape to (1, 10, 8) so it's a 1-channel "image" of class probabilities
         conf_img = probs.T.unsqueeze(0)  # (1, 10, 8)
-        run.log_image("class_confidence", conf_img, step=global_step)
+        run.log_image("class_confidence", conf_img)
 
         # Synthetic prompt/completion/reward samples (stand-in for LLM generations), low cadence
-        if True:
-            run.log_samples(global_step, [
-                {"prompt": f"What is {a} + {b}?", "completion": f"The answer is {a + b + (i % 2)}.",
-                 "reward": round(float(max(0.0, 1.0 - val_loss / 3 - 0.3 * (i % 2))), 3), "reference": str(a + b)}
-                for i, (a, b) in enumerate([(2, 3), (7, 5), (12, 9), (4, 4)])
-            ], name="eval_generations")
+        run.log_samples([
+            {"prompt": f"What is {a} + {b}?", "completion": f"The answer is {a + b + (i % 2)}.",
+             "reward": round(float(max(0.0, 1.0 - val_loss / 3 - 0.3 * (i % 2))), 3), "reference": str(a + b)}
+            for i, (a, b) in enumerate([(2, 3), (7, 5), (12, 9), (4, 4)])
+        ], name="eval_generations")
 
         # Track best checkpoint and log an event when val loss improves
         if val_loss < best_val_loss:
@@ -165,7 +157,7 @@ def _train_torch(run: pyrometer.Run) -> None:
 
 
 def _train_simulated(run: pyrometer.Run) -> None:
-    """Pure-Python fallback generating a plausible loss curve."""
+    """Pure-Python fallback generating a plausible loss curve (no torch: no autolog, so steps are explicit)."""
     global_step = run.last_step + 1 if run.resumed and run.last_step is not None else 0
     base_loss = 2.302  # ln(10) — random baseline for 10 classes
 
@@ -173,6 +165,8 @@ def _train_simulated(run: pyrometer.Run) -> None:
         for _ in range(100):
             decay = math.exp(-global_step / 300)
             loss = base_loss * decay + 0.35 + random.gauss(0, 0.04)
+            if global_step == SPIKE_STEP:
+                loss *= 50
             acc = min(1.0, max(0.0, 1 - loss / base_loss * 0.9 + random.gauss(0, 0.02)))
             run.log({"train/loss": loss, "train/accuracy": acc, "lr": 3e-4,
                      "tokens_seen": (global_step + 1) * TOKENS_PER_STEP}, step=global_step)

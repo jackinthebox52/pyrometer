@@ -4,10 +4,17 @@ import ipaddress
 import os
 import sys
 
-from pyrometer.server import auth
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "run":  # the launcher takes the script's own flags: no argparse, no server imports
+        from pyrometer._launcher import main as run_script
+
+        run_script(sys.argv[2:])
+        return
+
+    from pyrometer.server import auth
+
     parser = argparse.ArgumentParser(prog="pyrometer", description="Pyrometer experiment dashboard")
     sub = parser.add_subparsers(dest="command")
 
@@ -50,8 +57,15 @@ def main() -> None:
     )
     sync.add_argument("--server", help="server URL (default: $PYROMETER_SERVER, then the URL recorded in the spool)")
 
+    sub.add_parser(
+        "run", help="run a training script inside a Pyrometer run: pyrometer run [options] script.py [args]"
+    )
+    sub.add_parser("presets", help="list the presets for init(preset=...) / pyrometer run --preset")
+
     args = parser.parse_args()
-    if args.command in (None, "serve"):
+    if args.command == "presets":
+        _presets()
+    elif args.command in (None, "serve"):
         if args.command is None:
             args = serve.parse_args([])
         _serve(args)
@@ -61,6 +75,20 @@ def main() -> None:
         _sync(args)
     else:
         _admin(args)
+
+
+def _presets() -> None:
+    from pyrometer._presets import PRESETS
+
+    for p in PRESETS.values():
+        print(f"{p.name}\n  {p.summary}")
+        print("  autolog:  " + ", ".join(f"{k}={v}" for k, v in p.autolog.items()))
+        print(f"  monitor:  GPU sample every {p.monitor_interval:g}s" + ("; clock throttle capture on" if p.capture_throttle else ""))
+        if p.reminders:
+            print(f"  reminds:  {', '.join(p.reminders)} (printed at finish if never used)")
+        print(f"  convention: {p.conventions}\n")
+    print("Use:  pyrometer.init(preset=NAME)   or   pyrometer run --preset NAME train.py")
+    print("Explicit init(autolog={...}) options and run.config assignments override a preset.")
 
 
 def _is_loopback(host: str) -> bool:
@@ -119,6 +147,8 @@ def _sync(args: argparse.Namespace) -> None:
 
 
 def _keys(args: argparse.Namespace) -> None:
+    from pyrometer.server import auth
+
     if args.keys_command == "create":
         if args.project is not None:
             from pyrometer.server.db import db_get_project
@@ -145,6 +175,8 @@ def _keys(args: argparse.Namespace) -> None:
 
 def _admin(args: argparse.Namespace) -> None:
     import secrets
+
+    from pyrometer.server import auth
 
     if args.password_stdin:
         password, generated = sys.stdin.readline().rstrip("\n"), False

@@ -9,6 +9,10 @@ Usage:
 
     # Run a subset by passing script names (without path or .py):
     python examples/run_all.py synthetic_train lr_sweep
+
+    # Run every script through the launcher instead (`pyrometer run script.py`): same runs, the first init()
+    # of each script attaches to the launcher's run
+    python examples/run_all.py --launch
 """
 
 import subprocess
@@ -30,7 +34,7 @@ DEFAULT_SCRIPTS = [
 ]
 
 
-def run_script(name: str) -> bool:
+def run_script(name: str, launch: bool = False) -> bool:
     """Run a single example script. Returns True on success."""
     script = EXAMPLES_DIR / f"{name}.py"
     if not script.exists():
@@ -43,7 +47,7 @@ def run_script(name: str) -> bool:
 
     start = time.monotonic()
     result = subprocess.run(
-        [sys.executable, str(script)],
+        [sys.executable, *(["-m", "pyrometer", "run"] if launch else []), str(script)],
         check=False,
     )
     elapsed = time.monotonic() - start
@@ -57,7 +61,9 @@ def run_script(name: str) -> bool:
 
 
 def main() -> None:
-    scripts = sys.argv[1:] if len(sys.argv) > 1 else DEFAULT_SCRIPTS
+    argv = [a for a in sys.argv[1:] if a != "--launch"]
+    launch = len(argv) != len(sys.argv) - 1
+    scripts = argv or DEFAULT_SCRIPTS
 
     print(f"\nPyrometer — running {len(scripts)} example script(s)\n")
     print("Make sure the server is running:  pyrometer serve")
@@ -67,7 +73,7 @@ def main() -> None:
     total_start = time.monotonic()
 
     for name in scripts:
-        ok = run_script(name)
+        ok = run_script(name, launch)
         results[name] = ok
         print()
 

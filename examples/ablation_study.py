@@ -15,6 +15,9 @@ relative to baseline to produce genuinely different loss/accuracy trajectories:
   sgd-step      — SGD+momentum with step-decay LR, needs different LR range
   large-batch   — 8× larger batch with linearly scaled LR, fewer but noisier steps
 
+Each run is `with pyrometer.init(...) as run:`; autolog records the step, loss, learning rate and gradient norm,
+so the loop only logs accuracy and validation metrics.
+
 Usage:
     pyrometer serve                    # terminal 1
     python examples/ablation_study.py  # terminal 2
@@ -244,14 +247,13 @@ def train_one_run(
     y_val = torch.from_numpy(y_val_np).to(device)
 
     model = build_model(n_features, hp["hidden_dims"], hp["dropout"]).to(device)
-    run.watch(model, log_freq=20)
+    run.track(samples_per_batch=batch_size, model=model)  # model = gradient-health target
     optimizer = build_optimizer(model, hp)
     criterion = nn.CrossEntropyLoss()
 
     steps_per_epoch = max(1, len(X_train) // batch_size)
     scheduler = build_scheduler(optimizer, hp, epochs * steps_per_epoch)
 
-    global_step = 0
     n_train = len(X_train)
     best_val_acc = 0.0
 
@@ -260,41 +262,30 @@ def train_one_run(
         perm = torch.randperm(n_train, device=device)
         X_shuf, y_shuf = X_train[perm], y_train[perm]
 
-        ep_loss, ep_correct, n_batches = 0.0, 0, 0
+        ep_loss = torch.zeros((), device=device)  # accumulate on the device: no per-step sync
+        ep_correct = torch.zeros((), device=device)
+        n_batches = 0
 
         for i in range(0, n_train - batch_size + 1, batch_size):
             xb = X_shuf[i : i + batch_size]
             yb = y_shuf[i : i + batch_size]
 
             # Profile the first batch of each epoch
-            ctx = run.profile(step=global_step) if i == 0 else nullcontext()
+            ctx = run.profile() if i == 0 else nullcontext()
             with ctx:
                 optimizer.zero_grad()
                 logits = model(xb)
                 loss = criterion(logits, yb)
-                loss.backward()
-
-                grad_norm = (
-                    sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                )
-
-                optimizer.step()
+                loss.backward()  # autolog captures the loss ...
+                optimizer.step()  # ... counts the step and logs lr, grad norm and throughput
                 scheduler.step()
 
-            run.log(
-                {
-                    "train/loss": loss.item(),
-                    "train/accuracy": (logits.argmax(1) == yb).float().mean().item(),
-                    "train/grad_norm": grad_norm,
-                    "lr": scheduler.get_last_lr()[0],
-                },
-                step=global_step,
-            )
-
-            ep_loss += loss.item()
-            ep_correct += (logits.argmax(1) == yb).sum().item()
+            batch_correct = (logits.argmax(1) == yb).sum()
+            ep_loss += loss.detach()
+            ep_correct += batch_correct
             n_batches += 1
-            global_step += 1
+            if run.step % 10 == 0:  # a custom metric, on the same step as the auto metrics
+                run.log({"train/accuracy": batch_correct.item() / batch_size})
 
         model.eval()
         with torch.no_grad():
@@ -309,10 +300,10 @@ def train_one_run(
             val_loss = float(np.mean(val_losses))
             val_acc = torch.cat(val_preds).mean().item()
 
-        run.log({"val/loss": val_loss, "val/accuracy": val_acc}, step=global_step)
+        run.log({"val/loss": val_loss, "val/accuracy": val_acc})  # step-less: the current optimizer step
         print(
             f"  epoch {epoch + 1:2d}/{epochs} — "
-            f"train_loss={ep_loss/n_batches:.4f}  train_acc={ep_correct/(n_batches*batch_size):.3f}  "
+            f"train_loss={ep_loss.item()/n_batches:.4f}  train_acc={ep_correct.item()/(n_batches*batch_size):.3f}  "
             f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}"
         )
 
@@ -341,18 +332,16 @@ def main() -> None:
     for config in CONFIGS:
         hp = config["hp"]
         hp["n_features"] = n_features  # log actual feature count after one-hot
-        run = pyrometer.init(
+        with pyrometer.init(
             name=config["name"],
             hyperparams=hp,
             tags=config["tags"],
             group="ablation-study",
             notes=config["notes"],
-        )
-        print(f"[{config['name']}] run_id={run.run_id}")
-
-        train_one_run(run, hp, X_train, y_train, X_val, y_val)
-
-        run.finish()
+            autolog={"log_every": 10, "grad_norm": True, "grad_health": True, "grad_log_freq": 20},
+        ) as run:
+            print(f"[{config['name']}] run_id={run.run_id}")
+            train_one_run(run, hp, X_train, y_train, X_val, y_val)
         print(f"[{config['name']}] done\n")
 
     print(

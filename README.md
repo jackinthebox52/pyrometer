@@ -5,8 +5,13 @@ Track metrics, compare runs, and profile GPU kernels — all local, no cloud, no
 
 **Features**
 
+- **Autolog**: wrap training in `with pyrometer.init(...) as run:` and the step counter, loss, learning rate, steps/sec,
+  tokens/samples throughput and (opt-in) gradient norm and health are recorded with no logging calls in your loop.
+  `pyrometer run train.py` does the same to an unmodified script; **presets** (`llm-pretrain`, `finetune`, `rlhf`,
+  `rl`, `benchmark`) pick sensible defaults for a kind of job.
 - **SDK**: `run.log`, `watch` (gradient/weight stats), `profile` (torch.profiler), `event`, `log_artifact`,
-  `log_image` / `log_histogram` / `log_figure`, and `log_samples` (prompt/completion/reward tables).
+  `log_image` / `log_histogram` / `log_figure`, `log_samples` (prompt/completion/reward tables) and
+  `log_episode` (rolling RL episode statistics).
 - **Durable delivery**: payloads are journaled to disk before sending (a SIGKILL loses ~nothing), retried with backoff and replayed automatically after outages, `init()` works with the server down; `init(offline=True)` records
   without a network and `pyrometer sync` uploads later. Retries never double-insert.
 - **Run health**: heartbeat plus statuses `running` / `completed` / `failed` / `crashed` / `killed`; a run that goes
@@ -48,7 +53,46 @@ export PYROMETER_API_KEY=pyro_...
 export PYROMETER_SERVER=http://localhost:8321                      # optional
 ```
 
-Add three lines to any training script:
+### 1. Wrap your training in `with`
+
+```python
+import pyrometer
+
+with pyrometer.init(name="my-experiment", hyperparams={"lr": 3e-4, "batch_size": 64}) as run:
+    train(model, optimizer, dataloader)     # your existing loop, untouched
+```
+
+That is the whole integration. While the block is open, Pyrometer hooks PyTorch globally (and removes the hooks on
+exit) and records, under the `auto/` prefix: the **step** (optimizer steps), the **loss** of every `backward()`, the
+**learning rate**, **steps/sec**, and optionally tokens/samples throughput, gradient norm and per-parameter gradient
+health. The run finishes by itself: `completed`, `killed` on Ctrl-C, `failed` on an exception (never swallowed).
+Add whatever autolog cannot know by hand, `run.log({"val/acc": acc})` (no `step=` needed), and tell it about your data
+with `run.track(tokens_per_batch=..., dataloader=...)`. See [docs/sdk-reference.md](docs/sdk-reference.md#autolog).
+
+### 2. Or change no code at all: `pyrometer run`
+
+```bash
+pyrometer run --name baseline --project vision --tag sweep train.py --lr 3e-4 --epochs 20
+pyrometer run -m my_pkg.train --config configs/base.yaml
+torchrun --nproc_per_node 4 -m pyrometer run train.py     # rank 0 logs
+```
+
+The script runs in the same process under a run that autolog is already attached to; `--lr 3e-4 --epochs 20` become the
+run's hyperparams (best effort, plus the raw `argv`), and the exit status becomes the run status. If the script calls
+`pyrometer.init()` itself, its first call attaches to the launcher's run instead of creating a second one.
+
+### 3. Presets
+
+```python
+with pyrometer.init(name="gpt-small", preset="llm-pretrain") as run:    # or: pyrometer run --preset llm-pretrain
+    ...
+```
+
+`llm-pretrain`, `finetune`, `rlhf`, `rl` and `benchmark` set autolog options (gradient norm, profiling cadence, episode
+statistics, fast GPU sampling with clock-throttle capture, ...). `pyrometer presets` lists exactly what each one does.
+Anything you pass explicitly (`autolog={...}`, `run.config.<option> = ...`) overrides a preset.
+
+### 4. Or log everything explicitly
 
 ```python
 import pyrometer
@@ -70,6 +114,7 @@ run = pyrometer.init(
     # resume="auto",                 # continue the run named by $PYROMETER_RUN_ID
     # offline=True,                  # no network; upload later with `pyrometer sync`
     # anomaly_detection={...},       # or False to disable
+    # autolog=False,                 # no automatic collection: pass step= to every log call
 )
 
 for step, batch in enumerate(dataloader):
@@ -103,7 +148,8 @@ Webhook alerts (crash, failure, event severity, anomaly, metric thresholds) are 
 
 ### `pyrometer.init(...) → Run`
 
-Registers a new run with the server. Automatically captures:
+Registers a new run with the server (a context manager: use it with `with`). Under `pyrometer run` the script's first
+call returns the launcher's run. Automatically captures:
 - Hardware: GPU model, VRAM, CUDA version, PyTorch version, hostname
 - Git state: commit hash, dirty flag
 
@@ -117,25 +163,36 @@ Registers a new run with the server. Automatically captures:
 | `offline` | `bool` | `False` (or `PYROMETER_MODE=offline`) | Write everything to a local spool, no network; upload later with `pyrometer sync` |
 | `resume` | `str \| None` | `None` (or `PYROMETER_RUN_ID`) | Run id to continue, or `"auto"` |
 | `anomaly_detection` | `bool \| dict` | `True` | Disable or tune automatic anomaly events |
+| `autolog` | `bool \| dict \| None` | `True` | Automatic step/loss/lr/throughput collection; a dict sets options |
+| `preset` | `str \| None` | `None` (or `PYROMETER_PRESET`) | `llm-pretrain`, `finetune`, `rlhf`, `rl` or `benchmark` |
+| `group` | `str \| None` | `None` | Experiment / sweep name |
 
 Delivery is durable: if the server is unreachable, data is retried in the background and spilled to
 `~/.pyrometer/spool/<run_id>/` (`PYROMETER_SPOOL_DIR`) instead of being lost. Run `pyrometer sync` to upload it;
 retries never double-insert.
 
-### `run.log(metrics, step)`
+### `run.log(metrics, step=None)`
 
-Log a dict of scalar metrics at a training step. Batches in memory and flushes every 5 seconds or 100 entries.
+Log a dict of scalar metrics at a training step. Batches in memory and flushes every 5 seconds or 100 entries. Without
+`step` the automatic step (`run.step`, completed optimizer steps) is used.
 
 ```python
 run.log({"train/loss": 0.42, "lr": 3e-4}, step=global_step)
+run.log({"val/acc": acc})                     # autolog on: lands on the current optimizer step
 ```
 
-### `run.profile(step)` *(context manager)*
+### `run.log_episode(return_, length=None, step=None, **info)`
 
-Profile a single training step. *(Phase 1: stub — full `torch.profiler` integration in Phase 4.)*
+Reinforcement learning: call it when an episode ends. Every 10 episodes it logs `episode/return_mean|min|max`,
+`episode/length_mean`, `episode/count` and the cumulative `env_steps` axis over a rolling window of 100 episodes
+(`run.config.episode_log_every` / `episode_window`).
+
+### `run.profile(step=None)` *(context manager)*
+
+Profile a single training step with `torch.profiler` (operators, CPU/CUDA time, shapes, memory).
 
 ```python
-with run.profile(step=global_step):
+with run.profile():
     val_loss = val_step(model, batch)
 ```
 
@@ -145,7 +202,8 @@ Log a list of JSON-able dicts (e.g. `prompt`, `completion`, `reward`, `reference
 
 ### `run.finish()`
 
-Flush remaining metrics, mark the run as `completed`, close the HTTP session. Always call this.
+Flush remaining metrics, mark the run as `completed`, close the HTTP session. Called for you at the end of a `with`
+block (which also sets `failed` / `killed` as appropriate); call it yourself when you do not use `with`.
 
 ---
 
@@ -190,8 +248,11 @@ uv run pyrometer serve
 uv run python examples/synthetic_train.py
 ```
 
-The script logs `train/loss`, `train/accuracy`, `val/loss`, and `val/accuracy` across 5 epochs.
-While it runs, check the server logs and then query the API to see your data.
+The script uses the `with` style and the `llm-pretrain` preset: autolog records `auto/loss`, `auto/lr/0`,
+`auto/grad_norm`, `auto/tokens_per_sec` and the step counter, and the script adds `train/accuracy`, `val/loss`,
+`val/accuracy`, an image, samples and a checkpoint artifact across 5 epochs (with one deliberate loss spike at step 300).
+`lr_sweep.py` and `optimizer_compare.py` run 9 runs each (3 settings x 3 seeds) for the compare view. The same script
+works through the launcher: `uv run pyrometer run examples/synthetic_train.py`.
 
 ---
 
@@ -227,6 +288,7 @@ Docker and nginx deployment: [docs/deployment.md](docs/deployment.md).
 ```
 Training Script
     └── pyrometer SDK
+        ├── autolog             → global optimizer-step / backward hooks (with-block or `pyrometer run`)
         ├── run.log()           → buffers metrics, flushes every 5s/100 entries
         ├── system monitor      → pynvml polling every 2s (background thread)
         └── HTTP POST → FastAPI server

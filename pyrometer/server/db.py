@@ -1001,7 +1001,8 @@ RUN_INFO_FIELDS = (
 )
 
 
-RUN_META_FIELDS = ("name", "tags", "run_group")  # organisation fields (rename / retag / regroup)
+# organisation fields (rename / retag / regroup) + hyperparams (SDK only: a launcher run adopting the script's)
+RUN_META_FIELDS = ("name", "tags", "run_group", "hyperparams")
 
 
 def db_touch_run(run_id: str, ts: float | None = None) -> None:
@@ -1016,7 +1017,7 @@ def db_update_run(
     """Update status / notes / hardware info / name, tags, group. Setting ``running`` also counts as a
     heartbeat, so a run revived by a status PATCH (or a resume) is not immediately swept back to
     ``crashed``. Any change bumps ``updated_at``. ``meta`` keys: ``name``, ``tags`` (list), ``run_group``
-    (``None`` clears)."""
+    (``None`` clears), ``hyperparams`` (dict, replaces)."""
     with _lock:
         conn = get_conn()
         now = time.time()
@@ -1046,7 +1047,7 @@ def db_update_run(
                 changed = True
                 conn.execute(
                     f"UPDATE runs SET {col} = ? WHERE run_id = ?",
-                    [json.dumps(val) if col == "tags" else val, run_id],
+                    [json.dumps(val) if col in ("tags", "hyperparams") else val, run_id],
                 )
         if changed:
             conn.execute("UPDATE runs SET updated_at = ? WHERE run_id = ?", [now, run_id])

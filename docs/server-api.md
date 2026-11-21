@@ -390,6 +390,7 @@ Update run status, notes, hardware info and the organisation fields (name, tags,
 | `notes` | `string` | No | Updated notes text (`""` clears it) |
 | `name` | `string` | No | Rename the run (1-200 characters, trimmed) |
 | `tags` | `list[string]` | No | **Replaces** the tag list (trimmed, deduplicated, at most 50 tags of at most 64 characters) |
+| `hyperparams` | `object` | No | **Replaces** the run's hyperparams. API keys only (dashboard sessions get 403). Used by the SDK when a script's `init()` attaches to a `pyrometer run` launcher run |
 | `group` | `string\|null` | No | Set the run's group (max 128 characters); `""`/`null` clears it |
 | `git_hash`, `git_dirty`, `gpu_model`, `gpu_memory_total`, `cuda_version`, `pytorch_version`, `python_version`, `hostname` | various | No | Hardware/environment fields. The SDK sends these in a follow-up PATCH once its background probe (importing torch, initialising NVML; takes seconds) is done, so `init()` does not wait for it. Absent or null fields are left unchanged |
 
