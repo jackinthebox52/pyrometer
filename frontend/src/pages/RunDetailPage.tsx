@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client.ts'
 import type { Artifact, Metric, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, SystemSnapshot } from '../api/types.ts'
 import GradientHeatmap from '../components/GradientHeatmap.tsx'
@@ -15,6 +15,8 @@ import CompareChart from '../components/CompareChart.tsx'
 import type { RunSeries } from '../components/CompareChart.tsx'
 import OperatorBreakdown from '../components/OperatorBreakdown.tsx'
 import StatusBadge from '../components/StatusBadge.tsx'
+import { RunActions, RunNotes, RunTitle } from '../components/RunOrganizer.tsx'
+import { useSession } from '../hooks/useSession.ts'
 import { duration, formatBytes, formatMicroseconds, timeAgo } from '../utils/format.ts'
 import { useWebSocket } from '../hooks/useWebSocket.ts'
 
@@ -325,6 +327,10 @@ function ModelHealthSection({
 
 export default function RunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
+  const navigate = useNavigate()
+  const { session, isAdmin } = useSession()
+  const canPin = session?.role === 'admin' || session?.role === 'user'
+  const [deleted, setDeleted] = useState(false)
   const [run, setRun] = useState<Run | null>(null)
   const [summary, setSummary] = useState<RunSummary | null>(null)
   const [metrics, setMetrics] = useState<Metric[]>([])
@@ -476,8 +482,18 @@ export default function RunDetailPage() {
   useWebSocket(
     useCallback(
       (msg) => {
+        if (msg.type === 'project_deleted') {
+          if ((msg as { project?: string }).project === runRef.current?.project) setDeleted(true)
+          return
+        }
+        if (msg.type === 'project_updated') {
+          fetchRun().catch(() => {})
+          return
+        }
         if (msg.run_id !== runId) return
-        if (msg.type === 'metrics') fetchMetrics()
+        if (msg.type === 'run_deleted') setDeleted(true)
+        else if (msg.type === 'run_moved') fetchRun().catch(() => setDeleted(true))
+        else if (msg.type === 'metrics') fetchMetrics()
         else if (msg.type === 'system') fetchSystem()
         else if (msg.type === 'param_stats') fetchParamStats()
         else if (msg.type === 'logs') fetchLogs()
@@ -492,12 +508,25 @@ export default function RunDetailPage() {
               }
               fetchSummary()
             }
-          })
+          }).catch(() => {})
         }
       },
       [runId, fetchRun, fetchMetrics, fetchSystem, fetchParamStats, fetchLogs, fetchSummary],
     ),
   )
+
+  // A deleted run has nothing left to show: say so, then go back to the start page.
+  useEffect(() => {
+    if (!deleted) return
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current)
+      intervalRef.current = null
+    }
+    const t = setTimeout(() => navigate('/'), 2500)
+    return () => clearTimeout(t)
+  }, [deleted, navigate])
+
+  useEffect(() => setDeleted(false), [runId])
 
   // Fetch available profiled steps once on mount
   useEffect(() => {
@@ -547,6 +576,15 @@ export default function RunDetailPage() {
     [metricsByName, run],
   )
 
+  if (deleted) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-2" role="alert">
+        <span className="text-sm font-mono" style={{ color: '#e8eaf0' }}>This run was deleted.</span>
+        <button onClick={() => navigate('/')} className="text-xs font-mono underline" style={{ color: '#8b8fa8' }}>Back to runs</button>
+      </div>
+    )
+  }
+
   if (loading) {
     return <RunDetailSkeleton />
   }
@@ -582,10 +620,8 @@ export default function RunDetailPage() {
       {/* ── Header ── */}
       <div className="flex items-start justify-between mb-5">
         <div>
-          <h1 className="text-lg font-semibold mb-1.5" style={{ color: '#e8eaf0' }}>
-            {run.name}
-          </h1>
-          <div className="flex items-center gap-4">
+          <RunTitle run={run} isAdmin={isAdmin} onChanged={fetchRun} />
+          <div className="flex items-center gap-4 mt-2">
             <StatusBadge status={run.status} />
             <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
               {timeAgo(run.created_at)}
@@ -596,6 +632,7 @@ export default function RunDetailPage() {
           </div>
         </div>
         <div className="flex flex-col items-end gap-2">
+          <RunActions run={run} isAdmin={isAdmin} canPin={canPin} onChanged={fetchRun} />
           {/* Copy LLM Summary button */}
           <button
             onClick={() => {
@@ -623,25 +660,6 @@ export default function RunDetailPage() {
           </span>
         </div>
       </div>
-
-      {/* ── Tags ── */}
-      {run.tags.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-5">
-          {run.tags.map((tag) => (
-            <span
-              key={tag}
-              className="text-xs font-mono px-2 py-0.5 rounded"
-              style={{
-                backgroundColor: '#1a1d24',
-                color: '#8b8fa8',
-                border: '1px solid #252830',
-              }}
-            >
-              #{tag}
-            </span>
-          ))}
-        </div>
-      )}
 
       {/* ── Run summary stats ── */}
       {summary && (
@@ -713,18 +731,7 @@ export default function RunDetailPage() {
       </div>
 
       {/* ── Notes ── */}
-      {run.notes && (
-        <div
-          className="p-4 rounded-lg mb-6 text-sm leading-relaxed"
-          style={{
-            backgroundColor: '#111318',
-            border: '1px solid #252830',
-            color: '#8b8fa8',
-          }}
-        >
-          {run.notes}
-        </div>
-      )}
+      <RunNotes run={run} isAdmin={isAdmin} onChanged={fetchRun} />
 
       {/* ── Hyperparameters ── */}
       {Object.keys(run.hyperparams).length > 0 && (

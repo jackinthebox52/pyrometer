@@ -16,6 +16,13 @@ export default function App() {
     )
   }
 
+  function selectMany(ids: string[], on: boolean) {
+    setSelectedIds((prev) => {
+      if (!on) return prev.filter((x) => !ids.includes(x))
+      return [...prev, ...ids.filter((x) => !prev.includes(x))]
+    })
+  }
+
   function clearSelection() {
     setSelectedIds([])
   }
@@ -27,6 +34,7 @@ export default function App() {
         <RunSidebar
           selectedIds={selectedIds}
           onToggleSelect={toggleSelect}
+          onSelectMany={selectMany}
           onClearSelection={clearSelection}
         />
         <main className="flex-1 overflow-y-auto">

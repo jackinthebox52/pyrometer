@@ -1,5 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api } from '../api/client.ts'
+import ConfirmDialog from '../components/ConfirmDialog.tsx'
+import { useWebSocket } from '../hooks/useWebSocket.ts'
+import { timeAgo } from '../utils/format.ts'
 import type { AlertFormat, AlertKind, AlertRule, AlertTrigger, ApiKey, CreatedApiKey, Project, Session, UserAccount } from '../api/types.ts'
 
 const input =
@@ -8,6 +11,13 @@ const btn = 'rounded bg-py-amber px-3 py-1.5 text-xs font-mono text-black disabl
 const ghost = 'rounded border border-py-border px-2 py-1 text-xs font-mono text-py-muted'
 const section = 'flex flex-col gap-3'
 const h2 = 'text-xs font-mono uppercase tracking-widest text-py-muted'
+
+const RETENTION_TABLES = ['system_snapshots', 'logs', 'profile_events', 'param_stats', 'events', 'artifacts', 'media', 'samples', 'metrics'] as const
+
+/** epoch seconds (keys, alert rules) -> "5m ago" */
+function agoEpoch(sec: number | null | undefined): string | null {
+  return sec ? timeAgo(new Date(sec * 1000).toISOString()) : null
+}
 
 function msg(e: unknown, fallback: string): string {
   return e instanceof Error ? e.message : fallback
@@ -31,6 +41,86 @@ function OneTimeSecret({ label, secret, onDone }: { label: string; secret: strin
           I've stored it
         </button>
       </div>
+    </div>
+  )
+}
+
+/** Per-table "delete rows older than N days"; empty = keep forever (the default). */
+function RetentionEditor({ project, onError }: { project: string; onError: (m: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [days, setDays] = useState<Record<string, string>>({})
+  const [note, setNote] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    api.getProjectAdmin(project).then((p) => {
+      const cur = p.retention?.older_than_days ?? {}
+      setDays(Object.fromEntries(Object.entries(cur).map(([k, v]) => [k, String(v)])))
+    }).catch((e) => onError(msg(e, 'Failed to load retention policy')))
+  }, [open, project, onError])
+
+  const invalid = Object.values(days).some((v) => v !== '' && !(Number(v) > 0 && Number(v) <= 36500))
+
+  async function run(fn: () => Promise<string>) {
+    setBusy(true)
+    setNote(null)
+    try {
+      setNote(await fn())
+    } catch (e) {
+      onError(msg(e, 'Retention request failed'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const save = () => run(async () => {
+    const older = Object.fromEntries(Object.entries(days).filter(([, v]) => v !== '').map(([k, v]) => [k, Number(v)]))
+    await api.setRetention(project, Object.keys(older).length ? { older_than_days: older } : null)
+    return Object.keys(older).length ? 'Policy saved. The daily sweeper applies it.' : 'Retention is off: everything is kept.'
+  })
+  const runNow = () => run(async () => {
+    const { deleted } = await api.runRetention(project)
+    const parts = Object.entries(deleted).map(([t, n]) => `${t}: ${n}`)
+    return parts.length ? `Deleted rows: ${parts.join(', ')}` : 'Nothing to delete.'
+  })
+
+  return (
+    <div className="text-xs font-mono">
+      <button className="text-py-muted" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        {open ? '▾' : '▸'} retention policy
+      </button>
+      {open && (
+        <div className="mt-2 flex flex-col gap-2 rounded border border-py-border p-3">
+          <p className="text-py-faint">
+            Delete rows older than N days, per table. Leave a field empty to keep that table forever. Runs themselves are never
+            deleted. <span className="text-py-killed">Deleting metrics is permanent and thins the training curves.</span>
+          </p>
+          <div className="grid grid-cols-3 gap-2">
+            {RETENTION_TABLES.map((t) => (
+              <label key={t} className="flex items-center justify-between gap-2 text-py-muted">
+                {t}
+                <input
+                  type="number" min={1} max={36500} placeholder="keep" aria-label={`${t}: delete rows older than days`}
+                  value={days[t] ?? ''} onChange={(e) => setDays((d) => ({ ...d, [t]: e.target.value }))}
+                  className={`${input} w-20`}
+                />
+              </label>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <button className={ghost} disabled={busy || invalid} onClick={save}>Save policy</button>
+            <button
+              className={ghost} disabled={busy}
+              onClick={() => window.confirm('Apply the saved policy now? Matching rows are deleted permanently.') && runNow()}
+            >
+              Run now
+            </button>
+            {invalid && <span className="text-py-crashed">Days must be between 1 and 36500.</span>}
+            {note && <span role="status" className="text-py-running">{note}</span>}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -67,6 +157,10 @@ export default function SettingsPage() {
   const [curPw, setCurPw] = useState('')
   const [newPw, setNewPw] = useState('')
   const [pwDone, setPwDone] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [showArchived, setShowArchived] = useState(false)
+  const [deleting, setDeleting] = useState<Project | null>(null)
+  const [cascade, setCascade] = useState(false)
 
   const isAdmin = session?.role === 'admin'
 
@@ -74,11 +168,11 @@ export default function SettingsPage() {
     try {
       const s = await api.getSession()
       setSession(s)
-      const ps = await api.listProjects()
+      const ps = await api.listProjects({ include_archived: showArchived })
       setProjects(ps)
       if (s.role === 'admin') {
         const [us, ks, als] = await Promise.all([api.listUsers(), api.listKeys(), api.listAlerts()])
-        setUsers(us)
+        setUsers([...us].sort((a, b) => a.username.localeCompare(b.username)))
         setKeys(ks)
         setAlertRules(als)
         const entries = await Promise.all(ps.map(async (p) => [p.name, (await api.getProjectAdmin(p.name)).members ?? []] as const))
@@ -90,7 +184,12 @@ export default function SettingsPage() {
   }
   useEffect(() => {
     load()
-  }, [])
+  }, [showArchived])
+
+  useWebSocket((m) => {
+    if (m.type === 'project_updated' || m.type === 'project_deleted') load()
+  })
+  const activeProjects = projects.filter((p) => !p.archived)
 
   // Wraps a mutation: clears the error, reports failures, refreshes on success.
   async function act(fn: () => Promise<void>, fail: string) {
@@ -192,7 +291,8 @@ export default function SettingsPage() {
         Settings <span className="text-py-faint">· {session?.user ?? '…'} ({session?.role ?? '…'})</span>
       </h1>
 
-      {error && <p className="text-xs text-py-crashed">{error}</p>}
+      {error && <p role="alert" className="text-xs text-py-crashed">{error}</p>}
+      {notice && <p role="status" className="text-xs text-py-running">{notice}</p>}
       {secret && <OneTimeSecret label={secret.label} secret={secret.value} onDone={() => setSecret(null)} />}
 
       {session?.auth === 'required' && session.role !== 'global' && session.role !== 'project' && (
@@ -209,26 +309,48 @@ export default function SettingsPage() {
 
       <section className={section}>
         <h2 className={h2}>Projects</h2>
+        <label className="flex items-center gap-2 text-xs font-mono text-py-muted">
+          <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+          Show archived projects
+        </label>
         <div className="rounded border border-py-border">
           {projects.map((p) => (
-            <div key={p.name} className="border-b border-py-border px-4 py-2 last:border-b-0 flex flex-col gap-2">
+            <div key={p.name} className="border-b border-py-border px-4 py-2 last:border-b-0 flex flex-col gap-2" style={{ opacity: p.archived ? 0.65 : 1 }}>
               <div className="flex items-center justify-between text-xs font-mono">
                 <span>
                   <span className="text-py-text">{p.name}</span>
-                  <span className="ml-3 text-py-faint">{p.runs ?? 0} runs · by {p.created_by}</span>
+                  {p.archived && <span className="ml-2 text-py-killed">archived</span>}
+                  <span className="ml-3 text-py-faint">
+                    {p.runs ?? 0} runs{p.archived_runs ? ` (${p.archived_runs} archived)` : ''} · by {p.created_by} ·{' '}
+                    {p.last_activity ? `active ${timeAgo(p.last_activity)}` : 'no activity'}
+                  </span>
                 </span>
-                {isAdmin ? (
-                  <select
-                    value={p.visibility}
-                    onChange={(e) => act(async () => { await api.updateProject(p.name, { visibility: e.target.value as 'public' | 'private' }) }, 'Failed to update project')}
-                    className={input}
-                  >
-                    <option value="public">public</option>
-                    <option value="private">private</option>
-                  </select>
-                ) : (
-                  <span className="text-py-muted">{p.visibility}</span>
-                )}
+                <span className="flex items-center gap-3">
+                  <a href={api.projectExportUrl(p.name)} download className="text-py-muted" title="Download every run of this project as Parquet files in a zip">
+                    Export
+                  </a>
+                  {isAdmin && p.name !== 'default' && (
+                    <>
+                      <button className="text-py-muted" onClick={() => act(async () => { await api.archiveProject(p.name, !p.archived) }, 'Failed to update project')}>
+                        {p.archived ? 'Unarchive' : 'Archive'}
+                      </button>
+                      <button className="text-py-crashed" onClick={() => { setCascade(false); setDeleting(p) }}>Delete…</button>
+                    </>
+                  )}
+                  {isAdmin ? (
+                    <select
+                      aria-label={`Visibility of ${p.name}`}
+                      value={p.visibility}
+                      onChange={(e) => act(async () => { await api.updateProject(p.name, { visibility: e.target.value as 'public' | 'private' }) }, 'Failed to update project')}
+                      className={input}
+                    >
+                      <option value="public">public</option>
+                      <option value="private">private</option>
+                    </select>
+                  ) : (
+                    <span className="text-py-muted">{p.visibility}</span>
+                  )}
+                </span>
               </div>
               {isAdmin && (
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs font-mono text-py-muted">
@@ -243,6 +365,7 @@ export default function SettingsPage() {
                   {p.visibility === 'public' && <span className="text-py-faint">(public: everyone can already see it)</span>}
                 </div>
               )}
+              {isAdmin && <RetentionEditor project={p.name} onError={setError} />}
             </div>
           ))}
         </div>
@@ -257,6 +380,36 @@ export default function SettingsPage() {
           </form>
         )}
       </section>
+
+      {deleting && (
+        <ConfirmDialog
+          title={`Delete project ${deleting.name}?`}
+          confirmLabel="Delete project"
+          requireText={deleting.name}
+          danger
+          onCancel={() => setDeleting(null)}
+          onConfirm={async () => {
+            const res = await api.deleteProject(deleting.name, cascade)
+            setDeleting(null)
+            setError(null)
+            setNotice(`Deleted ${res.deleted}: ${res.runs_deleted} runs, ${res.keys_revoked} API keys revoked, ${res.alert_rules_removed} alert rules removed.`)
+            await load()
+          }}
+        >
+          <p>
+            Deleting a project is permanent. It also <b>revokes every API key bound to it</b> (scripts using them stop working, and a
+            project re-created under the same name inherits nothing), removes its members and deletes the alert rules scoped to it.
+          </p>
+          {(deleting.runs ?? 0) > 0 ? (
+            <label className="flex items-start gap-2 text-py-text">
+              <input type="checkbox" checked={cascade} onChange={(e) => setCascade(e.target.checked)} className="mt-0.5" />
+              <span>Also delete its {deleting.runs} run{deleting.runs === 1 ? '' : 's'} and all their data. Without this the server refuses while runs exist.</span>
+            </label>
+          ) : (
+            <p>The project has no runs.</p>
+          )}
+        </ConfirmDialog>
+      )}
 
       {isAdmin && (
         <section className={section}>
@@ -322,7 +475,10 @@ export default function SettingsPage() {
                   <div className="text-xs font-mono">
                     <span className="text-py-text">{k.name}</span>
                     <span className="ml-3 text-py-amber">{k.project ?? 'global'}</span>
-                    <span className="ml-3 text-py-faint">{k.id} · {new Date(k.created_at * 1000).toLocaleString()}</span>
+                    <span className="ml-3 text-py-faint">
+                      {k.id} · created {new Date(k.created_at * 1000).toLocaleDateString()} ·{' '}
+                      {agoEpoch(k.last_used_at) ? `last used ${agoEpoch(k.last_used_at)}` : 'never used'}
+                    </span>
                   </div>
                   <button
                     onClick={() => window.confirm(`Revoke "${k.name}"? Anything using it will stop working.`) && act(async () => { await api.revokeKey(k.id) }, 'Failed to revoke key')}
@@ -338,7 +494,7 @@ export default function SettingsPage() {
             <input value={keyName} onChange={(e) => setKeyName(e.target.value)} placeholder="Key name, e.g. the machine" maxLength={64} className={`${input} flex-1`} />
             <select value={keyProject} onChange={(e) => setKeyProject(e.target.value)} className={input}>
               <option value="">global</option>
-              {projects.map((p) => (
+              {activeProjects.map((p) => (
                 <option key={p.name} value={p.name}>{p.name}</option>
               ))}
             </select>
@@ -364,7 +520,10 @@ export default function SettingsPage() {
                   <div className="text-xs font-mono">
                     <span className={r.enabled ? 'text-py-text' : 'text-py-faint'}>{r.name}</span>
                     <span className="ml-3 text-py-amber">{describeRule(r)}</span>
-                    <span className="ml-3 text-py-faint">{r.project ?? 'all projects'} · {r.format} · {r.url}</span>
+                    <span className="ml-3 text-py-faint">
+                      {r.project ?? 'all projects'} · {r.format} · {r.url}
+                      {agoEpoch(r.updated_at) ? ` · updated ${agoEpoch(r.updated_at)}` : ''}
+                    </span>
                   </div>
                   <span className="flex items-center gap-3 text-xs font-mono">
                     <button className="text-py-muted" onClick={() => testAlert(r.id)}>Send test</button>
@@ -437,7 +596,7 @@ export default function SettingsPage() {
             <div className="flex gap-2">
               <select value={aProject} onChange={(e) => setAProject(e.target.value)} className={input}>
                 <option value="">all projects</option>
-                {projects.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
+                {activeProjects.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
               </select>
               <button type="submit" disabled={!aName.trim() || !aUrl.trim() || aTriggers.length === 0} className={btn}>
                 Add rule

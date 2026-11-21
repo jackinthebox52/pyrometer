@@ -224,6 +224,24 @@ export interface AlertRule {
   project: string | null
   triggers: AlertTrigger[] // the rule fires when any of them matches
   enabled: boolean
+  updated_at?: number | null
 }
 
 export type AlertRuleInput = Omit<AlertRule, 'id'>
+
+export interface RunListMeta {
+  total: number
+  limit: number
+  offset: number
+  returned: number
+}
+
+export interface RetentionPolicy {
+  older_than_days: Record<string, number>
+}
+
+export interface BulkResponse {
+  results: { run_id: string; ok: boolean; error: string | null }[]
+  succeeded: number
+  failed: number
+}

@@ -7,13 +7,16 @@
  *   - "run_updated"  — run status/notes changed
  *   - "metrics"      — new metric batch ingested for run_id
  *   - "system"       — new system snapshot ingested for run_id
+ *   - "run_deleted" / "run_moved" — run removed / moved to `project`
+ *   - "project_updated" / "project_deleted" — project archived/unarchived / deleted (`project`, no run_id)
  */
 
 import { useEffect, useRef } from 'react'
 
 export interface WsEvent {
-  type: 'run_created' | 'run_updated' | 'metrics' | 'system' | string
-  run_id: string
+  type: 'run_created' | 'run_updated' | 'run_deleted' | 'run_moved' | 'project_updated' | 'project_deleted' | 'metrics' | 'system' | string
+  run_id: string // absent on project_* events
+  project?: string
 }
 
 type Handler = (event: WsEvent) => void

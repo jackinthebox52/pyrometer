@@ -70,22 +70,37 @@ A 5-second polling fallback ensures the dashboard stays live even if WebSocket i
 
 ## Run Sidebar
 
-The fixed left panel lists all runs, sorted newest-first.
+The fixed left panel lists runs, most recently active first.
 
 ### Run Row
 
 Each row displays:
 
-- **Checkbox**: Select for comparison (color-coded)
+- **Checkbox**: Select for comparison or bulk actions (color-coded). Shift-click selects the range from the last clicked run
 - **Status dot**: Green (running), blue (completed), orange (failed), red (crashed: no heartbeat from the SDK), yellow (killed)
-- **Run name**: Click to navigate to run detail
-- **Time ago**: When the run was created (e.g., "2 hours ago")
-- **Tags**: Hashtag pills for filtering
+- **Run name**: Click to navigate to run detail; a star marks pinned runs, "archived" marks archived ones
+- **Time ago**: Since the last update (or creation when sorted by created)
+- **Tags**: Hashtag pills
 
-### Search & Filter
+### Sorting, search & filters
 
-- **Search bar**: Filter runs by name or tag (case-insensitive substring match)
-- **Tag filter**: Click a tag pill to filter runs by that tag
+- **Sort**: Last updated (default), Created, or Name. The choice is remembered in the browser
+- **Search bar**: Case-insensitive substring match on name, group or tag
+- **Filters** (button under the search bar): project (ordered by last activity), status, group, created date range, tag chips (a run must carry all chosen tags) and **Show archived**. Archived runs and runs of archived projects are hidden by default
+- Status, project, group and archived are applied by the server; tags, dates and search are applied in the browser, so while one of them is active the sidebar loads the remaining pages automatically
+
+### Pinned runs and groups
+
+- **Pinned** runs (pin from the run page) sit in their own section at the top. Pins are per user
+- Runs that share a `group` (`pyrometer.init(group=...)`) nest under a collapsible group header showing the run count and a status
+  summary (for example "3 running · 2 completed"). The header checkbox selects every run of the group. Collapsed state is remembered
+
+### Paging and live updates
+
+The sidebar loads 50 runs at a time (scroll to the bottom or press **Load more**) and de-duplicates by run id. Live events
+reorder, insert and remove rows without a reload: a created/updated/moved run is re-read and re-placed, a deleted run disappears
+(and is deselected), and project archive/delete refreshes the list. While runs are active the first page is also re-read every 10 s,
+because metric ingestion changes the order without a push event.
 
 ### Selection for Comparison
 
@@ -97,6 +112,13 @@ Selected runs are color-coded from a palette of 6 distinct colors. The same colo
 - Sidebar checkboxes
 - Chart lines in comparison view
 - Hyperparameter diff table columns
+
+### Bulk actions (admins)
+
+With one or more runs selected, admins get a **Bulk** button in the sidebar footer: add/remove tags, archive, unarchive, move to a
+project (tick *force* for runs that are still running) and delete (typed `delete` confirmation). The request goes to
+`POST /runs/bulk`; any runs that failed are listed with the reason instead of being skipped silently. Other users only see Compare:
+dashboard sessions may not write run metadata unless they are admins (see [auth.md](auth.md#organising-runs-and-projects)).
 
 ### Live Updates
 
@@ -136,6 +158,17 @@ The main view for inspecting a single training run.
 | **Tags** | Clickable hashtag pills |
 | **Summary stats** | Efficiency grade, steps, throughput, GPU utilization, anomalies |
 | **Hardware info** | GPU model, CUDA, PyTorch, Python versions, hostname, git commit |
+
+#### Organising a run
+
+Admins can edit run metadata from the header; everyone else sees it read-only:
+
+- **rename** (inline; Enter saves, Esc cancels), **group** edit, **tags** (x removes, the "+ tag" box adds, comma separated) and **notes** (edit block)
+- **manage** menu: Archive/Unarchive, Move to project (confirm dialog; a running run needs the explicit override because its key may lose access) and
+  Delete, which needs the run name typed to confirm. Deleting from another tab or user shows "This run was deleted" and returns to the start page
+- **pin** (any signed-in user, not API keys) and **export** (a zip of Parquet files with every table of the run) are available to everyone who can see the run
+
+Dialogs are keyboard-friendly: Esc cancels, Tab stays inside, focus returns to the trigger.
 
 #### "Copy for LLM" Button
 
@@ -725,6 +758,15 @@ Use the **"Copy for LLM"** button to export a run summary for:
 4. Review the **Kernel Timeline** for CPU bottlenecks
 
 ---
+
+## Projects and retention (Settings)
+
+Projects are listed by last activity. Everyone can export a project (Parquet zip). Admins can also:
+
+- **Archive / Unarchive** a project (hides it and its runs; data and ingestion are untouched; "Show archived projects" lists them). Project pickers elsewhere (sidebar filter, key and alert forms) hide archived projects
+- **Delete** it behind a typed-name confirmation. The dialog explains that API keys bound to the project are revoked, its members removed and its alert rules deleted, and offers *also delete its runs* (the server refuses while runs exist otherwise). `default` can't be archived or deleted
+- Set a **retention policy**: per table (system snapshots, logs, profile events, param stats, events, artifacts, media, samples, metrics) delete rows older than N days. Empty means keep forever, which is the default. **Run now** applies it immediately
+- API keys show when they were last used (or "never used"), alert rules show when they were last updated, and users are listed alphabetically
 
 ## Alerts (Settings)
 
