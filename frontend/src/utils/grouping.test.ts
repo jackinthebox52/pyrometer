@@ -62,10 +62,16 @@ describe('aggregate', () => {
     expect(aggregate([], 'minmax')).toEqual([])
   })
   it('computes mean and sample std', () => {
-    const [p] = aggregate([line([1]), line([3])], 'std')
+    const [p] = aggregate([line([1, -10, 10]), line([3, 10, -10])], 'std')
     expect(p).toMatchObject({ x: 0, mean: 2, n: 2 })
     expect(p.hi - p.mean).toBeCloseTo(Math.SQRT2)
     expect(p.mean - p.lo).toBeCloseTo(Math.SQRT2)
+  })
+  it('clamps a std band to the range the runs reached (no negative loss band)', () => {
+    const [p] = aggregate([line([1]), line([3])], 'std')
+    expect(p).toMatchObject({ mean: 2, lo: 1, hi: 3 })
+    const out = aggregate([line([0.01, 0.01, 5]), line([0.02, 0.02, 0.01])], 'std')
+    expect(out.every((q) => q.lo >= 0.01 && q.hi <= 5)).toBe(true)
   })
   it('min/max band', () => {
     const [p] = aggregate([line([1]), line([5]), line([3])], 'minmax')

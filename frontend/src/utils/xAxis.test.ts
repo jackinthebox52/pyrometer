@@ -159,3 +159,12 @@ describe('GPU chart axes', () => {
     expect(timeWindow('time', 1500, 1400, 1000)).toEqual({ t_min: 1400, t_max: 1500 })
   })
 })
+
+describe('wall-clock ticks', () => {
+  it('include seconds for short spans only', () => {
+    const t = 1_700_000_000
+    expect(formatXTick('time', 30)(t).split(':').length).toBe(3)
+    expect(formatXTick('time', 3600)(t).split(':').length).toBe(2)
+    expect(formatXTick('time')(t).split(':').length).toBe(2)
+  })
+})

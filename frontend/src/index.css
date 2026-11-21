@@ -88,3 +88,8 @@ body::before {
   background-color: #1a1d24;
   border-left-color: #f59e0b;
 }
+
+input[type="range"],
+input[type="checkbox"] {
+  accent-color: #f59e0b;
+}

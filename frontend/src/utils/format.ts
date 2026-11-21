@@ -19,6 +19,9 @@ export function duration(start: string, end: string | null): string {
   return `${hours}h ${mins % 60}m`
 }
 
+/** Y-axis gutter in px: fits the widest tick label (e.g. `-28.000`, `1.70e+4`) in the 10px mono axis font. */
+export const Y_AXIS_WIDTH = 52
+
 export function formatMetricValue(v: number): string {
   const abs = Math.abs(v)
   if (abs === 0) return '0'

@@ -375,7 +375,7 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
           </div>
           <div
             className="grid gap-4 p-4"
-            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' }}
+            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 280px), 1fr))' }}
           >
             {gradNormSeries.length > 0 && (
               <MetricChart key={`g${selectedParam}`} name="grad_norm" data={gradNormSeries} lineColor="#f59e0b" source={DETAIL_SOURCE} fetchRange={fetchRange} refreshKey={refreshKey} />

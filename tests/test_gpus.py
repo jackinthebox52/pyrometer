@@ -312,3 +312,10 @@ def test_unsupported_power_does_not_drop_the_gpu():
     snaps = _gpu.sample_all(nv, [(0, 0)], own_pid=1)
     assert len(snaps) == 1 and snaps[0]["power_draw"] is None and snaps[0]["attributed_power"] is None
     assert snaps[0]["gpu_utilization"] == 50.0 and snaps[0]["memory_used"] == 1000
+
+
+def test_summary_has_no_grade_for_a_run_that_measured_nothing(server):
+    rid = server.post("/runs", json={}).json()["data"]["run_id"]
+    assert db.db_compute_run_summary(rid)["efficiency_score"] is None
+    server.post(f"/runs/{rid}/metrics", json=[{"name": "loss", "value": 1.0, "step": 0, "timestamp": 1.0}])
+    assert db.db_compute_run_summary(rid)["efficiency_score"] == "A"

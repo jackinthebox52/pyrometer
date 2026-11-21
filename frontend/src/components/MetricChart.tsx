@@ -11,7 +11,7 @@ import {
   YAxis,
 } from 'recharts'
 import type { Metric, RunEvent } from '../api/types.ts'
-import { formatMetricValue } from '../utils/format.ts'
+import { formatMetricValue, Y_AXIS_WIDTH } from '../utils/format.ts'
 import { MAX_ALPHA, formatLogTick, logTicks, positiveRange, processSeries, useChartOptions } from '../utils/chartOptions.ts'
 import { coerceAxis, axisLabel, axisMetricName, eventX, firstTimestamp, formatXLabel, formatXTick, resolveXs } from '../utils/xAxis.ts'
 import type { XPoint, XSource } from '../utils/xAxis.ts'
@@ -124,7 +124,7 @@ function Chart({
           tickLine={false}
           axisLine={false}
           tickFormatter={logY ? formatLogTick : formatMetricValue}
-          width={logY ? 42 : 35}
+          width={Y_AXIS_WIDTH}
           scale={logY ? 'log' : 'auto'}
           domain={log ? log.domain : logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
           ticks={log?.ticks}

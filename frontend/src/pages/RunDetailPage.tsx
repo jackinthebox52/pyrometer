@@ -142,7 +142,7 @@ function RunDetailSkeleton() {
       </div>
       <div
         className="grid gap-4 mb-6"
-        style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}
+        style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 320px), 1fr))' }}
       >
         <Skeleton h={220} />
         <Skeleton h={220} />
@@ -937,7 +937,7 @@ export default function RunDetailPage() {
           </div>
           <div
             className="grid gap-4"
-            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}
+            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 320px), 1fr))' }}
           >
             {metricNames.map((name) => (
               <MetricChart
@@ -960,7 +960,7 @@ export default function RunDetailPage() {
           <SectionLabel>GPU Stats</SectionLabel>
           <div
             className="grid gap-4"
-            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}
+            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 320px), 1fr))' }}
           >
             {SYSTEM_SERIES.map(({ key, preferKey, label, color, transform }) => {
               const conv = (v: number) => (transform ? transform(v) : v)
@@ -1036,7 +1036,7 @@ export default function RunDetailPage() {
         <div className="mb-6">
           <SectionLabel>Artifacts</SectionLabel>
           <div
-            className="rounded-lg overflow-hidden"
+            className="rounded-lg overflow-x-auto"
             style={{ backgroundColor: '#111318', border: '1px solid #252830' }}
           >
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -1083,16 +1083,8 @@ export default function RunDetailPage() {
         </div>
       )}
 
-      {/* ── Media ── */}
-      <div className="mb-6">
-        <h2
-          className="text-xs font-mono uppercase mb-3"
-          style={{ color: '#c8cad6', letterSpacing: '0.12em' }}
-        >
-          Media
-        </h2>
-        <MediaGallery runId={run.run_id} />
-      </div>
+      {/* ── Media (renders nothing, heading included, when the run logged none) ── */}
+      <MediaGallery runId={run.run_id} />
 
       {/* ── Samples (renders nothing when the run logged none) ── */}
       <SamplesViewer runs={[{ runId: run.run_id, label: run.name }]} />
@@ -1141,6 +1133,17 @@ export default function RunDetailPage() {
               <OptimizationHints events={profileEvents} />
             </div>
           )}
+        </div>
+      )}
+
+      {sortedSnapshots.length === 0 && metricNames.length > 0 && (
+        <div className="mb-6">
+          <SectionLabel>GPU Stats</SectionLabel>
+          <div className="rounded-lg p-4 text-xs font-mono" style={{ backgroundColor: '#111318', border: '1px solid #252830', color: '#4a4e60' }}>
+            {run.status === 'running'
+              ? 'No GPU samples yet. They appear here every 2 s once the run reports an NVIDIA GPU.'
+              : 'No GPU samples were recorded for this run (no NVIDIA GPU or NVML on the training host).'}
+          </div>
         </div>
       )}
 

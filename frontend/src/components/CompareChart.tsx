@@ -12,7 +12,7 @@ import {
   YAxis,
 } from 'recharts'
 import type { Metric } from '../api/types.ts'
-import { formatMetricValue } from '../utils/format.ts'
+import { formatMetricValue, Y_AXIS_WIDTH } from '../utils/format.ts'
 import { MAX_ALPHA, formatLogTick, logTicks, positiveRange, processSeries, useChartOptions } from '../utils/chartOptions.ts'
 import type { ChartOptions } from '../utils/chartOptions.ts'
 import { coerceAxis, axisLabel, axisMetricName, firstTimestamp, formatXLabel, formatXTick, resolveXs, runHasAxis } from '../utils/xAxis.ts'
@@ -409,7 +409,7 @@ export default function CompareChart({
                   tickLine={false}
                   axisLine={false}
                   tickFormatter={opts.logY ? formatLogTick : formatMetricValue}
-                  width={opts.logY ? 42 : 35}
+                  width={Y_AXIS_WIDTH}
                   scale={opts.logY ? 'log' : 'auto'}
                   domain={log ? log.domain : opts.logY ? ['dataMin', 'dataMax'] : ['auto', 'auto']}
                   ticks={log?.ticks}

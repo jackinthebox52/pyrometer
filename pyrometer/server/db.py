@@ -2172,13 +2172,17 @@ def db_compute_run_summary(run_id: str) -> dict | None:
     # Components:
     #   gpu_utilization: avg attributed util / 85 (capped at 1.0)
     #   stability:       1.0 − anomaly_count × 0.15 (floored at 0)
+    efficiency_score: str | None
     efficiency_details: dict[str, float] = {}
     if avg_gpu_utilization is not None:
         efficiency_details["gpu_utilization"] = min(1.0, avg_gpu_utilization / 85.0)
     efficiency_details["stability"] = max(0.0, 1.0 - anomaly_count * 0.15)
 
     avg_eff = sum(efficiency_details.values()) / len(efficiency_details)
-    if avg_eff >= 0.80:
+    if not final_metrics and avg_gpu_utilization is None:
+        # Nothing was measured (a run that died before logging): a stability-only "A" would be a meaningless grade.
+        efficiency_score = None
+    elif avg_eff >= 0.80:
         efficiency_score = "A"
     elif avg_eff >= 0.65:
         efficiency_score = "B"

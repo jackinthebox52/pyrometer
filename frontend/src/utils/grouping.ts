@@ -117,7 +117,8 @@ const MAX_GRID = 600
 /**
  * Aggregate several runs' series (each sorted by x, finite values only) onto a common x grid (union of all
  * x values, thinned to MAX_GRID). A grid point is only emitted where at least 2 runs cover it
- * (interpolated linearly; no extrapolation). Bands are mean +/- sample std, or min/max.
+ * (interpolated linearly; no extrapolation). Bands are mean +/- sample std, or min/max. A std band is clamped to the
+ * range the runs actually reached, so a positive metric (loss, throughput) never draws a band below zero.
  */
 export function aggregate(runs: XY[][], band: BandKind): AggPoint[] {
   const nonEmpty = runs.filter((r) => r.length > 0)
@@ -126,6 +127,14 @@ export function aggregate(runs: XY[][], band: BandKind): AggPoint[] {
   if (grid.length > MAX_GRID) {
     const stride = grid.length / MAX_GRID
     grid = Array.from({ length: MAX_GRID }, (_, i) => grid[Math.floor(i * stride)])
+  }
+  let gMin = Infinity
+  let gMax = -Infinity
+  for (const r of nonEmpty) {
+    for (const p of r) {
+      if (p.y < gMin) gMin = p.y
+      if (p.y > gMax) gMax = p.y
+    }
   }
   const out: AggPoint[] = []
   for (const x of grid) {
@@ -141,7 +150,7 @@ export function aggregate(runs: XY[][], band: BandKind): AggPoint[] {
       out.push({ x, mean, lo: Math.min(...vals), hi: Math.max(...vals), n })
     } else {
       const std = Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1))
-      out.push({ x, mean, lo: mean - std, hi: mean + std, n })
+      out.push({ x, mean, lo: Math.max(mean - std, gMin), hi: Math.min(mean + std, gMax), n })
     }
   }
   return out

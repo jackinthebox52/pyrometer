@@ -3,7 +3,7 @@ import { NavLink, useMatch, useNavigate } from 'react-router-dom'
 import { api, PINS_CHANGED, type RunSort } from '../api/client.ts'
 import type { BulkResponse, Project, Run, RunFacets } from '../api/types.ts'
 import { timeAgo } from '../utils/format.ts'
-import { RUN_COLORS } from '../pages/CompareView.tsx'
+import { RUN_COLORS } from '../utils/runColors.ts'
 import { useWebSocket } from '../hooks/useWebSocket.ts'
 import { useSession } from '../hooks/useSession.ts'
 import ConfirmDialog from './ConfirmDialog.tsx'
@@ -180,7 +180,8 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
       activityTimer.current = null
       const { serverFilters: f, sort: s } = stateRef.current
       try {
-        const { runs: page } = await api.listRuns({ sort: s, limit: PAGE_SIZE, ...filtersToQuery(f) })
+        const { runs: page, meta } = await api.listRuns({ sort: s, limit: PAGE_SIZE, ...filtersToQuery(f) })
+        if (meta) setTotal(meta.total) // keeps the footer count right as runs appear and disappear
         setRuns((prev) => mergeRuns(prev, page, s))
         setServerDown(false)
         if (stateRef.current.pins.length > 0) refreshPins() // pinned runs may have changed status
@@ -230,10 +231,12 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
       case 'run_moved':
         upsert(msg.run_id)
         scheduleFacets()
+        scheduleActivityRefresh() // also refreshes the total
         break
       case 'run_deleted':
         drop(msg.run_id)
         scheduleFacets()
+        scheduleActivityRefresh()
         break
       case 'project_updated':
         fetchPage(true)
@@ -352,13 +355,13 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
             <span className="truncate text-sm font-medium leading-snug" style={{ color: '#e8eaf0' }}>{run.name}</span>
             {run.pinned && <span aria-label="pinned" title="Pinned" style={{ color: '#f59e0b', fontSize: 10 }}>★</span>}
           </div>
-          <div className="flex items-center gap-2 mt-0.5 pl-[14px]">
-            <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
+          <div className="flex items-center gap-2 mt-0.5 pl-[14px] min-w-0">
+            <span className="text-xs font-mono whitespace-nowrap shrink-0" style={{ color: '#4a4e60' }}>
               {timeAgo(sort === 'created' ? run.created_at : (run.updated_at ?? run.created_at))}
             </span>
-            {run.archived && <span className="text-xs font-mono text-py-killed">archived</span>}
+            {run.archived && <span className="text-xs font-mono text-py-killed shrink-0">archived</span>}
             {run.tags.slice(0, 2).map((tag) => (
-              <span key={tag} className="text-xs truncate" style={{ color: '#4a4e60' }}>#{tag}</span>
+              <span key={tag} className="text-xs truncate min-w-0" style={{ color: '#4a4e60' }}>#{tag}</span>
             ))}
           </div>
         </NavLink>
@@ -456,7 +459,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
           </button>
         </div>
         {showFilters && (
-          <div className="flex flex-col gap-2" role="group" aria-label="Run filters">
+          <div className="flex max-h-[45vh] flex-col gap-2 overflow-y-auto" role="group" aria-label="Run filters">
             <select aria-label="Project" value={filters.project} onChange={(e) => setFilter({ project: e.target.value })} className={field}>
               <option value="">All projects</option>
               {projects.map((p) => (
@@ -472,9 +475,9 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
               {groupChoices.map((g) => <option key={g} value={g}>{g}</option>)}
             </select>
             <div className="flex items-center gap-1">
-              <input type="date" aria-label="Created from" value={filters.from} onChange={(e) => setFilter({ from: e.target.value })} className={field} />
+              <input type="date" aria-label="Created from" value={filters.from} onChange={(e) => setFilter({ from: e.target.value })} className={`${field} min-w-0 flex-1`} />
               <span className="text-py-faint text-xs">–</span>
-              <input type="date" aria-label="Created to" value={filters.to} onChange={(e) => setFilter({ to: e.target.value })} className={field} />
+              <input type="date" aria-label="Created to" value={filters.to} onChange={(e) => setFilter({ to: e.target.value })} className={`${field} min-w-0 flex-1`} />
             </div>
             {tagChoices.length > 0 && (
               <div className="flex flex-wrap gap-1" role="group" aria-label="Filter by tag">

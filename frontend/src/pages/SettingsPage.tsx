@@ -310,7 +310,7 @@ export default function SettingsPage() {
       {session?.auth === 'required' && session.role !== 'global' && session.role !== 'project' && (
         <section className={section}>
           <h2 className={h2}>Change password</h2>
-          <form onSubmit={changePassword} className="flex gap-2">
+          <form onSubmit={changePassword} className="flex flex-wrap gap-2">
             <input type="password" autoComplete="current-password" value={curPw} onChange={(e) => setCurPw(e.target.value)} placeholder="Current password" className={`${input} flex-1`} />
             <input type="password" autoComplete="new-password" value={newPw} onChange={(e) => setNewPw(e.target.value)} placeholder="New password" className={`${input} flex-1`} />
             <button type="submit" disabled={!curPw || !newPw} className={btn}>Change</button>
@@ -328,7 +328,7 @@ export default function SettingsPage() {
         <div className="rounded border border-py-border">
           {projects.map((p) => (
             <div key={p.name} className="border-b border-py-border px-4 py-2 last:border-b-0 flex flex-col gap-2" style={{ opacity: p.archived ? 0.65 : 1 }}>
-              <div className="flex items-center justify-between text-xs font-mono">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
                 <span>
                   <span className="text-py-text">{p.name}</span>
                   {p.archived && <span className="ml-2 text-py-killed">archived</span>}
@@ -382,7 +382,7 @@ export default function SettingsPage() {
           ))}
         </div>
         {isAdmin && (
-          <form onSubmit={createProject} className="flex gap-2">
+          <form onSubmit={createProject} className="flex flex-wrap gap-2">
             <input value={projName} onChange={(e) => setProjName(e.target.value)} placeholder="New project name" maxLength={64} className={`${input} flex-1`} />
             <select value={projVis} onChange={(e) => setProjVis(e.target.value as 'public' | 'private')} className={input}>
               <option value="public">public</option>
@@ -458,7 +458,7 @@ export default function SettingsPage() {
               </div>
             ))}
           </div>
-          <form onSubmit={createUser} className="flex gap-2">
+          <form onSubmit={createUser} className="flex flex-wrap gap-2">
             <input value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Username" className={`${input} flex-1`} />
             <input type="password" autoComplete="new-password" value={userPw} onChange={(e) => setUserPw(e.target.value)} placeholder="Password" className={`${input} flex-1`} />
             <select value={userRole} onChange={(e) => setUserRole(e.target.value as 'admin' | 'user')} className={input}>
@@ -502,7 +502,7 @@ export default function SettingsPage() {
               ))
             )}
           </div>
-          <form onSubmit={createKey} className="flex gap-2">
+          <form onSubmit={createKey} className="flex flex-wrap gap-2">
             <input value={keyName} onChange={(e) => setKeyName(e.target.value)} placeholder="Key name, e.g. the machine" maxLength={64} className={`${input} flex-1`} />
             <select value={keyProject} onChange={(e) => setKeyProject(e.target.value)} className={input}>
               <option value="">global</option>
@@ -528,8 +528,8 @@ export default function SettingsPage() {
               <p className="p-4 text-xs text-py-faint font-mono">No alert rules yet.</p>
             ) : (
               alertRules.map((r) => (
-                <div key={r.id} className="flex items-center justify-between border-b border-py-border px-4 py-2 last:border-b-0">
-                  <div className="text-xs font-mono">
+                <div key={r.id} className="flex items-center justify-between gap-4 border-b border-py-border px-4 py-2 last:border-b-0">
+                  <div className="min-w-0 break-words text-xs font-mono">
                     <span className={r.enabled ? 'text-py-text' : 'text-py-faint'}>{r.name}</span>
                     <span className="ml-3 text-py-amber">{describeRule(r)}</span>
                     <span className="ml-3 text-py-faint">
@@ -537,7 +537,7 @@ export default function SettingsPage() {
                       {agoEpoch(r.updated_at) ? ` · updated ${agoEpoch(r.updated_at)}` : ''}
                     </span>
                   </div>
-                  <span className="flex items-center gap-3 text-xs font-mono">
+                  <span className="flex shrink-0 items-center gap-3 whitespace-nowrap text-xs font-mono">
                     <button className="text-py-muted" onClick={() => testAlert(r.id)}>Send test</button>
                     <button className="text-py-muted" onClick={() => act(async () => { await api.updateAlert(r.id, { enabled: !r.enabled }) }, 'Failed to update alert')}>
                       {r.enabled ? 'Disable' : 'Enable'}
@@ -551,7 +551,7 @@ export default function SettingsPage() {
             )}
           </div>
           <form onSubmit={createAlert} className="flex flex-col gap-2">
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <input value={aName} onChange={(e) => setAName(e.target.value)} placeholder="Rule name" maxLength={64} className={`${input} w-40`} />
               <input type="password" autoComplete="off" value={aUrl} onChange={(e) => setAUrl(e.target.value)} placeholder="Webhook URL (secret)" className={`${input} flex-1`} />
               <select value={aFormat} onChange={(e) => setAFormat(e.target.value as AlertFormat)} className={input}>
@@ -561,7 +561,7 @@ export default function SettingsPage() {
                 <option value="slack">Slack</option>
               </select>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <select value={aKind} onChange={(e) => setAKind(e.target.value as AlertKind)} className={input}>
                 <option value="run_crashed">run crashed</option>
                 <option value="run_failed">run failed</option>
@@ -590,7 +590,7 @@ export default function SettingsPage() {
                 Add trigger
               </button>
             </div>
-            <div className="flex items-center gap-2 text-xs font-mono">
+            <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
               <span className="text-py-muted">Triggers (any match fires):</span>
               {aTriggers.length === 0 && <span className="text-py-faint">none yet</span>}
               {aTriggers.map((t, i) => (

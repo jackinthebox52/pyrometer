@@ -1,3 +1,4 @@
+import { RUN_COLORS } from '../utils/runColors.ts'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client.ts'
@@ -25,15 +26,6 @@ import type { RangeQuery } from '../utils/series.ts'
 import { groupRuns, parseIgnoreKeys } from '../utils/grouping.ts'
 import type { BandKind, GroupMode } from '../utils/grouping.ts'
 import { duration, timeAgo } from '../utils/format.ts'
-
-export const RUN_COLORS = [
-  '#f59e0b', // amber
-  '#22d3ee', // cyan
-  '#f43f5e', // rose
-  '#8b5cf6', // violet
-  '#84cc16', // lime
-  '#fb923c', // orange
-]
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -370,7 +362,7 @@ export default function CompareView() {
           <SectionLabel>Metrics</SectionLabel>
           <div
             className="grid gap-4"
-            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(380px, 1fr))' }}
+            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 380px), 1fr))' }}
           >
             {allMetricNames.map((name) => (
               <div key={name}>

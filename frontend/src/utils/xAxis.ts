@@ -162,12 +162,15 @@ function formatElapsed(secs: number): string {
   return `${h}h${m % 60 ? ` ${m % 60}m` : ''}`
 }
 
-/** Tick label: wall-clock HH:MM (date when the span exceeds a day), elapsed h/m/s, or compact numbers. */
+/** Tick label: wall-clock HH:MM (HH:MM:SS under 10 minutes; date when the span exceeds a day), elapsed h/m/s, or compact numbers. */
 export function formatXTick(axis: XAxis, spanSeconds = 0): (v: number) => string {
   if (axis === 'time') {
     return (v) => {
       const d = new Date(v * 1000)
-      const t = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      // Short windows (a brief run, or a zoom into one) need seconds, or every tick reads the same minute.
+      const t = d.toLocaleTimeString([], spanSeconds > 0 && spanSeconds < 600
+        ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+        : { hour: '2-digit', minute: '2-digit' })
       return spanSeconds > 86400 ? `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${t}` : t
     }
   }
