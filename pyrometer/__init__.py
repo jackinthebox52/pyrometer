@@ -6,10 +6,14 @@ import sys
 import time
 import uuid
 
+import functools
+import inspect
+
 import httpx
 
+from pyrometer._autolog import AutologConfig, NullRun, name_loss, rank_info
 from pyrometer._hardware import fingerprint_fast
-from pyrometer._run import Run
+from pyrometer._run import Run, _run_stack
 from pyrometer._transport import spool_root
 
 # Connecting to a dead server must not stall the start of training; a slow one still gets a few seconds.
@@ -28,6 +32,8 @@ def init(
     anomaly_detection: bool | dict = True,
     resume: str | None = None,
     group: str | None = None,
+    autolog: bool | dict | None = None,
+    rank_zero_only: bool = True,
 ) -> Run:
     """Initialize a new training run and register it with the Pyrometer server.
 
@@ -85,6 +91,20 @@ def init(
             ``PYROMETER_GROUP`` environment variable. Up to 128 characters; stored on the run and
             not changed by ``resume``.
 
+        autolog: Automatic collection while the run is open (default on; ``PYROMETER_AUTOLOG=0``
+            turns the default off). ``False`` disables it. A dict sets :class:`AutologConfig` options
+            up front, e.g. ``{"log_every": 50, "grad_norm": True}``; change them live with
+            ``run.config``. Autolog counts optimizer steps, logs learning rates and steps/sec,
+            and captures the loss of every ``backward()``; see the "Autolog" section of
+            ``docs/sdk-reference.md`` for every ``auto/`` metric.
+        rank_zero_only: In a distributed job (``RANK`` / ``LOCAL_RANK`` / ``WORLD_SIZE``, as set
+            by ``torchrun``) only rank 0 creates a run; other ranks get an inert stand-in whose
+            methods all do nothing (and ``run.run_id`` is ``None``). Pass ``False`` for one run per rank.
+
+    ``Run`` is a context manager: ``with pyrometer.init(...) as run:`` finishes the run when the block
+    ends (``completed``; ``killed`` on Ctrl-C; ``failed`` on any other exception or a non-zero
+    ``SystemExit``) and never swallows the exception.
+
     Delivery is durable. Every payload is appended to an on-disk journal
     (``~/.pyrometer/spool/<run_id>/``) before it is sent and acknowledged after, so a hard kill
     loses at most the last few milliseconds. If the server is unreachable (also right here at
@@ -101,17 +121,26 @@ def init(
         ValueError: If ``resume`` is malformed, or the run belongs to another project.
 
     Returns:
-        A :class:`Run` instance. Call :meth:`Run.log` to record metrics and
-        :meth:`Run.finish` when training completes.
+        A :class:`Run` instance (or an inert stand-in on non-zero ranks). Use it as a context
+        manager, or call :meth:`Run.finish` when training completes.
 
     Example::
 
-        run = pyrometer.init(
+        with pyrometer.init(
             name="my-experiment",
             hyperparams={"lr": 3e-4, "batch_size": 64},
             tags=["baseline"],
-        )
+        ) as run:
+            train(model, optimizer)   # loss, lr, step, steps/sec are logged automatically
     """
+    if autolog is None:
+        autolog = os.environ.get("PYROMETER_AUTOLOG", "1").strip().lower() not in ("0", "false", "off", "no")
+    if rank_zero_only:
+        rank, _world = rank_info()
+        if rank not in (None, 0):
+            return NullRun(AutologConfig(**(autolog if isinstance(autolog, dict) else {})))  # type: ignore[return-value]
+    if isinstance(autolog, dict):
+        AutologConfig(**autolog)  # validate early
     if offline is None:
         offline = os.environ.get("PYROMETER_MODE", "").strip().lower() == "offline"
 
@@ -157,7 +186,7 @@ def init(
 
         Spool(run_id).write_meta(server=server, created=False, run_id=run_id, create=payload)
         run = Run(run_id=run_id, server_url=server, api_key=None, offline=True,
-                  anomaly_detection=anomaly_detection)
+                  anomaly_detection=anomaly_detection, autolog=autolog)
         if resume_mode:
             run._mark_resumed(None, None, {"offline": True})
         _probe_hardware(run, hw)
@@ -185,7 +214,7 @@ def init(
             file=sys.stderr,
         )
         run = Run(run_id=run_id, server_url=server, api_key=api_key, anomaly_detection=anomaly_detection,
-                  create=payload)
+                  create=payload, autolog=autolog)
         if resume_mode:
             run._mark_resumed(None, None, {"deferred": True})
         _probe_hardware(run, hw)
@@ -211,7 +240,7 @@ def init(
 
     run = Run(
         run_id=run_data["run_id"], server_url=server, api_key=api_key,
-        anomaly_detection=anomaly_detection,
+        anomaly_detection=anomaly_detection, autolog=autolog,
     )
     if run_data.get("resumed"):
         changes = _diff_config(run_data, hyperparams, tags)
@@ -227,8 +256,9 @@ def init(
 
 
 def _probe_hardware(run: Run, hw: dict) -> None:
-    """Complete the fingerprint (torch/CUDA/GPU details) in the background."""
+    """Complete the fingerprint (torch/CUDA/GPU details) in the background, then start autolog."""
     run._start_hardware_probe(hw)
+    run._autolog.start(run._last_step if run._step_known else None, run.resumed)
 
 
 def _diff_config(stored: dict, hyperparams: dict | None, tags: list[str] | None) -> dict:
@@ -301,4 +331,94 @@ def create_project(
     return resp.json()["data"]
 
 
-__all__ = ["init", "create_project", "Run"]
+def current_run() -> Run | None:
+    """The most recently opened run that is still open in this process, or ``None``."""
+    return _run_stack[-1] if _run_stack else None
+
+
+_MAX_HP_ITEMS = 50
+_MAX_HP_STR = 200
+
+
+def _json_safe(value, depth: int = 0):
+    """A JSON-safe, bounded rendering of a function argument; tensors, modules and other objects become
+    a ``"<ClassName>"`` placeholder."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else str(value)
+    if isinstance(value, str):
+        return value if len(value) <= _MAX_HP_STR else value[:_MAX_HP_STR] + "..."
+    if hasattr(value, "__fspath__"):
+        return _json_safe(os.fspath(value), depth)
+    if depth < 3:
+        if isinstance(value, dict):
+            return {str(k)[:_MAX_HP_STR]: _json_safe(v, depth + 1) for k, v in list(value.items())[:_MAX_HP_ITEMS]}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            items = list(value)[:_MAX_HP_ITEMS]
+            return [_json_safe(v, depth + 1) for v in items]
+    import enum
+
+    if isinstance(value, enum.Enum):
+        return str(value)
+    return f"<{type(value).__name__}>"
+
+
+def run(
+    fn=None,
+    *,
+    name: str | None = None,
+    hyperparams: dict | None = None,
+    **init_kwargs,
+):
+    """Decorator: run a training function inside ``with pyrometer.init(...) as run:``.
+
+    The function's call arguments (with defaults applied) become the run's hyperparams, JSON-safe:
+    numbers, strings, bools, ``None`` and short lists/dicts as they are; tensors, modules, datasets and
+    other objects as a ``"<ClassName>"`` placeholder; long strings and containers are truncated.
+    ``hyperparams=`` entries override same-named arguments. ``name`` defaults to the function name. All
+    other keyword arguments go to :func:`init` (``project``, ``tags``, ``autolog``, ...). If the function
+    has a parameter called ``run`` that the caller did not pass, the :class:`Run` is injected there.
+
+    Works bare (``@pyrometer.run``) or with arguments (``@pyrometer.run(name="x", tags=["a"])``).
+    The exception, if any, propagates after the run is closed (``failed`` / ``killed``).
+
+    Example::
+
+        @pyrometer.run(name="baseline", project="mnist")
+        def train(lr: float = 3e-4, epochs: int = 10):
+            ...   # autolog captures step, loss, lr, steps/sec
+    """
+
+    def deco(f):
+        sig = inspect.signature(f)
+
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            try:
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                call = {k: v for k, v in bound.arguments.items() if k != "run"}
+                # **kwargs parameters arrive as one dict: flatten them
+                for pname, param in sig.parameters.items():
+                    if param.kind is inspect.Parameter.VAR_KEYWORD and pname in call:
+                        call.update(call.pop(pname))
+                    elif param.kind is inspect.Parameter.VAR_POSITIONAL and pname in call:
+                        call[pname] = list(call[pname])
+            except TypeError:
+                call = {}
+            hp = {k: _json_safe(v) for k, v in call.items()}
+            hp.update({str(k): _json_safe(v) for k, v in (hyperparams or {}).items()})
+            with init(name=name or f.__name__, hyperparams=hp, **init_kwargs) as r:
+                if "run" in sig.parameters and "run" not in kwargs and not (
+                    args and list(sig.parameters).index("run") < len(args)
+                ):
+                    kwargs["run"] = r
+                return f(*args, **kwargs)
+
+        return wrapper
+
+    return deco(fn) if callable(fn) else deco
+
+
+__all__ = ["init", "create_project", "run", "current_run", "name_loss", "AutologConfig", "Run"]

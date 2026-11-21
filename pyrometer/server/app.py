@@ -92,6 +92,7 @@ from pyrometer.server.db import (
     db_set_project_visibility,
     db_update_run,
     RUN_INFO_FIELDS,
+    db_recent_grad_norms,
     db_recent_metrics,
     db_heartbeat,
     db_get_run_status,
@@ -1571,6 +1572,12 @@ def get_param_stats(
     _check_window(max_points, step_min, step_max, t_min, t_max)
     rows, total = db_get_param_stats(run_id, name, max_points, step_min, step_max, t_min, t_max, with_total=True)
     return ok_series(rows, total, max_points, any(v is not None for v in (max_points, step_min, step_max, t_min, t_max)))
+
+
+@app.get("/runs/{run_id}/param-stats/recent")
+def get_recent_param_stats(run_id: str, limit: int = 100):
+    """Newest ``limit`` gradient norms per parameter, oldest first: ``{param_name: [norms]}`` (SDK seeding on resume)."""
+    return ok(db_recent_grad_norms(run_id, max(1, min(limit, 1000))))
 
 
 @app.get("/runs/{run_id}/param-stats/names")

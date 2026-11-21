@@ -14,6 +14,7 @@ import httpx
 
 from pyrometer import _gpu
 from pyrometer._anomaly import AnomalyConfig, GradDetector, MetricDetector
+from pyrometer._autolog import AutologConfig, _AutologEngine, name_loss as _name_loss
 from pyrometer._transport import Spool, Transport
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ _INLINE_MEDIA_MAX = 32 * 1024  # larger string media (histograms) go to a blob f
 _active_runs: "set[Run]" = set()
 _excepthook_installed = False
 _our_sigterm = None  # the SIGTERM handler we installed (so a second init does not wrap it again)
+_run_stack: "list[Run]" = []  # open runs, newest last (``pyrometer.current_run()``)
 
 
 def _exit_code_status(code) -> str:
@@ -171,6 +173,7 @@ class Run:
         offline: bool = False,
         anomaly_detection: bool | dict | None = True,
         create: dict | None = None,
+        autolog: bool | dict = True,
     ) -> None:
         self.run_id = run_id
         self._server = server_url
@@ -233,7 +236,12 @@ class Run:
         self._exit_status = "completed"
         self._probe_thread: threading.Thread | None = None
         self._exit_from_sys_exit = False  # status came from sys.exit(): cleared if the program carries on
+        autolog_opts = autolog if isinstance(autolog, dict) else {}
+        self.config = AutologConfig(**autolog_opts)
+        """Live autolog settings (:class:`pyrometer._autolog.AutologConfig`): ``run.config.log_every = 50``."""
+        self._autolog = _AutologEngine(self, bool(autolog), self.config)
         _active_runs.add(self)
+        _run_stack.append(self)
         _install_exit_hooks()
         atexit.register(self._atexit)
 
@@ -243,8 +251,8 @@ class Run:
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
-    def log(self, metrics: dict, step: int) -> None:
-        """Log a dict of scalar metrics at a given training step.
+    def log(self, metrics: dict, step: int | None = None) -> None:
+        """Log a dict of scalar metrics at a training step.
 
         Buffers entries in memory and flushes to the server every 5 seconds or
         when the buffer reaches 100 entries — whichever comes first. This is
@@ -252,20 +260,32 @@ class Run:
 
         Args:
             metrics: Dict mapping metric names to float values.
-                     Names can use slash notation, e.g. ``"train/loss"``.
-            step: Global training step (integer). Used as the x-axis in charts.
+                     Names can use slash notation, e.g. ``"train/loss"``. (The ``auto/`` prefix is
+                     used by autolog; avoid it for your own metrics.)
+            step: Global training step (integer), the x-axis in charts. Optional while autolog is on:
+                  an explicit ``step`` always wins for that call; without one the run's automatic step
+                  is used: the number of optimizer steps completed so far (``run.step``), or, before
+                  any optimizer has stepped, a counter of step-less ``log`` calls. With
+                  ``autolog=False`` a step is required.
 
         Example::
 
-            run.log({"train/loss": loss.item(), "lr": scheduler.get_last_lr()[0]}, step=global_step)
+            run.log({"train/acc": acc})                 # step comes from the optimizer-step counter
+            run.log({"val/loss": val_loss}, step=epoch) # explicit step
         """
         if self._finished:
             return
         if self._exit_from_sys_exit:  # a caught sys.exit(): the program is evidently still running
             self._exit_status, self._exit_from_sys_exit = "completed", False
+        if step is None:
+            step = self._autolog.resolve_step()
+        self._log(metrics, int(step), time.time())
+
+    def _log(self, metrics: dict, step: int, ts: float) -> None:
+        if self._finished:
+            return
         self._last_step = step
         self._step_known = True
-        ts = time.time()
         with self._lock:
             entries = [
                 {"step": step, "timestamp": ts, "name": name, "value": float(value)}
@@ -280,10 +300,79 @@ class Run:
                 self._flush_locked()
         # Anomaly checks run outside the buffer lock; HTTP calls happen in spawned threads.
         for name, value in metrics.items():
+            if name.startswith("auto/") and not (name.startswith("auto/loss") or name == "auto/grad_norm"):
+                continue  # rates and learning rates are not anomaly material
             try:
                 self._check_metric_anomaly(name, float(value), step)
             except (ValueError, TypeError):
                 pass
+
+    def __enter__(self) -> "Run":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Close the run with the status the block's outcome implies; never swallows the exception.
+
+        No exception: ``completed``. ``KeyboardInterrupt``: ``killed``. ``SystemExit``: ``completed`` for
+        code 0/None, ``failed`` otherwise. Any other exception: ``failed`` (an ``exception`` event with
+        the error is recorded first).
+        """
+        if exc_type is None:
+            status = "completed"
+        elif issubclass(exc_type, KeyboardInterrupt):
+            status = "killed"
+        elif issubclass(exc_type, SystemExit):
+            status = _exit_code_status(getattr(exc, "code", None))
+        else:
+            status = "failed"
+            try:
+                self.event(f"{exc_type.__name__}: {exc}"[:500], event_type="exception", severity="error")
+            except Exception:
+                pass
+        self._finish(status)
+        return False
+
+    @property
+    def step(self) -> int:
+        """Automatic step: optimizer steps completed so far (counted by autolog), starting from the last
+        stored step on a resumed run. ``0`` until the first ``optimizer.step()``."""
+        return self._autolog.step
+
+    def set_step(self, step: int) -> None:
+        """Set the automatic step counter (e.g. to align with your own numbering). The next completed
+        optimizer step is ``step + 1``."""
+        self._autolog.set_step(step)
+
+    def track(self, *, tokens_per_batch=None, samples_per_batch=None, model=None, dataloader=None):
+        """Tell autolog about your data so it can log ``tokens_seen`` / ``samples_seen`` and throughput.
+
+        Args:
+            tokens_per_batch: Tokens in one (micro-)batch: an int, or a callable ``batch -> int`` (needs
+                ``dataloader=``; use it for variable-length batches).
+            samples_per_batch: Samples in one batch (int or callable). With a wrapped dataloader it is
+                inferred from the first dimension of the batch's first tensor if omitted.
+            model: Optional. The module used for gradient statistics when ``run.config.grad_health``
+                is on (otherwise every module is discovered through a global hook).
+            dataloader: An iterable of batches. Returns a wrapped iterable that counts batches and
+                measures how long the loop waits for data (``auto/data_wait_ms``, ``auto/data_wait_frac``).
+                Wrap the training loader only.
+
+        Returns:
+            The wrapped dataloader if one was passed, else ``None``.
+
+        Example::
+
+            train_loader = run.track(dataloader=train_loader, tokens_per_batch=B * T, model=model)
+        """
+        return self._autolog.track(tokens_per_batch, samples_per_batch, model, dataloader)
+
+    def name_loss(self, name: str, loss):
+        """Name a loss tensor: its ``backward()`` is logged as ``auto/loss/<name>``. Returns ``loss``.
+
+        Without names, each ``backward`` call site is a stream (``auto/loss``, or ``auto/loss/0``,
+        ``auto/loss/1`` ... with several). Example: ``run.name_loss("d_loss", d_loss).backward()``.
+        """
+        return _name_loss(name, loss)
 
     @property
     def server(self) -> str:
@@ -335,12 +424,18 @@ class Run:
                 resp = self._client.get(  # type: ignore[union-attr]
                     f"/runs/{self.run_id}/metrics/recent", params={"limit": self._anomaly_cfg.window}, timeout=5
                 )
-                if resp.status_code >= 300:
-                    return
-                history = resp.json().get("data") or {}
-                with self._anomaly_lock:
-                    for name, values in history.items():
-                        self._metric_detector.seed(name, [v for v in values if isinstance(v, (int, float))])
+                if resp.status_code < 300:
+                    history = resp.json().get("data") or {}
+                    with self._anomaly_lock:
+                        for name, values in history.items():
+                            self._metric_detector.seed(name, [v for v in values if isinstance(v, (int, float))])
+                resp = self._client.get(  # type: ignore[union-attr]
+                    f"/runs/{self.run_id}/param-stats/recent", params={"limit": self._anomaly_cfg.window}, timeout=5
+                )
+                if resp.status_code < 300:
+                    with self._anomaly_lock:
+                        for pname, values in (resp.json().get("data") or {}).items():
+                            self._grad_detector.seed(pname, [v for v in values if isinstance(v, (int, float))])
             except Exception:
                 log.debug("could not seed anomaly detectors", exc_info=True)
 
@@ -389,80 +484,81 @@ class Run:
 
         self._remove_watch_hooks()
 
-        def make_hook(param_name: str, param):
-            call_count = [0]
-
-            def hook(grad):
-                if grad is None:
-                    return
-                call_count[0] += 1
-                if call_count[0] % log_freq != 0:
-                    return
-                if self._finished:
-                    return
-
-                step = self._last_step
-                ts = time.time()
-                try:
-                    import torch as _torch
-
-                    # Move to CPU for all computations (safe across CUDA/CPU models)
-                    g = grad.detach().float().cpu()
-                    w = param.data.detach().float().cpu()
-                    flat_g = g.flatten()
-                    flat_w = w.flatten()
-
-                    grad_norm = float(flat_g.norm(2))
-                    has_nan_inf = (
-                        not bool(_torch.isfinite(g).all())
-                        or not bool(_torch.isfinite(w).all())
-                    )
-
-                    try:
-                        gh = _torch.histc(flat_g, bins=32).tolist()
-                        wh = _torch.histc(flat_w, bins=32).tolist()
-                    except Exception:
-                        gh, wh = [], []
-
-                    stat = {
-                        "step": step,
-                        "timestamp": ts,
-                        "param_name": param_name,
-                        "grad_norm": grad_norm,
-                        "grad_min": float(flat_g.min()),
-                        "grad_max": float(flat_g.max()),
-                        "grad_mean": float(flat_g.mean()),
-                        "weight_norm": float(flat_w.norm(2)),
-                        "weight_min": float(flat_w.min()),
-                        "weight_max": float(flat_w.max()),
-                        "weight_mean": float(flat_w.mean()),
-                        "grad_histogram": gh,
-                        "weight_histogram": wh,
-                    }
-
-                    with self._param_stats_lock:
-                        if not self._param_stats_buffer:
-                            self._param_stats_batch = uuid.uuid4().hex
-                        self._param_stats_buffer.append(stat)
-                        self._transport.wal_append(self._param_stats_batch, [stat], "param-stats")
-
-                    threading.Thread(
-                        target=self._check_grad_anomaly,
-                        args=(param_name, grad_norm, step, has_nan_inf),
-                        daemon=True,
-                    ).start()
-                except Exception:
-                    log.exception("Error computing param stats for %s", param_name)
-
-            return hook
-
         count = 0
         for name, param in model.named_parameters():
             if param.requires_grad:
-                h = param.register_hook(make_hook(name, param))
+                h = param.register_hook(self._make_param_hook(name, param, log_freq))
                 self._watch_hooks.append(h)
                 count += 1
         log.debug("Watching %d parameters (log_freq=%d)", count, log_freq)
+
+    def _make_param_hook(self, param_name: str, param, log_freq: int):
+        """Backward hook computing per-parameter gradient/weight statistics every ``log_freq`` calls."""
+        call_count = [0]
+
+        def hook(grad):
+            if grad is None:
+                return
+            call_count[0] += 1
+            if call_count[0] % log_freq != 0:
+                return
+            if self._finished:
+                return
+
+            step = self._last_step
+            ts = time.time()
+            try:
+                import torch as _torch
+
+                # Move to CPU for all computations (safe across CUDA/CPU models)
+                g = grad.detach().float().cpu()
+                w = param.data.detach().float().cpu()
+                flat_g = g.flatten()
+                flat_w = w.flatten()
+
+                grad_norm = float(flat_g.norm(2))
+                has_nan_inf = (
+                    not bool(_torch.isfinite(g).all())
+                    or not bool(_torch.isfinite(w).all())
+                )
+
+                try:
+                    gh = _torch.histc(flat_g, bins=32).tolist()
+                    wh = _torch.histc(flat_w, bins=32).tolist()
+                except Exception:
+                    gh, wh = [], []
+
+                stat = {
+                    "step": step,
+                    "timestamp": ts,
+                    "param_name": param_name,
+                    "grad_norm": grad_norm,
+                    "grad_min": float(flat_g.min()),
+                    "grad_max": float(flat_g.max()),
+                    "grad_mean": float(flat_g.mean()),
+                    "weight_norm": float(flat_w.norm(2)),
+                    "weight_min": float(flat_w.min()),
+                    "weight_max": float(flat_w.max()),
+                    "weight_mean": float(flat_w.mean()),
+                    "grad_histogram": gh,
+                    "weight_histogram": wh,
+                }
+
+                with self._param_stats_lock:
+                    if not self._param_stats_buffer:
+                        self._param_stats_batch = uuid.uuid4().hex
+                    self._param_stats_buffer.append(stat)
+                    self._transport.wal_append(self._param_stats_batch, [stat], "param-stats")
+
+                threading.Thread(
+                    target=self._check_grad_anomaly,
+                    args=(param_name, grad_norm, step, has_nan_inf),
+                    daemon=True,
+                ).start()
+            except Exception:
+                log.exception("Error computing param stats for %s", param_name)
+
+        return hook
 
     def event(
         self,
@@ -638,8 +734,8 @@ class Run:
 
     def log_samples(
         self,
-        step: int,
-        samples: list[dict],
+        step: int | list[dict] | None,
+        samples: list[dict] | None = None,
         name: str = "samples",
         mode: str = "replace",
     ) -> None:
@@ -654,7 +750,8 @@ class Run:
         every N steps rather than every step.
 
         Args:
-            step: Training step these samples belong to.
+            step: Training step these samples belong to. Optional under autolog: pass only the samples
+                (``run.log_samples(samples)``) and the automatic step is used.
             samples: List of dicts.
             name: Sample stream name, e.g. ``"eval_generations"``.
             mode: ``"replace"`` (default): the samples replace whatever is already stored for this
@@ -667,8 +764,14 @@ class Run:
 
             run.log_samples(step, [{"prompt": p, "completion": c, "reward": r}], name="rollouts")
         """
-        if self._finished or not samples:
+        if self._finished:
             return
+        if samples is None and isinstance(step, (list, tuple)):  # log_samples(samples): automatic step
+            step, samples = None, list(step)
+        if not samples:
+            return
+        if step is None:
+            step = self._autolog.resolve_step()
         if mode not in ("replace", "append"):
             raise ValueError(f"log_samples: mode must be 'replace' or 'append', not {mode!r}")
         import json as _json
@@ -734,11 +837,19 @@ class Run:
     def _finish(self, status: str) -> None:
         if self._finished:
             return
+        try:
+            self._autolog.stop(resolve=status != "killed")  # hooks off first; logs the last pending values
+        except Exception:
+            log.debug("autolog stop failed", exc_info=True)
         if self._probe_thread is not None and status != "killed":
             # let a nearly finished hardware probe still report (it submits only while the run is open)
             self._probe_thread.join(timeout=2)
         self._finished = True
         _active_runs.discard(self)
+        try:
+            _run_stack.remove(self)
+        except ValueError:
+            pass
         try:
             atexit.unregister(self._atexit)
         except Exception:
@@ -770,7 +881,7 @@ class Run:
             )
 
     @contextmanager
-    def profile(self, step: int):
+    def profile(self, step: int | None = None):
         """Profile a single training step using torch.profiler.
 
         Activates ``torch.profiler.profile`` with CPU + CUDA activity capture,
@@ -788,7 +899,8 @@ class Run:
 
         Args:
             step: The training step being profiled. Stored alongside all events
-                  so the dashboard can correlate profiler data with metric charts.
+                  so the dashboard can correlate profiler data with metric charts. Defaults to the
+                  step in progress under autolog (``run.step + 1``).
 
         Example::
 
@@ -801,6 +913,8 @@ class Run:
             yield
             return
 
+        if step is None:
+            step = self._autolog.step + 1
         ts = time.time()
         with _tp.profile(
             activities=[_tp.ProfilerActivity.CPU, _tp.ProfilerActivity.CUDA],
@@ -810,12 +924,11 @@ class Run:
         ) as _prof:
             yield
 
+        self._ship_profile_async(_prof, step, ts)
+
+    def _ship_profile_async(self, prof, step: int, ts: float) -> None:
         # Ship events off the hot path — failures are silently swallowed.
-        threading.Thread(
-            target=self._ship_profile,
-            args=(_prof, step, ts),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._ship_profile, args=(prof, step, ts), daemon=True).start()
 
     def _ship_profile(self, prof, step: int, ts: float) -> None:
         """Extract key_averages from a finished profiler session and POST to server."""

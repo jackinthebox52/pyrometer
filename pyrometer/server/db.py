@@ -1365,6 +1365,26 @@ def db_recent_metrics(run_id: str, limit: int = 100) -> dict[str, list[float]]:
     return out
 
 
+def db_recent_grad_norms(run_id: str, limit: int = 100) -> dict[str, list[float]]:
+    """The newest ``limit`` gradient norms of every parameter (oldest first), for seeding the SDK's
+    gradient anomaly detector on resume."""
+    with _lock:
+        rows = get_conn().execute(
+            """
+            SELECT param_name, grad_norm FROM (
+                SELECT param_name, step, grad_norm,
+                       row_number() OVER (PARTITION BY param_name ORDER BY step DESC) AS rn
+                FROM param_stats WHERE run_id = ? AND grad_norm IS NOT NULL
+            ) WHERE rn <= ? ORDER BY param_name, step
+            """,
+            [run_id, limit],
+        ).fetchall()
+    out: dict[str, list[float]] = {}
+    for name, value in rows:
+        out.setdefault(name, []).append(value)
+    return out
+
+
 def db_get_metrics(
     run_id: str,
     name: str | None = None,

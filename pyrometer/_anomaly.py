@@ -164,6 +164,15 @@ class GradDetector:
         self._total = 0
         self._nan_reported: set[str] = set()
 
+    def seed(self, param: str, values: list[float]) -> None:
+        """Pre-load a resumed run's gradient-norm history (oldest first); never fires, keeps cooldowns."""
+        if not self.cfg.enabled:
+            return
+        hist = self._hist.setdefault(param, [])
+        hist[:0] = [float(v) for v in values if math.isfinite(v)]
+        if len(hist) > self.cfg.window:
+            del hist[: len(hist) - self.cfg.window]
+
     def observe(self, param: str, grad_norm: float, step: int, has_nan_inf: bool) -> str | None:
         cfg = self.cfg
         if not cfg.enabled:

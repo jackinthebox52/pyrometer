@@ -29,3 +29,6 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=9.2.0",
 ]
+
+[tool.pytest.ini_options]
+markers = ["slow: spawns subprocesses (distributed / multi-process tests)"]

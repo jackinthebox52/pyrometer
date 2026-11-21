@@ -524,6 +524,13 @@ Used by the SDK to seed its anomaly detectors when a run is resumed.
 
 ---
 
+### `GET /runs/{run_id}/param-stats/recent`
+
+The newest `limit` (default 100, 1-1000) gradient norms of every parameter, oldest first:
+`{"data": {"layer.weight": [..], ...}}`. Used by the SDK to seed its gradient anomaly detector on resume.
+
+---
+
 ### `GET /runs/{run_id}/metrics`
 
 Get all metrics for a run, optionally filtered by name.

@@ -13,6 +13,7 @@ Complete API reference for the Pyrometer Python SDK.
   - [`run.watch()`](#runwatch)
   - [`run.profile()`](#runprofile)
   - [`run.finish()`](#runfinish)
+- [Autolog](#autolog)
 - [Media Logging](#media-logging)
   - [`run.log_image()`](#runlog_image)
   - [`run.log_histogram()`](#runlog_histogram)
@@ -60,6 +61,8 @@ run = pyrometer.init(
 | `offline` | `bool \| None` | `$PYROMETER_MODE == "offline"` | Record to the local spool without touching the network (including run creation); upload later with `pyrometer sync`. See [Durable delivery](#durable-delivery-offline-mode-and-pyrometer-sync). |
 | `resume` | `str \| None` | `$PYROMETER_RUN_ID` implies `"auto"` | Continue an existing run: a run id, or `"auto"` (use `$PYROMETER_RUN_ID`; resume if it exists, create it with that id otherwise). See [Resuming a run](#resuming-a-run). |
 | `anomaly_detection` | `bool \| dict` | `True` | `False` disables automatic anomaly events; a dict overrides thresholds. See [Anomaly Detection](#anomaly-detection). |
+| `autolog` | `bool \| dict \| None` | `True` (`PYROMETER_AUTOLOG=0` flips the default) | Automatic step counter, learning rate, loss, throughput while the run is open. `False` disables; a dict presets [`run.config`](#autolog) options. See [Autolog](#autolog). |
+| `rank_zero_only` | `bool` | `True` | In a distributed job (`RANK`/`LOCAL_RANK`/`WORLD_SIZE`) only rank 0 creates a run; other ranks get an inert stand-in (`run_id is None`, every method a no-op). `False`: one run per rank. |
 
 Raises `PermissionError` if the server rejects the key, `LookupError` if the project doesn't exist or the key can't use it (or `resume` names an unknown run), `ValueError` if `resume` is malformed or the run belongs to another project. See [auth.md](auth.md).
 
@@ -160,7 +163,7 @@ run.log({
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `metrics` | `dict[str, float]` | Dictionary mapping metric names to scalar values. Names can use slash notation (e.g., `"train/loss"`, `"val/accuracy"`). |
-| `step` | `int` | Global training step. Used as the x-axis in dashboard charts. |
+| `step` | `int \| None` | Global training step, the x-axis in dashboard charts. Optional while [autolog](#autolog) is on: an explicit value always wins; otherwise the automatic step is used (see [Step semantics](#step-semantics)). Required with `autolog=False`. |
 
 #### Behavior
 
@@ -339,7 +342,8 @@ run.finish()
 - If `finish()` is never called the run is closed at interpreter exit: `completed` on a normal exit, `failed`
   after an uncaught exception or `sys.exit(<non-zero>)` (also `sys.exit("message")`), `killed` on Ctrl-C or SIGTERM.
   `sys.exit(0)` / `sys.exit()` end `completed`. (The exit code is read by wrapping `sys.exit`; a hand-written
-  `raise SystemExit(1)` bypasses it and ends `completed`. A `sys.exit()` you catch is forgotten once the program logs
+  `raise SystemExit(1)` bypasses it and ends `completed` - unless the run is used as a context manager, whose
+  `__exit__` sees every exception: see [Context manager](#context-manager-and-decorator). A `sys.exit()` you catch is forgotten once the program logs
   again.)
 - **SIGTERM** is chained, not replaced: our handler marks every live run `killed` and finishes it, then calls the
   handler your application had installed (or, if there was none, lets the default action terminate the process). If
@@ -413,6 +417,162 @@ except KeyboardInterrupt:
     run.finish()  # Still flush data on interrupt
     raise
 ```
+
+---
+
+## Autolog
+
+Wrapping your training in the run's context manager is the main way to use Pyrometer: while the run is open
+(from `init` until `finish`, i.e. the `with` block) it records the step counter, learning rate, loss, throughput
+and, if you ask, gradient health, with no logging calls in your loop.
+
+```python
+with pyrometer.init(name="baseline", hyperparams={"lr": 3e-4}) as run:
+    for batch in train_loader:
+        loss = model(batch).loss
+        loss.backward()
+        optimizer.step()          # <- autolog counts steps and reads lr here
+        optimizer.zero_grad()
+        # loss was captured at backward(); nothing to log. Extra metrics: run.log({"val/acc": acc})
+```
+
+### Context manager and decorator
+
+`Run` is a context manager. On exit the run is finished with a status taken from the outcome, and the exception is
+**never swallowed**:
+
+| Block ends with | Status |
+|-----------------|--------|
+| nothing | `completed` |
+| `KeyboardInterrupt` | `killed` |
+| `SystemExit(0)` / `SystemExit()` | `completed` |
+| `SystemExit(<other code or message>)` | `failed` (this covers a hand-written `raise SystemExit(1)`) |
+| any other exception | `failed` (an `exception` event with the error is recorded first) |
+
+`run = pyrometer.init(...)` without `with` keeps working unchanged (autolog then runs until `run.finish()` or
+interpreter exit).
+
+`@pyrometer.run(name=None, hyperparams=None, **init_kwargs)` wraps a training function in that context manager (bare
+`@pyrometer.run` works too). The function's bound arguments, defaults applied, become the run's hyperparams, JSON-safe:
+numbers, strings, bools, `None`, paths and short lists/dicts as they are; tensors, modules, datasets and any other object
+become `"<ClassName>"`; strings are cut at 200 characters, containers at 50 items and depth 3. `hyperparams=` entries
+override same-named arguments; `name` defaults to the function name; other keywords (`project`, `tags`, `autolog`, ...) go to
+`init`. A parameter named `run` the caller did not pass receives the `Run`; `pyrometer.current_run()` returns the
+innermost open run anywhere.
+
+```python
+@pyrometer.run(project="mnist", tags=["baseline"])
+def train(lr: float = 3e-4, epochs: int = 10, model: torch.nn.Module = None):
+    ...
+train(lr=1e-3)    # hyperparams {"lr": 0.001, "epochs": 10, "model": "<Linear>"}
+```
+
+### How it hooks in
+
+Only global PyTorch hooks, installed when the run starts and removed when it ends (also after an exception); the
+SDK never looks at your model:
+
+- `torch.optim.optimizer.register_optimizer_step_post_hook`: one cheap callback per `optimizer.step()`.
+- A scoped wrap of `torch.Tensor.backward` and `torch.autograd.backward`: keeps a *detached reference* to each scalar
+  floating-point loss. The value is read at the **next** logging cadence, so there is no per-step GPU synchronisation.
+  The originals are restored when the last active run ends; if another library wrapped `backward` on top of ours in the
+  meantime, our wrapper stays in place but inert instead of clobbering theirs.
+- Optional, off by default (`run.config.grad_health`): a global forward hook that discovers parameters.
+
+Several runs may be open at once (each sees every step/backward); the hooks are thread-safe. If torch is not
+installed autolog switches itself off. A callback never raises into your code.
+
+### Step semantics
+
+`run.step` is the number of **optimizer steps completed** (the HuggingFace/Lightning `global_step` convention): `0`
+until the first `optimizer.step()`, `1` right after it. Auto metrics for a step are logged *at* that number.
+
+- **Which optimizer counts.** The first optimizer that steps drives the counter, unless `run.config.step_optimizer`
+  is set. Other optimizers only contribute their learning rates (`auto/lr/opt<j>/<group>`). A step skipped by
+  `GradScaler` (inf gradients) is not a completed step.
+- **`run.log(metrics)` without `step`** uses `run.step`. Called after `optimizer.step()` in the loop (the usual place) it lands
+  on the same step as that iteration's auto metrics. Before any optimizer has stepped, step-less calls count up on their own
+  (0, 1, 2, ...), so a script without an optimizer does not stack every value on step 0.
+- **An explicit `step=` always wins** for that call and does not move the counter. If your own numbering differs from
+  the optimizer-step count (epochs, 0-based loops, accumulation-aware counters) either pass `step=` everywhere you log,
+  or align the counter once with `run.set_step(n)` (the next completed step is `n + 1`).
+- **Resume**: the counter starts at the run's last stored step.
+- Anything else without a step (`log_image`, `log_histogram`, `log_figure`, events, console lines) uses the last step known;
+  `log_samples(samples)` and `run.profile()` accept no step too (`profile()` labels the step in progress, `run.step + 1`).
+
+### `run.config`
+
+Live-editable options (assignment takes effect immediately; `init(autolog={...})` presets them):
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `log_every` | `10` | Log the auto metrics every N steps of the driving optimizer (and at step 1, and once more at the end). |
+| `loss` | `True` | Capture losses from `backward()`. |
+| `lr` | `True` | Learning rate per param group. |
+| `throughput` | `True` | Steps/sec, tokens/samples counters and rates, data wait. |
+| `step_optimizer` | `None` | The optimizer that drives the step counter (default: the first that steps). |
+| `grad_norm` | `False` | Global gradient L2 norm at cadence (cheap: one foreach-norm, read lazily); NaN/Inf triggers an anomaly event. |
+| `grad_health` | `False` | Per-parameter gradient/weight stats and anomaly detection, as `run.watch`. Expensive. Without a model hint every module is discovered through a global forward hook (parameters named `<Class>.<n>.<param>`); with `run.track(model=...)` only that model is watched under its normal names. |
+| `grad_log_freq` | `100` | Backward passes between per-parameter statistics (`grad_health`). |
+| `profile_every` | `None` | Profile one whole iteration (forward, backward, step) every N steps; `None` = never. |
+
+### Auto metrics
+
+Everything autolog logs lives under the `auto/` prefix (except the two axis metrics), at the step defined above, at the
+`log_every` cadence. Auto metrics other than the loss and `auto/grad_norm` are exempt from anomaly detection.
+
+| Metric | Meaning |
+|--------|---------|
+| `auto/lr/<i>` | Learning rate of param group `i` of the driving optimizer. |
+| `auto/lr/opt<j>/<i>` | Same for the j-th other optimizer (in order of first step). |
+| `auto/loss` | Loss of the (single) loss stream, see below. |
+| `auto/loss/<0..n>` | One metric per loss stream when there are several; `auto/loss/<name>` for streams named with `run.name_loss`. |
+| `auto/steps_per_sec` | Optimizer steps per wall-clock second since the previous logged step (so evaluation and checkpointing time between steps counts; not logged at step 1). |
+| `auto/grad_norm` | Global gradient L2 norm (`grad_norm` option). |
+| `auto/tokens_per_sec`, `auto/samples_per_sec` | Rates from the `run.track` hints. |
+| `auto/data_wait_ms` | Mean time per step the loop waited on the wrapped dataloader. |
+| `auto/data_wait_frac` | Fraction of wall time spent waiting for data (`0..1`); high means an input-bound job. |
+| `tokens_seen`, `samples_seen` | Cumulative counters, unprefixed on purpose: select them as the dashboard's x-axis. |
+
+**Losses.** A *loss stream* is all the `backward()` calls from one call site (file and line), or all tensors tagged with the
+same `run.name_loss(name, loss)` name. Only scalar floating-point tensors count (a non-scalar `backward(gradient)` is
+ignored). Several backwards per optimizer step on the same stream are gradient accumulation: the logged value is their
+**mean** over the step. Different streams (GAN generator and discriminator, a multi-task loss backpropagated in parts) are
+logged separately. With one stream the metric is `auto/loss`; once a second one exists the new ones are `auto/loss/1`,
+`auto/loss/2`... (a stream keeps the name it was first logged under, so `auto/loss` stays stream 0).
+Name them for readable charts: `run.name_loss("disc", d_loss).backward()`. Only the optimizer step closes a window, so a
+program that calls `backward()` without ever stepping an optimizer logs no loss.
+
+NaN/Inf in the loss is reported by the normal anomaly detection when the value is read (one cadence later).
+
+### `run.track(...)`
+
+```python
+train_loader = run.track(dataloader=train_loader, tokens_per_batch=B * T, samples_per_batch=B, model=model)
+```
+
+Hints for what autolog cannot know: `tokens_per_batch` / `samples_per_batch` (int, or `callable(batch) -> int` when a
+dataloader is wrapped), `model` (target for `grad_health`) and `dataloader`, which returns a wrapped iterable that counts
+batches and times how long `next()` blocks. Without a dataloader the counters advance per optimizer step by
+`hint x micro-batches` (the number of backwards in the step, so accumulation is counted correctly). Wrap the training
+loader only. `samples_per_batch` is inferred from `shape[0]` of the first tensor in a wrapped batch if omitted. Returns
+the wrapped loader (or `None`).
+
+### Ranks
+
+`init` reads `RANK` (or `LOCAL_RANK` when `WORLD_SIZE > 1` and `RANK` is unset) as set by `torchrun`. Only rank 0 creates a run
+and installs hooks; the others receive an inert stand-in that accepts every call (including `with`, `config`, `track`,
+`name_loss`) and does nothing, so one script runs unchanged on every rank. `init(rank_zero_only=False)` gives every
+rank its own run. Pass the same `PYROMETER_RUN_ID` to resume across restarts.
+
+### Overhead
+
+Autolog cost is one callback per `optimizer.step()` plus a small wrapper per `backward()`; everything else (reading
+learning rates, stacking loss references, `.item()`) happens once per `log_every` steps. Measured on a CPU box with a tiny
+64-128-1 MLP (the worst case: about 420 us per step of real work): roughly **+20 us per step, about 5%** (best of three 1500-step runs, `log_every=10`;
+`tests/test_autolog.py::test_overhead_is_small` prints the numbers on your machine). Real GPU steps take milliseconds, so the relative cost is lower still. `grad_health` is the
+exception: it computes per-parameter statistics on the CPU every `grad_log_freq` backward passes and should be used
+deliberately.
 
 ---
 
