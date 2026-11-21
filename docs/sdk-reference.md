@@ -548,10 +548,18 @@ ignored). Several backwards per optimizer step on the same stream are gradient a
 **mean** over the step. Different streams (GAN generator and discriminator, a multi-task loss backpropagated in parts) are
 logged separately. With one stream the metric is `auto/loss`; once a second one exists the new ones are `auto/loss/1`,
 `auto/loss/2`... (a stream keeps the name it was first logged under, so `auto/loss` stays stream 0).
+**`auto/loss` is sampled, not a window mean.** The value logged at step `k` (a cadence step: step 1 and every
+`log_every`-th) is the loss of *that* optimizer step's backward(s) only; with gradient accumulation it is the mean of
+the micro-batches inside that one step. It is not an average over the `log_every` steps since the previous point, so it
+is noisier than a smoothed training loss (use the chart's EMA smoothing, or log your own running mean with `run.log`).
+This is deliberate: a window mean would need one extra device kernel per step, which costs measurable time on CUDA
+jobs with sub-millisecond steps, and reading it would need a host sync. Steps between cadence points keep nothing.
 Name them for readable charts: `run.name_loss("disc", d_loss).backward()`. Only an optimizer step closes a
 window; for programs that never step one see the fallback below.
 
-NaN/Inf in the loss is reported by the normal anomaly detection when the value is read (one cadence later).
+NaN/Inf in the loss is reported by the normal anomaly detection when the value is read (one cadence later). Non-finite
+values are stored as logged; the SDK sends them as the strings `"NaN"`/`"Infinity"` (strict JSON has no such numbers) and
+the server returns them as `null` in JSON responses (a gap in the chart; the Parquet export keeps the real NaN).
 
 ### Loss without an optimizer step, and `torch.autograd.grad`
 

@@ -576,7 +576,8 @@ class _AutologEngine:
         try:
             if not (t.numel() == 1 and t.is_floating_point()):
                 return
-            tag = getattr(t, "_pyro_loss_name", None)
+            d0 = t.__dict__  # a missing attribute through getattr() costs an exception per backward
+            tag = d0.get("_pyro_loss_name") if d0 else None
         except Exception:
             return
         skey = ("tag", tag) if tag else key
@@ -619,7 +620,6 @@ class _AutologEngine:
         return d is optimizer
 
     def _step_hook(self, optimizer: Any) -> None:
-        now = time.perf_counter()
         cfg = self.config
         with self._lock:
             if id(optimizer) not in self._opt_ids:
@@ -650,7 +650,7 @@ class _AutologEngine:
         if self._prof is not None or cfg.profile_every:
             self._profile_tick(k)
         if cadence:
-            self._emit(k, now)
+            self._emit(k, time.perf_counter())
 
     def _emit(self, k: int, now: float | None) -> None:
         """Log the cadence metrics for step ``k``. ``now=None`` (final flush at stop) skips rate metrics."""

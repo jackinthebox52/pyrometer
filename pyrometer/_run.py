@@ -35,10 +35,13 @@ class _TeeWriter:
         self._on_line = on_line  # callable(line: str, stream: str)
         self._buf = ""
         self._lock = threading.RLock()
+        self.detached = False  # the run ended while something else wrapped us: pass through, capture nothing
 
     def write(self, text: str) -> int:
         with self._lock:
             self._orig.write(text)
+            if self.detached:
+                return len(text)
             self._buf += text
             while "\n" in self._buf:
                 line, self._buf = self._buf.split("\n", 1)
@@ -51,7 +54,7 @@ class _TeeWriter:
 
     def flush(self) -> None:
         with self._lock:
-            if self._buf.strip():
+            if self._buf.strip() and not self.detached:
                 try:
                     self._on_line(self._buf, self._name)
                 except Exception:
@@ -1057,16 +1060,25 @@ class Run:
     def _install_stdout_capture(self) -> None:
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
-        sys.stdout = _TeeWriter(sys.stdout, "stdout", self._on_log_line)
-        sys.stderr = _TeeWriter(sys.stderr, "stderr", self._on_log_line)
+        self._tee_out = sys.stdout = _TeeWriter(sys.stdout, "stdout", self._on_log_line)
+        self._tee_err = sys.stderr = _TeeWriter(sys.stderr, "stderr", self._on_log_line)
 
     def _restore_stdout_capture(self) -> None:
-        if self._original_stdout is not None:
-            sys.stdout = self._original_stdout
-            self._original_stdout = None
-        if self._original_stderr is not None:
-            sys.stderr = self._original_stderr
-            self._original_stderr = None
+        """Put the streams back, but never clobber what somebody else installed after us (another run, a
+        redirect helper): then our tee just stops capturing and passes through. A stale tee left under a
+        newer one by an earlier run is skipped over when the newer owner restores."""
+        for attr, tee_attr, orig_attr in (("stdout", "_tee_out", "_original_stdout"),
+                                          ("stderr", "_tee_err", "_original_stderr")):
+            tee, orig = getattr(self, tee_attr, None), getattr(self, orig_attr)
+            if tee is None:
+                continue
+            tee.detached = True
+            while isinstance(orig, _TeeWriter) and orig.detached:
+                orig = orig._orig
+            if getattr(sys, attr) is tee:
+                setattr(sys, attr, orig)
+            setattr(self, tee_attr, None)
+            setattr(self, orig_attr, None)
 
     def _on_log_line(self, line: str, stream: str) -> None:
         ts = time.time()
@@ -1286,8 +1298,11 @@ class Run:
     def _flush_loop(self) -> None:
         self._heartbeat()
         while not self._stop.wait(5):
-            self._flush()
-            self._heartbeat()
+            try:  # a bad batch must not end the thread (metrics would then only flush at finish)
+                self._flush()
+                self._heartbeat()
+            except Exception:
+                log.debug("periodic flush failed", exc_info=True)
         self._flush()  # drain on exit
 
     def _heartbeat(self) -> None:

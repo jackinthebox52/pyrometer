@@ -77,6 +77,31 @@ def _record(item: dict) -> dict:
     return {k: v for k, v in item.items() if not k.startswith("_")}
 
 
+_NONFINITE = {"nan": "NaN", "inf": "Infinity", "-inf": "-Infinity"}
+
+
+def _finite_json(obj):
+    """``obj`` with NaN/Infinity floats replaced by the strings ``"NaN"`` / ``"Infinity"`` / ``"-Infinity"``
+    (strict JSON has no such numbers; the server's float fields parse these strings back)."""
+    if isinstance(obj, float):
+        return obj if obj - obj == 0.0 else _NONFINITE[str(obj)]  # nan/inf: x - x is nan
+    if isinstance(obj, dict):
+        return {k: _finite_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite_json(v) for v in obj]
+    return obj
+
+
+def wire_json(body):
+    """``body`` ready for a strict JSON encoder (httpx refuses NaN/Infinity, which a diverging loss produces,
+    and would otherwise fail the whole batch it is in)."""
+    try:
+        json.dumps(body, allow_nan=False)
+        return body
+    except ValueError:
+        return _finite_json(body)
+
+
 def materialize_body(item: dict, run_dir: Path):
     """The JSON body to send for ``item``, with its blob (if any) inlined as text.
 
@@ -84,7 +109,7 @@ def materialize_body(item: dict, run_dir: Path):
     """
     blob = item.get("blob")
     if not blob:
-        return item.get("json")
+        return wire_json(item.get("json"))
     try:
         raw = (run_dir / BLOB_DIR / blob["file"]).read_bytes()
     except OSError:
@@ -93,7 +118,7 @@ def materialize_body(item: dict, run_dir: Path):
     body[blob["field"]] = (
         base64.b64encode(raw).decode("ascii") if blob.get("enc", "b64") == "b64" else raw.decode("utf-8")
     )
-    return body
+    return wire_json(body)
 
 
 def read_jsonl(path: Path, start: int = 0) -> tuple[list[dict], int]:

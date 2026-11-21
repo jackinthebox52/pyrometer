@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -20,7 +21,7 @@ from pathlib import Path
 import duckdb
 from starlette.requests import HTTPConnection
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -203,7 +204,29 @@ async def _announce_activity(conn: HTTPConnection):
         await _ws.broadcast({"type": "run_activity", "run_id": run_id}, throttle_key=(run_id, "activity"), throttle_ms=2000)
 
 
+class _SafeJSONResponse(JSONResponse):
+    """Like ``JSONResponse`` but a NaN/Infinity (a diverged loss is stored as such) becomes ``null`` instead of
+    failing the whole response with a 500."""
+
+    def render(self, content) -> bytes:
+        try:
+            return super().render(content)
+        except ValueError:
+            return super().render(_null_nonfinite(content))
+
+
+def _null_nonfinite(obj):
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _null_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_null_nonfinite(v) for v in obj]
+    return obj
+
+
 app = FastAPI(
+    default_response_class=_SafeJSONResponse,
     title="Pyrometer API",
     version="0.1.0",
     lifespan=_lifespan,

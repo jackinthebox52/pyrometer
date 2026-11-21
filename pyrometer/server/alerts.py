@@ -69,6 +69,8 @@ def public_rule(rule: dict) -> dict:
 
 def validate_url(url: str) -> str | None:
     """An error message if ``url`` is not an http(s) URL, else ``None``."""
+    if "\u2026" in url:  # the masked form shown by the API: saving it back would destroy the real secret
+        return "Webhook URL looks masked; send the full URL"
     try:
         parsed = httpx.URL(url)
     except Exception:
