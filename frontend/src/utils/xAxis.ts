@@ -181,3 +181,18 @@ export function formatXLabel(axis: XAxis, v: number): string {
   if (axis === 'rel') return `elapsed ${formatElapsed(v)}`
   return `${axisLabel(axis)} ${Number.isInteger(v) ? v : compact(v)}`
 }
+
+/**
+ * Restrict the x-axis to the kinds a chart offers (e.g. GPU charts have no steps: elapsed or wall time). A stored
+ * axis outside `axes` (and not a metric axis, which the caller validates) becomes the first allowed kind.
+ */
+export function coerceAxis(axis: XAxis, axes?: readonly string[]): XAxis {
+  if (!axes || axes.length === 0 || axisMetricName(axis) != null || axes.includes(axis)) return axis
+  return axes[0]
+}
+
+/** Convert a drag selection on a time-based chart into a timestamp window (Unix seconds). */
+export function timeWindow(axis: XAxis, x0: number, x1: number, startTime: number): { t_min: number; t_max: number } {
+  const off = axis === 'time' ? 0 : startTime
+  return { t_min: off + Math.min(x0, x1), t_max: off + Math.max(x0, x1) }
+}

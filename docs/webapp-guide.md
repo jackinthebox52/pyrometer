@@ -312,7 +312,7 @@ and elapsed axes, placed by timestamp.
 #### Large runs: downsampling and zoom
 
 Charts do not load every point. Run page and compare view ask the server for about **two points per pixel of chart width**
-(`max_points`, clamped to 200-4000; sized from the page width, so narrower charts get slightly more than they draw), and the server keeps
+(`max_points`, clamped to 200-4000; measured with a `ResizeObserver` on the charts themselves: a page-wide load uses the widest chart on screen, a zoom refetch its own chart's width, and widening the charts a lot (window, layout) triggers one reload at the new resolution), and the server keeps
 the minimum, maximum, first and last point of every bucket (GPU stats: first/last and the peak/low utilization, peak memory and
 temperature; gradient stats: first/last and the peaks), so a one-step spike survives. Runs that fit within the budget are returned whole.
 
@@ -322,6 +322,12 @@ temperature; gradient stats: first/last and the peaks), so a one-step spike surv
   value falls inside it (plus one neighbouring point each side) and both the series and the axis metric are fetched for that step window.
   Changing the x-axis drops the zoom. Zoom composes with log scale, normalization, smoothing, event markers and (compare view) grouping bands.
   In the GPU section all charts share one zoom (they share the time axis). In the gradient detail charts the window is fetched per parameter.
+- **Linked zoom (compare view)**: a **link zoom** toggle (on by default) makes a drag on one chart zoom every compare chart to the same x window
+  (each fetches its own runs' data for it; resetting one resets all; a chart whose x-axis differs from the selection ignores it). Turn it off for independent zoom.
+- **X-axis on GPU and gradient charts**: GPU charts offer **elapsed** (default) and **wall time**; the gradient/weight detail charts offer step, wall time and
+  elapsed. A GPU zoom converts to a timestamp window whichever axis you dragged on.
+- **Heatmap zoom**: drag across columns of the gradient heatmap to zoom to that step range (every parameter is refetched at full resolution, one column per 4 px);
+  **reset zoom** in its header goes back. A plain click still selects a parameter.
 - **Metric-as-x on downsampled data**: the axis metric and the plotted metric are thinned independently, so they rarely share exact steps;
   points are placed by linear interpolation of the axis metric between its kept points (not outside its range). Zoom in for exact joins.
 - **Smoothing (EMA) is an approximation on thinned data.** It runs in the browser over the points the server returned (per-bucket
@@ -332,7 +338,9 @@ temperature; gradient stats: first/last and the peaks), so a one-step spike surv
 - **Live runs**: new points are fetched as a tail (everything newer than the newest timestamp already held, minus 5 s) and merged by
   (series, step), so a long run never refetches its history. When the merged tail makes the held data more than about twice the
   budget it is resampled once. A zoomed chart refetches its window when new data arrives. Points logged late with an older timestamp
-  (for example a `pyrometer sync` replay) show up on the next full load.
+  (for example a `pyrometer sync` replay) are not in that tail, so the server sends a throttled `run_backfill` WebSocket event (`kind`: `metrics`,
+  `system` or `param_stats`, with a trailing event after a burst) when an ingested batch is older than the run's newest data, and the page reloads the affected
+  series in full.
 - The gradient heatmap puts every parameter on one shared column grid (at most one column per 4 px, peak norm per cell; hovering a binned
   column shows its step range), because parameters are thinned separately.
 - **Images** in the media gallery are loaded through their file URL (`inline=false`, `loading="lazy"`), so a run with thousands of images does not

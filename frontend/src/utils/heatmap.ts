@@ -42,3 +42,17 @@ export function binHeatmap(stats: ParamStat[], maxCols: number): HeatmapBins {
   }
   return { steps: used.map((b) => first.get(b)!), ends: used.map((b) => last.get(b)!), cells }
 }
+
+/** Column index under pixel `x` (relative to the grid's left edge), clamped to the grid; null if there are no columns. */
+export function columnAt(x: number, colCount: number, colPitch: number): number | null {
+  if (colCount <= 0 || !(colPitch > 0) || !Number.isFinite(x)) return null
+  return Math.max(0, Math.min(colCount - 1, Math.floor(x / colPitch)))
+}
+
+/** Step window covered by the dragged columns `a`..`b` (any order); null if either column does not exist. */
+export function columnsToStepRange(bins: Pick<HeatmapBins, 'steps' | 'ends'>, a: number, b: number): { step_min: number; step_max: number } | null {
+  const lo = Math.min(a, b)
+  const hi = Math.max(a, b)
+  if (lo < 0 || hi >= bins.steps.length) return null
+  return { step_min: bins.steps[lo], step_max: bins.ends[hi] }
+}

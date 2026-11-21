@@ -13,12 +13,13 @@ import {
 import type { Metric, RunEvent } from '../api/types.ts'
 import { formatMetricValue } from '../utils/format.ts'
 import { MAX_ALPHA, formatLogTick, logTicks, positiveRange, processSeries, useChartOptions } from '../utils/chartOptions.ts'
-import { axisLabel, axisMetricName, eventX, firstTimestamp, formatXLabel, formatXTick, resolveXs } from '../utils/xAxis.ts'
+import { coerceAxis, axisLabel, axisMetricName, eventX, firstTimestamp, formatXLabel, formatXTick, resolveXs } from '../utils/xAxis.ts'
 import type { XPoint, XSource } from '../utils/xAxis.ts'
 import { maxPointsForWidth, zoomQuery } from '../utils/series.ts'
 import type { RangeQuery, XZoom } from '../utils/series.ts'
 import { useDragZoom } from '../hooks/useDragZoom.ts'
 import { useZoomFetch } from '../hooks/useZoomFetch.ts'
+import { useMeasuredWidth } from '../hooks/useMeasuredWidth.ts'
 import ChartControls from './ChartControls.tsx'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
@@ -32,6 +33,8 @@ interface Props {
   expanded?: boolean
   /** Enables the x-axis selector: the run's metrics by name (for metric-as-x) and start time. */
   source?: XSource
+  /** Base x-axis kinds offered by the selector (default step, time, rel); GPU charts: ['rel', 'time']. */
+  axes?: readonly string[]
   /**
    * Self-managed zoom: drag-select on the chart fetches that window at full resolution through this
    * callback (one call per series: the metric and, on a metric x-axis, the axis metric).
@@ -195,6 +198,7 @@ export default function MetricChart({
   events,
   expanded = false,
   source,
+  axes,
   fetchRange,
   zoom: externalZoom,
   refreshKey,
@@ -204,6 +208,7 @@ export default function MetricChart({
   const [isExpanded, setIsExpanded] = useState(false)
   const [showLocalEvents, setShowLocalEvents] = useState(true)
   const containerRef = useRef<HTMLDivElement>(null)
+  const widthRef = useMeasuredWidth(containerRef)
 
   const src: XSource = useMemo(() => source ?? {}, [source])
   const axisNames = useMemo(
@@ -211,9 +216,9 @@ export default function MetricChart({
     [source],
   )
   // A stored metric axis this run does not have falls back to step (with a note).
-  const wanted = source ? opts.xAxis : 'step'
+  const wanted = source ? coerceAxis(opts.xAxis, axes) : 'step'
   const axisMissing = axisMetricName(wanted) != null && !(src.byName?.[axisMetricName(wanted)!]?.length)
-  const axis = axisMissing ? 'step' : wanted
+  const axis = axisMissing ? coerceAxis('step', axes) : wanted
 
   // Zoom: the window is refetched at full resolution (self-managed) or supplied by the parent (external).
   const pointsRef = useRef<XPoint[]>([])
@@ -222,7 +227,7 @@ export default function MetricChart({
       ? async (z) => {
           const q = zoomQuery(z, pointsRef.current, src.startTime ?? firstTimestamp(data) ?? 0)
           if (!q) return null
-          const mp = maxPointsForWidth(containerRef.current?.clientWidth ?? 600)
+          const mp = maxPointsForWidth(widthRef.current)
           const axisName = axisMetricName(z.axis)
           const [series, axisData] = await Promise.all([
             fetchRange(name, q, mp),
@@ -350,6 +355,7 @@ export default function MetricChart({
             onChange={setOpts}
             dropped={dropped}
             axisMetrics={source ? axisNames : undefined}
+            axes={axes}
             overridden={overridden}
             onReset={resetOpts}
           />
@@ -401,6 +407,7 @@ export default function MetricChart({
             lineColor={lineColor}
             events={events}
             source={source}
+            axes={axes}
             fetchRange={fetchRange}
             zoom={externalZoom}
             refreshKey={refreshKey}

@@ -120,11 +120,18 @@ _wrap_lock = threading.Lock()
 _engines: tuple = ()  # copy-on-write, read lock-free by the wrappers
 _orig_tensor_backward: Callable | None = None
 _orig_autograd_backward: Callable | None = None
-_tls = threading.local()  # .active: inside a wrapped backward (Tensor.backward calls autograd.backward)
+
+
+class _TLS(threading.local):
+    active = False  # inside a wrapped backward (Tensor.backward calls autograd.backward); class default: no getattr()
+
+
+_tls = _TLS()
 
 
 def _w_tensor_backward(self, *args, **kwargs):
-    if not getattr(_tls, "active", False):
+    prev = _tls.active
+    if not prev:
         engines = _engines
         if engines:
             try:
@@ -134,7 +141,6 @@ def _w_tensor_backward(self, *args, **kwargs):
                     e._on_backward(key, self)
             except Exception:
                 pass
-    prev = getattr(_tls, "active", False)
     _tls.active = True
     try:
         return _orig_tensor_backward(self, *args, **kwargs)  # type: ignore[misc]
@@ -143,7 +149,8 @@ def _w_tensor_backward(self, *args, **kwargs):
 
 
 def _w_autograd_backward(tensors, *args, **kwargs):
-    if not getattr(_tls, "active", False):
+    prev = _tls.active
+    if not prev:
         engines = _engines
         if engines:
             try:
@@ -157,7 +164,6 @@ def _w_autograd_backward(tensors, *args, **kwargs):
                         e._on_backward(key, t)
             except Exception:
                 pass
-    prev = getattr(_tls, "active", False)
     _tls.active = True
     try:
         return _orig_autograd_backward(tensors, *args, **kwargs)  # type: ignore[misc]
@@ -200,7 +206,7 @@ _orig_autograd_grad: Callable | None = None
 
 
 def _w_autograd_grad(outputs, *args, **kwargs):
-    if not getattr(_tls, "active", False):
+    if not _tls.active:
         engines = _grad_engines
         if engines:
             try:
@@ -350,6 +356,10 @@ class _AutologEngine:
         self._win_tokens = 0
         self._win_samples = 0
         self._last_emit_k = 0
+        self._next_is_cadence = True  # the driving optimizer's next step is a cadence step (keep loss values)
+        # CUDA: rates are measured between completed-work events, not CPU wall time (the CPU runs ahead of the GPU)
+        self._win_ev: Any = None
+        self._rate_lazy: list[tuple] = []
 
         # track() hints and counters
         self._tokens_hint: int | Callable | None = None
@@ -424,6 +434,7 @@ class _AutologEngine:
                     for s in list(self._streams.values()):
                         self._fallback_flush(s, True)
                 self._resolve_lazy(force=True)
+                self._resolve_rates(force=True)
         except Exception:
             log.debug("autolog final flush failed", exc_info=True)
         try:
@@ -449,6 +460,7 @@ class _AutologEngine:
         with self._lock:
             self.step = int(n)
             self._implicit = self.step - 1
+            self._next_is_cadence = True
         self.run._last_step = self.step
         self.run._step_known = True
 
@@ -568,12 +580,16 @@ class _AutologEngine:
         except Exception:
             return
         skey = ("tag", tag) if tag else key
-        d = t.detach()
+        # A backward that cannot reach a cadence step contributes only to the micro-batch count: the value
+        # is not kept (no detach, no deque append).
+        keep = not self.saw_step or self._next_is_cadence
+        d = t.detach() if keep else None
         with self._lock:
             s = self._streams.get(skey)
             if s is None:
                 s = self._streams[skey] = _Stream(len(self._streams), tag)
-            s.pending.append(d)
+            if keep:
+                s.pending.append(d)
             s.count += 1
             s.total += 1
             due = not self.saw_step and (s.fb or s.total >= _FALLBACK_AFTER) and s.total % self.config.log_every == 0
@@ -604,6 +620,7 @@ class _AutologEngine:
 
     def _step_hook(self, optimizer: Any) -> None:
         now = time.perf_counter()
+        cfg = self.config
         with self._lock:
             if id(optimizer) not in self._opt_ids:
                 self._opt_ids.add(id(optimizer))
@@ -615,22 +632,25 @@ class _AutologEngine:
             run = self.run
             run._last_step = k
             run._step_known = True
-            micro = max((s.count for s in self._streams.values()), default=0) or 1
-            if not self._loader_tracked:
-                if isinstance(self._tokens_hint, int):
-                    self.tokens_seen += self._tokens_hint * micro
-                if isinstance(self._samples_hint, int):
-                    self.samples_seen += self._samples_hint * micro
-            cadence = k == 1 or k % self.config.log_every == 0
-        if self._prof is not None or self.config.profile_every:
+            streams = self._streams
+            if self._tokens_hint is not None or self._samples_hint is not None:
+                if not self._loader_tracked:
+                    micro = max((s.count for s in streams.values()), default=0) or 1
+                    if isinstance(self._tokens_hint, int):
+                        self.tokens_seen += self._tokens_hint * micro
+                    if isinstance(self._samples_hint, int):
+                        self.samples_seen += self._samples_hint * micro
+            every = cfg.log_every
+            cadence = k == 1 or k % every == 0
+            self._next_is_cadence = (k + 1) % every == 0
+            if not cadence:
+                for s in streams.values():
+                    s.pending.clear()
+                    s.count = 0
+        if self._prof is not None or cfg.profile_every:
             self._profile_tick(k)
         if cadence:
             self._emit(k, now)
-        else:
-            with self._lock:
-                for s in self._streams.values():
-                    s.pending.clear()
-                    s.count = 0
 
     def _emit(self, k: int, now: float | None) -> None:
         """Log the cadence metrics for step ``k``. ``now=None`` (final flush at stop) skips rate metrics."""
@@ -640,17 +660,21 @@ class _AutologEngine:
         ts = time.time()
         with self._lock:
             self._last_emit_k = k
-            dt = None if (self._win_t is None or now is None) else now - self._win_t
+            ev = self._make_event(self._driver_opt()) if (cfg.throughput and now is not None) else None
             ds = k - self._win_k
-            if cfg.throughput and dt and dt > 0 and ds > 0:
-                metrics["auto/steps_per_sec"] = ds / dt
-                if self.tokens_seen:
-                    metrics["auto/tokens_per_sec"] = (self.tokens_seen - self._win_tokens) / dt
-                if self.samples_seen:
-                    metrics["auto/samples_per_sec"] = (self.samples_seen - self._win_samples) / dt
-                if self._loader_tracked:
-                    metrics["auto/data_wait_ms"] = self._wait_total / ds * 1000.0
-                    metrics["auto/data_wait_frac"] = min(1.0, self._wait_total / dt)
+            if ev is not None:
+                # CUDA: defer the rates until both window-edge events have completed (see _resolve_rates)
+                if self._win_ev is not None and ds > 0:
+                    self._rate_lazy.append((
+                        k, ts, ds, self._win_ev, ev, self.tokens_seen - self._win_tokens,
+                        self.samples_seen - self._win_samples, self._wait_total,
+                    ))
+                self._win_ev = ev
+            else:
+                dt = None if (self._win_t is None or now is None) else now - self._win_t
+                if cfg.throughput and dt and dt > 0 and ds > 0:
+                    metrics.update(self._rate_metrics(ds, dt, self.tokens_seen - self._win_tokens,
+                                                      self.samples_seen - self._win_samples, self._wait_total))
             if cfg.throughput:
                 if self.tokens_seen:
                     metrics["tokens_seen"] = float(self.tokens_seen)
@@ -674,22 +698,83 @@ class _AutologEngine:
                 device_vals["auto/grad_norm"] = gn
         self._ship(k, ts, metrics, device_vals)
 
+    def _rate_metrics(self, ds: int, dt: float, tokens: int, samples: int, wait: float) -> dict[str, float]:
+        m = {"auto/steps_per_sec": ds / dt}
+        if self.tokens_seen:
+            m["auto/tokens_per_sec"] = tokens / dt
+        if self.samples_seen:
+            m["auto/samples_per_sec"] = samples / dt
+        if self._loader_tracked:
+            m["auto/data_wait_ms"] = wait / ds * 1000.0
+            m["auto/data_wait_frac"] = min(1.0, wait / dt)
+        return m
+
+    @staticmethod
+    def _make_event(opt: Any) -> Any:
+        """A timing CUDA event recorded on the driving optimizer's device now, or ``None`` on CPU / without CUDA
+        (the wall-clock path is exact there). Rates computed between two such events reflect work the GPU has
+        actually completed, not how far the CPU has run ahead."""
+        try:
+            if opt is None:
+                return None
+            import torch
+
+            if not torch.cuda.is_available():
+                return None
+            dev = None
+            for g in opt.param_groups:
+                for p in g["params"]:
+                    dev = p.device
+                    break
+                if dev is not None:
+                    break
+            if dev is None or dev.type != "cuda":
+                return None
+            with torch.cuda.device(dev):
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record()
+            return ev
+        except Exception:
+            return None
+
+    def _resolve_rates(self, force: bool = False) -> None:
+        """Log CUDA-measured rate windows whose end events have completed (``force`` waits for them)."""
+        with self._lock:
+            ready: list[tuple] = []
+            keep: list[tuple] = []
+            for entry in self._rate_lazy:
+                try:
+                    done = force or entry[4].query()
+                except Exception:
+                    done = True
+                (ready if done else keep).append(entry)
+            self._rate_lazy = keep
+        for k, ts, ds, e0, e1, tokens, samples, wait in ready:
+            try:
+                if force:
+                    e1.synchronize()
+                dt = e0.elapsed_time(e1) / 1000.0
+            except Exception:
+                continue
+            if dt > 0:
+                self.run._log(self._rate_metrics(ds, dt, tokens, samples, wait), k, ts)
+
     def _ship(self, k: int, ts: float, metrics: dict[str, float], device_vals: dict[str, Any]) -> None:
         """Log ready values now; device tensors are queued and read at the next cadence (no GPU sync)."""
         # Earlier cadences are read only if their async host copy already finished (never blocks the stream).
         self._resolve_lazy()
-        if metrics:
-            self.run._log(metrics, k, ts)
-        ready: dict[str, float] = {}
+        self._resolve_rates()
+        ready = 0
         for name, tensor in device_vals.items():
-            if tensor.device.type == "cpu":  # nothing to wait for
+            if tensor.device.type == "cpu":  # nothing to wait for: logged together with the other ready values
                 try:
-                    ready[name] = float(tensor)
+                    metrics[name] = float(tensor)
+                    ready += 1
                 except Exception:
                     pass
-        if ready:
-            self.run._log(ready, k, ts)
-        pending = {n: t for n, t in device_vals.items() if n not in ready}
+        if metrics:
+            self.run._log(metrics, k, ts)
+        pending = {n: t for n, t in device_vals.items() if n not in metrics} if ready < len(device_vals) else None
         if pending:
             staged, events = self._stage(pending)
             with self._lock:
@@ -765,6 +850,11 @@ class _AutologEngine:
     def _mean(vals: list[Any]) -> Any:
         import torch
 
+        try:
+            if all(v.device.type == "cpu" for v in vals):  # cheaper than stack+mean for a handful of scalars
+                return torch.tensor(sum(float(v) for v in vals) / len(vals))
+        except Exception:
+            pass
         try:
             return torch.stack([v.reshape(()).float() for v in vals]).mean()
         except Exception:  # tensors on different devices
@@ -878,6 +968,8 @@ class _AutologEngine:
     # -- gradient health --
 
     def _on_config(self, name: str) -> None:
+        if name == "log_every":
+            self._next_is_cadence = True  # keep the next backward's loss until the cadence is recomputed
         if name == "capture_grad" and self._active:
             if self.config.capture_grad:
                 _install_grad(self)

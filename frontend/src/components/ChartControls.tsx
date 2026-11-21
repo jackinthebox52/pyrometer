@@ -1,4 +1,5 @@
 import { MAX_ALPHA } from '../utils/chartOptions.ts'
+import { coerceAxis } from '../utils/xAxis.ts'
 import type { ChartOptions, Normalization } from '../utils/chartOptions.ts'
 
 interface Props {
@@ -8,6 +9,8 @@ interface Props {
   dropped?: number
   /** Metric names usable as x-axis. When undefined, the x-axis selector is hidden. */
   axisMetrics?: string[]
+  /** Base x-axis kinds to offer (default step, time, rel). GPU charts have no steps: ['rel', 'time']. */
+  axes?: readonly string[]
   /** True when this chart overrides the global defaults; shows a reset button. */
   overridden?: boolean
   onReset?: () => void
@@ -26,19 +29,20 @@ const pill = (active: boolean): React.CSSProperties => ({
 })
 
 /** Per-chart toggles: log y-scale, EMA smoothing slider, normalization. */
-export default function ChartControls({ opts, onChange, dropped = 0, axisMetrics, overridden = false, onReset }: Props) {
+export default function ChartControls({ opts, onChange, dropped = 0, axisMetrics, axes, overridden = false, onReset }: Props) {
+  const kinds = axes ?? ['step', 'time', 'rel']
   return (
     <div className="flex flex-wrap items-center gap-2 mb-2">
       {axisMetrics && (
         <select
-          value={opts.xAxis}
+          value={coerceAxis(opts.xAxis, axes)}
           onChange={(e) => onChange({ xAxis: e.target.value })}
           title="X-axis (log your own axis, e.g. env_steps or tokens_seen, as a metric)"
-          style={{ ...pill(opts.xAxis !== 'step'), padding: '0 2px' }}
+          style={{ ...pill(opts.xAxis !== kinds[0]), padding: '0 2px' }}
         >
-          <option value="step">x: step</option>
-          <option value="time">x: wall time</option>
-          <option value="rel">x: elapsed</option>
+          {kinds.includes('step') && <option value="step">x: step</option>}
+          {kinds.includes('time') && <option value="time">x: wall time</option>}
+          {kinds.includes('rel') && <option value="rel">x: elapsed</option>}
           {axisMetrics.map((n) => (
             <option key={n} value={`metric:${n}`}>
               x: {n}

@@ -19,14 +19,21 @@ import { RunActions, RunNotes, RunTitle } from '../components/RunOrganizer.tsx'
 import { useSession } from '../hooks/useSession.ts'
 import { duration, formatBytes, formatMicroseconds, timeAgo } from '../utils/format.ts'
 import { useWebSocket } from '../hooks/useWebSocket.ts'
-import { maxPointsForWidth, mergeBuckets, needsResample, tailStart } from '../utils/series.ts'
+import { timeWindow } from '../utils/xAxis.ts'
+import type { XSource } from '../utils/xAxis.ts'
+import { backfillTargets, budgetGrew, mergeBuckets, needsResample, tailStart } from '../utils/series.ts'
+import { chartPointsBudget, onChartWidthChange } from '../hooks/useMeasuredWidth.ts'
 import type { RangeQuery, XZoom } from '../utils/series.ts'
 import type { ExternalZoom } from '../components/MetricChart.tsx'
 
-/** Chart cards are at most ~1000px wide on this page: ask the server for about two points per pixel. */
+/** Series budget: about two points per pixel of the widest chart on screen (measured with a ResizeObserver);
+ * before any chart is mounted, an estimate from the page width. */
 function pagePoints(): number {
-  return maxPointsForWidth(Math.min(Math.max(window.innerWidth - 320, 320), 1000))
+  return chartPointsBudget(Math.min(Math.max(window.innerWidth - 320, 320), 1000))
 }
+
+/** GPU snapshots have no steps: x is elapsed time since the first snapshot, or wall-clock time. */
+const GPU_AXES = ['rel', 'time'] as const
 
 const metricKey = (m: Metric) => `${m.name}\u0000${m.step}`
 const metricOrder = (a: Metric, b: Metric) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.step - b.step)
@@ -385,6 +392,7 @@ export default function RunDetailPage() {
   const snapsRef = useRef<SystemSnapshot[]>([])
   const statsRef = useRef<ParamStat[]>([])
   const locks = useRef<Record<string, Promise<unknown>>>({})
+  const loadedPoints = useRef(0) // the max_points the held series were last loaded with
   /** Serialize refreshes of one slice so two overlapping tail fetches cannot overwrite each other's merge. */
   const serial = useCallback((key: string, fn: () => Promise<void>): Promise<void> => {
     const next = (locks.current[key] ?? Promise.resolve()).then(fn, fn)
@@ -407,7 +415,7 @@ export default function RunDetailPage() {
   }, [runId])
 
   const loadMetrics = useCallback(async () => {
-    const r = await api.getMetricsSeries(runId!, undefined, { max_points: pagePoints() })
+    const r = await api.getMetricsSeries(runId!, undefined, { max_points: (loadedPoints.current = pagePoints()) })
     if (!mountedRef.current) return
     metricsRef.current = r.data
     setMetrics(r.data)
@@ -430,7 +438,7 @@ export default function RunDetailPage() {
   }), [runId, serial, loadMetrics])
 
   const loadSystem = useCallback(async () => {
-    const r = await api.getSystemSeries(runId!, { max_points: pagePoints() })
+    const r = await api.getSystemSeries(runId!, { max_points: (loadedPoints.current = pagePoints()) })
     if (!mountedRef.current) return
     snapsRef.current = r.data
     setSnapshots(r.data)
@@ -451,7 +459,7 @@ export default function RunDetailPage() {
   }), [runId, serial, loadSystem])
 
   const loadParamStats = useCallback(async () => {
-    const r = await api.getParamStatsSeries(runId!, { max_points: pagePoints() })
+    const r = await api.getParamStatsSeries(runId!, { max_points: (loadedPoints.current = pagePoints()) })
     if (!mountedRef.current) return
     statsRef.current = r.data
     setParamStats(r.data)
@@ -505,7 +513,7 @@ export default function RunDetailPage() {
 
     async function initialLoad() {
       try {
-        const pts = pagePoints()
+        const pts = (loadedPoints.current = pagePoints())
         const [runData, metricsData, snapshotsData, paramStatsData, eventsData, logsData, artifactsData, summaryData] = await Promise.all([
           api.getRun(runId!),
           api.getMetricsSeries(runId!, undefined, { max_points: pts }),
@@ -563,6 +571,29 @@ export default function RunDetailPage() {
     }
   }, [runId, fetchRun, fetchMetrics, fetchSystem, fetchParamStats, fetchEvents, fetchLogs, fetchArtifacts])
 
+  // Late data (a replayed spool) carries timestamps older than the tail we merge live, so the tail refetch
+  // would never see it: the server says so with run_backfill and the affected series are reloaded in full.
+  const reloadBackfilled = useCallback((kind?: string) => {
+    const loaders = { metrics: loadMetrics, system: loadSystem, stats: loadParamStats }
+    const jobs = backfillTargets(kind).map((k) => serial(k, loaders[k]))
+    Promise.all(jobs).then(() => setLiveTick((n) => n + 1)).catch(() => {})
+  }, [serial, loadMetrics, loadSystem, loadParamStats])
+
+  // Charts resized (window, sidebar, layout): refetch at the new resolution once the budget clearly outgrew the load.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const off = onChartWidthChange(() => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        if (mountedRef.current && loadedPoints.current > 0 && budgetGrew(loadedPoints.current, pagePoints())) reloadBackfilled()
+      }, 400)
+    })
+    return () => {
+      off()
+      if (timer) clearTimeout(timer)
+    }
+  }, [reloadBackfilled])
+
   // React immediately to server push events — each event type only refetches its own data
   useWebSocket(
     useCallback(
@@ -581,6 +612,7 @@ export default function RunDetailPage() {
         else if (msg.type === 'metrics') fetchMetrics()
         else if (msg.type === 'system') fetchSystem()
         else if (msg.type === 'param_stats') fetchParamStats()
+        else if (msg.type === 'run_backfill') reloadBackfilled((msg as { kind?: string }).kind)
         else if (msg.type === 'logs') fetchLogs()
         else if (msg.type === 'run_updated') {
           fetchRun().then(() => {
@@ -596,7 +628,7 @@ export default function RunDetailPage() {
           }).catch(() => {})
         }
       },
-      [runId, fetchRun, fetchMetrics, fetchSystem, fetchParamStats, fetchLogs, fetchSummary],
+      [runId, fetchRun, fetchMetrics, fetchSystem, fetchParamStats, fetchLogs, fetchSummary, reloadBackfilled],
     ),
   )
 
@@ -674,7 +706,7 @@ export default function RunDetailPage() {
   const gpuExternalZoom: ExternalZoom = useMemo(
     () => ({
       active: gpuZoom != null,
-      onSelect: (z: XZoom) => setGpuZoom({ t_min: gpuT0 + z.x0, t_max: gpuT0 + z.x1 }),
+      onSelect: (z: XZoom) => setGpuZoom(timeWindow(z.axis, z.x0, z.x1, gpuT0)),
       onReset: () => {
         setGpuZoom(null)
         setGpuZoomSnaps(null)
@@ -692,6 +724,8 @@ export default function RunDetailPage() {
       live = false
     }
   }, [gpuZoom, runId, liveTick])
+
+  const gpuSource = useMemo<XSource>(() => ({ startTime: Number.isFinite(gpuT0) ? gpuT0 : 0 }), [gpuT0])
 
   if (deleted) {
     return (
@@ -951,12 +985,12 @@ export default function RunDetailPage() {
                 const tag = multi ? `GPU ${gpu}` : ''
                 if (hasProcess && preferKey) {
                   const n = multi ? `${tag} process` : 'process'
-                  series.push({ runId: `${gpu}-p`, name: n, color: base, metrics: toMetrics(gpu, preferKey, n) })
+                  series.push({ runId: `${gpu}-p`, name: n, color: base, metrics: toMetrics(gpu, preferKey, n), source: gpuSource })
                   const d = multi ? `${tag} device` : 'device'
-                  series.push({ runId: `${gpu}-d`, name: d, color: GPU_COLORS_DEVICE[i % GPU_COLORS.length], metrics: toMetrics(gpu, key, d) })
+                  series.push({ runId: `${gpu}-d`, name: d, color: GPU_COLORS_DEVICE[i % GPU_COLORS.length], metrics: toMetrics(gpu, key, d), source: gpuSource })
                 } else {
                   const n = multi ? tag : label
-                  series.push({ runId: `${gpu}-d`, name: n, color: base, metrics: toMetrics(gpu, key, n) })
+                  series.push({ runId: `${gpu}-d`, name: n, color: base, metrics: toMetrics(gpu, key, n), source: gpuSource })
                 }
               })
               const nonEmpty = series.filter((s) => s.metrics.length > 0)
@@ -964,11 +998,11 @@ export default function RunDetailPage() {
               const displayLabel = preferKey && !hasProcess ? `${label} (device)` : label
               if (nonEmpty.length === 1) {
                 return (
-                  <MetricChart key={key} name={displayLabel} data={nonEmpty[0].metrics} lineColor={color} zoom={gpuExternalZoom} />
+                  <MetricChart key={key} name={displayLabel} data={nonEmpty[0].metrics} lineColor={color} zoom={gpuExternalZoom} source={gpuSource} axes={GPU_AXES} />
                 )
               }
               return (
-                <CompareChart key={key} metricName={displayLabel} series={nonEmpty} zoom={gpuExternalZoom} />
+                <CompareChart key={key} metricName={displayLabel} series={nonEmpty} zoom={gpuExternalZoom} axes={GPU_AXES} />
               )
             })}
           </div>

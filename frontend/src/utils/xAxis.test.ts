@@ -3,6 +3,8 @@ import type { Metric } from '../api/types.ts'
 import {
   axisLabel,
   axisMetricName,
+  coerceAxis,
+  timeWindow,
   eventX,
   firstTimestamp,
   formatXLabel,
@@ -142,5 +144,18 @@ describe('resolveXs with an interpolated (downsampled) axis metric', () => {
     const r = resolveXs([m(0, 1), m(50, 2), m(100, 3), m(150, 4)], 'metric:tok', { byName: { tok: axisSeries }, interpolate: true })
     expect(r.points.map((p) => p.x)).toEqual([0, 500, 1000])
     expect(r.skipped).toBe(1)
+  })
+})
+
+describe('GPU chart axes', () => {
+  it('coerceAxis falls back to the first offered kind but leaves metric axes to the caller', () => {
+    expect(coerceAxis('step', ['rel', 'time'])).toBe('rel')
+    expect(coerceAxis('time', ['rel', 'time'])).toBe('time')
+    expect(coerceAxis('metric:tokens', ['rel', 'time'])).toBe('metric:tokens')
+    expect(coerceAxis('step')).toBe('step')
+  })
+  it('timeWindow converts elapsed or wall-clock selections to timestamps', () => {
+    expect(timeWindow('rel', 10, 20, 1000)).toEqual({ t_min: 1010, t_max: 1020 })
+    expect(timeWindow('time', 1500, 1400, 1000)).toEqual({ t_min: 1400, t_max: 1500 })
   })
 })

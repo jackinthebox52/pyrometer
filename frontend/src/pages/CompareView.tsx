@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client.ts'
 import type { Metric, ProfileEvent, Run } from '../api/types.ts'
+import type { XZoom } from '../utils/series.ts'
 import ChartDefaults from '../components/ChartDefaults.tsx'
 import CompareChart from '../components/CompareChart.tsx'
 import CompareOperatorBreakdown from '../components/CompareOperatorBreakdown.tsx'
@@ -59,6 +60,10 @@ export default function CompareView() {
   const compareStateRef = useRef(compareState)
   compareStateRef.current = compareState
   const [profilerOpen, setProfilerOpen] = useState(false)
+  // Zoom: linked (default) = dragging on one chart zooms every chart to the same x window.
+  const [linkZoom, setLinkZoom] = useState(true)
+  const [sharedZoom, setSharedZoom] = useState<XZoom | null>(null)
+  const linkedZoom = useMemo(() => (linkZoom ? { zoom: sharedZoom, set: setSharedZoom } : undefined), [linkZoom, sharedZoom])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -339,6 +344,22 @@ export default function CompareView() {
           )}
         </div>
 
+        <label
+          className="flex items-center gap-2 px-3 py-2 rounded text-xs font-mono cursor-pointer"
+          style={{ backgroundColor: '#111318', border: '1px solid #252830', color: linkZoom ? '#22c55e' : '#4a4e60' }}
+          title="When on, zooming one chart zooms every chart to the same x range"
+        >
+          <input
+            type="checkbox"
+            checked={linkZoom}
+            onChange={(e) => {
+              setLinkZoom(e.target.checked)
+              setSharedZoom(null)
+            }}
+          />
+          link zoom
+        </label>
+
         <ChartDefaults axisMetrics={allMetricNames} />
         </div>
       </div>
@@ -365,6 +386,7 @@ export default function CompareView() {
                   globalHiddenIds={globalHiddenIds}
                   band={band}
                   fetchRange={fetchRange}
+                  linkedZoom={linkedZoom}
                   groups={
                     grouped
                       ? groups.map((g, gi) => ({

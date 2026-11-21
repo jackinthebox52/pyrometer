@@ -5,6 +5,7 @@ import binascii
 import datetime
 import hashlib
 import json
+import math
 import os
 import shutil
 import threading
@@ -12,6 +13,7 @@ import time
 import uuid
 from urllib.parse import quote as _urlquote
 from collections.abc import Callable
+from typing import Any
 from pathlib import Path
 
 import duckdb
@@ -23,6 +25,14 @@ _DB_PATH = os.environ.get(
 
 _lock = threading.RLock()  # re-entrant: ingest holds it across claim-batch + insert
 _conn: duckdb.DuckDBPyConnection | None = None
+
+
+def _sig(v: Any, digits: int = 6) -> Any:
+    """Round to ``digits`` significant digits (not decimals), so tiny values such as 1e-9 survive."""
+    try:
+        return float(f"{float(v):.{digits}g}") if math.isfinite(float(v)) else v
+    except (TypeError, ValueError):
+        return v
 
 
 def get_conn() -> duckdb.DuckDBPyConnection:
@@ -1365,6 +1375,17 @@ def db_insert_metrics(run_id: str, metrics: list[dict]) -> int:
     return len(keep)
 
 
+_NEWEST_TS_TABLES = {"metrics": "metrics", "system": "system_snapshots", "param_stats": "param_stats"}
+
+
+def db_newest_timestamp(run_id: str, kind: str) -> float | None:
+    """Newest stored client timestamp of a run's ``metrics`` / ``system`` / ``param_stats`` rows."""
+    table = _NEWEST_TS_TABLES[kind]
+    with _lock:
+        row = get_conn().execute(f"SELECT MAX(timestamp) FROM {table} WHERE run_id = ?", [run_id]).fetchone()
+    return row[0] if row else None
+
+
 def db_recent_metrics(run_id: str, limit: int = 100) -> dict[str, list[float]]:
     """The newest ``limit`` values of every metric (oldest first), for seeding SDK anomaly detectors on resume."""
     with _lock:
@@ -2119,7 +2140,7 @@ def db_compute_run_summary(run_id: str) -> dict | None:
             """,
             [run_id],
         ).fetchall()
-        final_metrics: dict[str, float] = {r[0]: round(r[1], 6) for r in final_rows}
+        final_metrics: dict[str, float] = {r[0]: _sig(r[1]) for r in final_rows}
 
         # Best metric values + the step at which they occurred
         # Loss-like names → best = min; accuracy-like names → best = max.
@@ -2142,7 +2163,7 @@ def db_compute_run_summary(run_id: str) -> dict | None:
                 [run_id, name],
             ).fetchone()
             best_metrics[name] = {
-                "value": round(best_val, 6),
+                "value": _sig(best_val),
                 "step": step_for_best[0] if step_for_best else None,
                 "direction": direction,
             }

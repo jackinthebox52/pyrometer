@@ -7,6 +7,7 @@
  *   - "run_updated"  — run status/notes changed
  *   - "metrics"      — new metric batch ingested for run_id
  *   - "system"       — new system snapshot ingested for run_id
+ *   - "run_backfill" — late data older than the run's newest was ingested (`kind`): reload that series in full
  *   - "run_activity" — a run ingested data (throttled to ~2s per run); run lists refresh updated_at
  *   - "run_deleted" / "run_moved" — run removed / moved to `project`
  *   - "project_updated" / "project_deleted" — project archived/unarchived / deleted (`project`, no run_id)

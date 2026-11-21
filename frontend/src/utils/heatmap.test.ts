@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ParamStat } from '../api/types.ts'
-import { binHeatmap } from './heatmap.ts'
+import { binHeatmap, columnAt, columnsToStepRange } from './heatmap.ts'
 
 const st = (param_name: string, step: number, grad_norm: number): ParamStat =>
   ({ step, timestamp: step, param_name, grad_norm, grad_min: 0, grad_max: 0, grad_mean: 0, weight_norm: 0, weight_min: 0, weight_max: 0, weight_mean: 0, grad_histogram: [], weight_histogram: [] })
@@ -26,5 +26,21 @@ describe('binHeatmap', () => {
   })
   it('empty input', () => {
     expect(binHeatmap([], 5).steps).toEqual([])
+  })
+})
+
+describe('drag selection helpers', () => {
+  it('maps pixels to clamped columns', () => {
+    expect(columnAt(0, 10, 4)).toBe(0)
+    expect(columnAt(9, 10, 4)).toBe(2)
+    expect(columnAt(-5, 10, 4)).toBe(0)
+    expect(columnAt(500, 10, 4)).toBe(9)
+    expect(columnAt(5, 0, 4)).toBeNull()
+  })
+  it('turns dragged columns (either direction) into a step window covering whole columns', () => {
+    const bins = { steps: [0, 10, 20, 30], ends: [9, 19, 29, 39] }
+    expect(columnsToStepRange(bins, 1, 2)).toEqual({ step_min: 10, step_max: 29 })
+    expect(columnsToStepRange(bins, 3, 1)).toEqual({ step_min: 10, step_max: 39 })
+    expect(columnsToStepRange(bins, 0, 9)).toBeNull()
   })
 })

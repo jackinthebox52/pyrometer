@@ -79,3 +79,21 @@ export function tailStart(rows: { timestamp: number }[], marginSeconds = 5): num
   for (const r of rows) if (r.timestamp > newest) newest = r.timestamp
   return newest - marginSeconds
 }
+
+/** A resize made the charts wide enough that the loaded (coarser) series no longer has enough points. */
+export function budgetGrew(loaded: number, wanted: number, factor = 1.5): boolean {
+  return wanted > loaded * factor
+}
+
+/** Which metrics-ish slices a `run_backfill` event invalidates (no kind = everything). */
+export function backfillTargets(kind?: string): ('metrics' | 'system' | 'stats')[] {
+  if (kind === 'metrics') return ['metrics']
+  if (kind === 'system') return ['system']
+  if (kind === 'param_stats') return ['stats']
+  return ['metrics', 'system', 'stats']
+}
+
+/** The shared zoom as one chart sees it: charts on a different x axis ignore it (they never reset it). */
+export function sharedZoomFor(shared: XZoom | null, axis?: string): XZoom | null {
+  return shared && (axis === undefined || shared.axis === axis) ? shared : null
+}

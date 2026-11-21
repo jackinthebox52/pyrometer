@@ -660,3 +660,65 @@ def test_stage_falls_back_to_the_tensor_without_cuda():
 
     staged, events = _AutologEngine._stage({"x": torch.tensor(3.0)})
     assert float(staged["x"]) == 3.0 and events == []
+
+
+def test_cuda_rates_come_from_completed_work_events(calls, monkeypatch):
+    """With CUDA the CPU runs ahead, so steps/sec is measured between completion events (deferred until both
+    have completed) rather than CPU wall time; the first cadence is only the baseline."""
+    state = {"done": False, "t": 0.0}
+
+    class FakeEvent:
+        def __init__(self) -> None:
+            self.t = state["t"]
+            state["t"] += 1000.0  # each cadence window = 1000 ms of GPU time
+
+        def query(self) -> bool:
+            return state["done"]
+
+        def synchronize(self) -> None:
+            pass
+
+        def elapsed_time(self, other) -> float:
+            return other.t - self.t
+
+    monkeypatch.setattr(_autolog._AutologEngine, "_make_event", staticmethod(lambda opt: FakeEvent()))
+    run = start(name="gpu-rates", autolog={"log_every": 5})
+    model = torch.nn.Linear(2, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(10):
+        opt.zero_grad()
+        model(torch.randn(3, 2)).sum().backward()
+        opt.step()
+    rate_logs = [m for _, m in calls if "auto/steps_per_sec" in m]
+    assert rate_logs == []  # nothing completed yet, wall-clock rate not used
+    state["done"] = True
+    for _ in range(5):
+        opt.zero_grad()
+        model(torch.randn(3, 2)).sum().backward()
+        opt.step()
+    rates = [(k, m["auto/steps_per_sec"]) for k, m in calls if "auto/steps_per_sec" in m]
+    # k=1 was the baseline, so the first window is 4 steps; then 5 steps per 1000 ms of GPU time
+    assert rates[0] == (5, pytest.approx(4.0)) and all(v == pytest.approx(5.0) for _, v in rates[1:])
+    assert len(rates) == 3
+    run.finish()
+
+
+def test_off_cadence_backwards_are_counted_but_not_retained(calls):
+    """Hot-path trim: a backward that cannot reach a cadence step only bumps the micro-batch count; the loss of
+    the backward right before a cadence step is kept and logged as usual."""
+    run = start(name="hot-path", autolog={"log_every": 4})
+    model = torch.nn.Linear(2, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    eng = run._autolog
+    kept = []
+    for _ in range(7):
+        model(torch.randn(3, 2)).sum().backward()
+        s = next(iter(eng._streams.values()))
+        kept.append(len(s.pending))
+        opt.step()
+        opt.zero_grad()
+    # step 1 is a cadence step; steps 2-3 are not (their backwards keep nothing), step 4 is the next cadence
+    assert kept[0] == 1 and kept[1] == 0 and kept[2] == 0 and kept[3] == 1
+    run.finish()
+    steps = sorted(k for k, m in calls if "auto/loss" in m)
+    assert steps[:2] == [1, 4]

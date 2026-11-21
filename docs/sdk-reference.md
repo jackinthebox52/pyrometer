@@ -535,7 +535,7 @@ Everything autolog logs lives under the `auto/` prefix (except the two axis metr
 | `auto/lr/opt<j>/<i>` | Same for the j-th other optimizer (in order of first step). |
 | `auto/loss` | Loss of the (single) loss stream, see below. |
 | `auto/loss/<0..n>` | One metric per loss stream when there are several; `auto/loss/<name>` for streams named with `run.name_loss`. |
-| `auto/steps_per_sec` | Optimizer steps per wall-clock second since the previous logged step (so evaluation and checkpointing time between steps counts; not logged at step 1). |
+| `auto/steps_per_sec` | Optimizer steps per second since the previous logged step (so evaluation and checkpointing time between steps counts; not logged at step 1). On CUDA it is measured between CUDA events recorded at each cadence, i.e. against work the GPU has actually completed (the CPU runs ahead of the GPU queue, so wall time over-reports early on); that value is written a cadence later, like the lazily read loss. On CPU it is wall-clock. The token / sample / data-wait rates use the same window. |
 | `auto/grad_norm` | Global gradient L2 norm (`grad_norm` option). |
 | `auto/tokens_per_sec`, `auto/samples_per_sec` | Rates from the `run.track` hints. |
 | `auto/data_wait_ms` | Mean time per step the loop waited on the wrapped dataloader. |
@@ -611,6 +611,10 @@ learning rates, stacking loss references, `.item()`) happens once per `log_every
 exception: it computes per-parameter statistics on the CPU every `grad_log_freq` backward passes and should be used
 deliberately.
 
+On a launch-bound loop (a 3-layer MLP at about 730 us per step, `log_every=10`, median of seven 3000-step runs) the hooks cost **+31 us per
+step, 4.3%** (7.4% before the hot path was trimmed: no loss detach/append on steps that cannot reach a cadence, one lock hold per
+step, one metric write per cadence, a cheaper loss mean on CPU, a class-default thread-local flag in the `backward` wrapper).
+
 ---
 
 ## Presets
@@ -659,7 +663,9 @@ Runs an unmodified script with a run already open and autolog hooks live: no cod
 launcher; everything after the script (or `-m module`) is the script's. Default run name: the script's file name without
 `.py` (or the module name).
 
-**Hyperparams from argv.** The script's arguments are parsed best effort into the run's hyperparams: `--key value`,
+**Hyperparams from argparse.** While the script runs, the launcher hooks `argparse.ArgumentParser.parse_args` / `parse_known_args`. When the script parses its arguments, the run's hyperparams become exactly the parsed `Namespace` (`vars(args)`, defaults included, made JSON-safe: `Path`s and other objects as strings, non-finite floats as strings, functions by name), plus `script` and the raw `argv`, and the run is PATCHed once. Only the outermost parse counts (sub-parsers); several parses in one script are merged, later values winning; the hook never changes what the script receives. Hyperparams passed to the script's own `init()` still win.
+
+**Hyperparams from argv (fallback).** A script that never uses argparse gets its arguments parsed best effort into the run's hyperparams: `--key value`,
 `--key=value`, `-k value`, bare `--flag` (`True`), repeated keys (a list), dashes in keys become underscores; values that
 look like ints, floats, `true`/`false` or `none`/`null` are converted, the rest stay strings; arguments that belong to no
 option go under `positional`. Two extra keys are always stored: `argv` (the raw argument list) and `script` (the target).
@@ -677,13 +683,13 @@ the source of truth.
 | `init()` argument | Effect on the launcher's run |
 |---|---|
 | `name` | Renames the run, unless `--name` was given (the command line wins). |
-| `hyperparams` | Merged over the ones parsed from argv (the script's values win on a clash; `argv`/`script` stay). |
+| `hyperparams` | Merged over the argparse Namespace (or the argv guess); the script's values win on a clash, `argv`/`script` stay. |
 | `tags` | Union with `--tag`s. |
 | `notes` | Set. |
 | `group` | Set, unless `--group` was given. |
 | `autolog={...}` | Options applied to `run.config`. `autolog=False` stops autolog for the run (`--no-autolog` itself cannot be overridden by `autolog=True`). |
 | `preset` | Applied (options, GPU sampling interval, reminders), unless `--preset` was given. |
-| `project`, `server`, `offline`, `resume`, `anomaly_detection`, `rank_zero_only`, `api_key` | **Ignored**; a differing `project`/`server`, or any `resume`/`offline`, prints one warning. They decide where and how the run exists, which the launcher already did: set them on the launcher command line or in the environment (`PYROMETER_SERVER`, `PYROMETER_API_KEY`, `PYROMETER_RUN_ID`, `PYROMETER_MODE`, `PYROMETER_GROUP`, `PYROMETER_PRESET`). |
+| `project`, `server`, `offline`, `resume`, `anomaly_detection`, `rank_zero_only`, `api_key` | **Ignored**; a differing `project`/`server`, or any `resume`/`offline`/`api_key`, a non-default `anomaly_detection` or `rank_zero_only`, prints one warning naming them. They decide where and how the run exists, which the launcher already did: set them on the launcher command line or in the environment (`PYROMETER_SERVER`, `PYROMETER_API_KEY`, `PYROMETER_RUN_ID`, `PYROMETER_MODE`, `PYROMETER_GROUP`, `PYROMETER_PRESET`). |
 
 Every later `init()` creates an independent run as usual (a sweep inside one script gets one attached run plus the others).
 The script finishing the run (`with` block or `run.finish()`) ends the launcher's run; the launcher then has nothing left to do.

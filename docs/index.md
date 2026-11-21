@@ -104,7 +104,7 @@ Navigate to **http://localhost:8321** to see your runs, metrics, and GPU profili
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.11+
 - (Optional) NVIDIA GPU with CUDA for GPU profiling
 - (Optional) PyTorch for deep learning integration
 

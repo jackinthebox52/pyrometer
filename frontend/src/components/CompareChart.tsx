@@ -15,11 +15,13 @@ import type { Metric } from '../api/types.ts'
 import { formatMetricValue } from '../utils/format.ts'
 import { MAX_ALPHA, formatLogTick, logTicks, positiveRange, processSeries, useChartOptions } from '../utils/chartOptions.ts'
 import type { ChartOptions } from '../utils/chartOptions.ts'
-import { axisLabel, axisMetricName, firstTimestamp, formatXLabel, formatXTick, resolveXs, runHasAxis } from '../utils/xAxis.ts'
+import { coerceAxis, axisLabel, axisMetricName, firstTimestamp, formatXLabel, formatXTick, resolveXs, runHasAxis } from '../utils/xAxis.ts'
 import { maxPointsForWidth, zoomQuery } from '../utils/series.ts'
 import type { RangeQuery } from '../utils/series.ts'
 import { useDragZoom } from '../hooks/useDragZoom.ts'
 import { useZoomFetch } from '../hooks/useZoomFetch.ts'
+import type { LinkedZoom } from '../hooks/useZoomFetch.ts'
+import { useMeasuredWidth } from '../hooks/useMeasuredWidth.ts'
 import type { ExternalZoom } from './MetricChart.tsx'
 import type { XSource } from '../utils/xAxis.ts'
 import { aggregate } from '../utils/grouping.ts'
@@ -59,6 +61,10 @@ interface Props {
   fetchRange?: (runId: string, name: string, query: RangeQuery, maxPoints: number) => Promise<Metric[]>
   /** Zoom owned by the parent (series are already windowed). */
   zoom?: ExternalZoom
+  /** Zoom shared with sibling charts (each fetches its own window); `undefined` = this chart zooms alone. */
+  linkedZoom?: LinkedZoom
+  /** Base x-axis kinds offered by the selector (default step, time, rel); GPU charts: ['rel', 'time']. */
+  axes?: readonly string[]
   /** Bump to re-fetch the zoomed window of live runs. */
   refreshKey?: number
 }
@@ -162,10 +168,13 @@ export default function CompareChart({
   band = 'std',
   fetchRange,
   zoom: externalZoom,
+  linkedZoom,
+  axes,
   refreshKey,
 }: Props) {
   const [opts, setOpts, resetOpts, overridden] = useChartOptions(`compare:${metricName}`)
   const wrapRef = useRef<HTMLDivElement>(null)
+  const widthRef = useMeasuredWidth(wrapRef)
   const shownRef = useRef<RunSeries[]>([])
   const { alpha } = opts
 
@@ -196,13 +205,13 @@ export default function CompareChart({
     for (const s of baseSeries) for (const n of Object.keys(s.source?.byName ?? {})) names.add(n)
     return [...names].sort()
   }, [baseSeries])
-  const axis = hasAxisSelector ? opts.xAxis : 'step'
+  const axis = hasAxisSelector ? coerceAxis(opts.xAxis, axes) : 'step'
 
   // Zoom: per run, fetch the window (metric + axis metric) at full resolution and show that instead.
   const self = useZoomFetch<Record<string, { metrics: Metric[]; axisData: Metric[] | null }>>(
     fetchRange && !externalZoom
       ? async (z) => {
-          const mp = maxPointsForWidth(wrapRef.current?.clientWidth ?? 600)
+          const mp = maxPointsForWidth(widthRef.current)
           const axisName = axisMetricName(z.axis)
           let any = false
           const entries = await Promise.all(
@@ -223,10 +232,12 @@ export default function CompareChart({
         }
       : undefined,
     refreshKey,
+    linkedZoom,
+    axis,
   )
   useEffect(() => {
-    if (self.zoom && self.zoom.axis !== axis) self.reset()
-  }, [axis, self])
+    if (!linkedZoom && self.zoom && self.zoom.axis !== axis) self.reset()
+  }, [axis, self, linkedZoom])
   const zoomed = externalZoom ? externalZoom.active : !!(self.zoom && self.data)
   const zoomable = !!(externalZoom || fetchRange)
   const zoomWin = !externalZoom && self.zoom && self.data ? self.data : null
@@ -338,6 +349,7 @@ export default function CompareChart({
           onChange={setOpts}
           dropped={dropped}
           axisMetrics={hasAxisSelector ? axisNames : undefined}
+          axes={axes}
           overridden={overridden}
           onReset={resetOpts}
         />
@@ -510,6 +522,8 @@ export default function CompareChart({
             band={band}
             fetchRange={fetchRange}
             zoom={externalZoom}
+            linkedZoom={linkedZoom}
+            axes={axes}
             refreshKey={refreshKey}
             expanded
           />

@@ -301,6 +301,6 @@ Training Script
 
 ## Tech stack
 
-- **SDK**: Python 3.12, httpx, nvidia-ml-py
+- **SDK**: Python 3.11+, httpx, nvidia-ml-py
 - **Server**: FastAPI, uvicorn, DuckDB
 - **Frontend**: React 18 + TypeScript + Vite + Recharts + d3 *(Phase 2+)*

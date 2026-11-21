@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { maxPointsForWidth, mergeBuckets, needsResample, tailStart, zoomQuery } from './series.ts'
+import { backfillTargets, budgetGrew, maxPointsForWidth, mergeBuckets, needsResample, sharedZoomFor, tailStart, zoomQuery } from './series.ts'
 import type { XPoint } from './xAxis.ts'
 
 const pts = (xs: number[], steps = xs.map((_, i) => i * 10)): XPoint[] => xs.map((x, i) => ({ x, value: 0, step: steps[i] }))
@@ -62,5 +62,26 @@ describe('live helpers', () => {
   it('tailStart backs off from the newest timestamp', () => {
     expect(tailStart([])).toBeUndefined()
     expect(tailStart([{ timestamp: 10 }, { timestamp: 100 }, { timestamp: 50 }])).toBe(95)
+  })
+})
+
+describe('W9a helpers', () => {
+  it('budgetGrew only fires on a clear increase', () => {
+    expect(budgetGrew(2000, 2500)).toBe(false)
+    expect(budgetGrew(2000, 3200)).toBe(true)
+    expect(budgetGrew(2000, 800)).toBe(false)
+  })
+  it('backfillTargets maps the event kind to the slices to reload', () => {
+    expect(backfillTargets('metrics')).toEqual(['metrics'])
+    expect(backfillTargets('param_stats')).toEqual(['stats'])
+    expect(backfillTargets('system')).toEqual(['system'])
+    expect(backfillTargets()).toEqual(['metrics', 'system', 'stats'])
+  })
+  it('sharedZoomFor hands a shared window only to charts on the same x axis', () => {
+    const z = { axis: 'step', x0: 1, x1: 5 }
+    expect(sharedZoomFor(z, 'step')).toBe(z)
+    expect(sharedZoomFor(z, 'time')).toBeNull()
+    expect(sharedZoomFor(z)).toBe(z)
+    expect(sharedZoomFor(null, 'step')).toBeNull()
   })
 })

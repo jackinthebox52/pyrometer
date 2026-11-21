@@ -540,3 +540,116 @@ def test_patch_run_hyperparams(tmp_path, monkeypatch):
     assert client.patch(f"/runs/{rid}", json={"hyperparams": {"a": 2, "argv": ["--a", "2"]}, "tags": ["x", "y"]}).status_code == 200
     run = client.get(f"/runs/{rid}").json()["data"]
     assert run["hyperparams"] == {"a": 2, "argv": ["--a", "2"]} and run["tags"] == ["x", "y"]
+
+
+# --- W9a: argparse capture, attached-init warnings ------------------------------------------------
+
+
+class _FakeRun:
+    run_id = "r1"
+
+    def __init__(self, guess=None):
+        self.patches = []
+        self._transport = type("T", (), {"submit": lambda s, m, p, b, **kw: self.patches.append((m, p, b))})()
+        self._launcher_guess = guess or {"argv": ["--lr", "1"], "lr": 1, "script": "t.py"}
+        self._launcher_target = "t.py"
+        self._launcher_parsed = None
+        self._launcher_script_hp = {}
+
+
+def test_argparse_capture_records_the_namespace_exactly():
+    import argparse
+    import pathlib
+
+    run = _FakeRun()
+    p = argparse.ArgumentParser()
+    p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--ckpt", type=pathlib.Path, default=pathlib.Path("/tmp/x"))
+    p.add_argument("--layers", type=int, nargs="+", default=[1, 2])
+    p.add_argument("--eps", type=float, default=float("inf"))
+    p.add_argument("--debug", action="store_true")
+    orig_parse_args, orig_known = argparse.ArgumentParser.parse_args, argparse.ArgumentParser.parse_known_args
+    with _launcher._ArgparseCapture(run):
+        ns = p.parse_args(["--lr", "3e-4", "--debug"])
+    assert argparse.ArgumentParser.parse_args is orig_parse_args and argparse.ArgumentParser.parse_known_args is orig_known
+    assert ns.lr == 3e-4  # the script still gets its normal Namespace
+    (method, path, body) = run.patches[-1]
+    hp = body["hyperparams"]
+    assert (method, path) == ("PATCH", "/runs/r1")
+    assert hp["lr"] == 3e-4 and hp["debug"] is True and hp["layers"] == [1, 2]  # defaults captured too
+    assert hp["ckpt"] == "/tmp/x" and hp["eps"] == "inf"  # JSON-safe
+    assert hp["argv"] == ["--lr", "1"] and hp["script"] == "t.py"  # raw argv and script kept
+    assert "positional" not in hp  # the argv guess is replaced, not mixed in
+    json.dumps(hp)
+
+
+def test_argparse_capture_counts_only_the_outermost_parse_and_merges_calls():
+    import argparse
+
+    run = _FakeRun()
+    top = argparse.ArgumentParser()
+    top.add_argument("--seed", type=int, default=0)
+    sub = top.add_subparsers(dest="cmd")
+    tr = sub.add_parser("train")
+    tr.add_argument("--epochs", type=int, default=1)
+    with _launcher._ArgparseCapture(run):
+        top.parse_args(["--seed", "7", "train", "--epochs", "3"])
+        extra = argparse.ArgumentParser()
+        extra.add_argument("--more", default="m")
+        extra.parse_known_args(["--unknown"])
+    assert len(run.patches) == 2  # one PATCH per outermost parse (the sub-parser's inner parse is not one)
+    first = run.patches[0][2]["hyperparams"]
+    assert first["seed"] == 7 and first["epochs"] == 3 and first["cmd"] == "train"
+    last = run.patches[-1][2]["hyperparams"]
+    assert last["seed"] == 7 and last["more"] == "m"
+
+
+def test_argparse_capture_leaves_errors_alone_and_script_init_hp_wins():
+    import argparse
+
+    run = _FakeRun()
+    p = argparse.ArgumentParser()
+    p.add_argument("--n", type=int)
+    with _launcher._ArgparseCapture(run):
+        with pytest.raises(SystemExit):
+            p.parse_args(["--n", "x"])
+    assert run.patches == []
+    run._launcher_parsed = {"n": 3, "lr": 0.1}
+    run._launcher_script_hp = {"lr": 0.5}
+    assert _launcher.compose_hyperparams(run) == {"script": "t.py", "argv": ["--lr", "1"], "n": 3, "lr": 0.5}
+
+
+@pytest.mark.slow
+def test_launcher_captures_argparse_namespace_and_falls_back_without_argparse(tmp_path):
+    body = """
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--lr", type=float, default=0.1)
+        ap.add_argument("--width", type=int, default=64)
+        args = ap.parse_args()
+        print("LR", args.lr)
+    """
+    proc, spool = launch(tmp_path, body, "--lr", "0.5", opts=["--no-autolog"])
+    assert proc.returncode == 0, proc.stderr
+    (d,) = run_dirs(spool)
+    patches = [it["json"] for it in queue_items(d) if it["method"] == "PATCH" and "hyperparams" in (it["json"] or {})]
+    hp = patches[-1]["hyperparams"]
+    assert hp["lr"] == 0.5 and hp["width"] == 64 and hp["argv"] == ["--lr", "0.5"]  # defaults included, exact values
+    other = tmp_path / "second"
+    other.mkdir()
+    proc, spool = launch(other, "print('no argparse')", "--lr", "0.5", opts=["--no-autolog"])
+    (d,) = run_dirs(spool)
+    assert create_payload(d)["hyperparams"]["lr"] == 0.5  # best-effort argv parsing stays the fallback
+    assert not [it for it in queue_items(d) if it["method"] == "PATCH" and "hyperparams" in (it["json"] or {})]
+
+
+@pytest.mark.slow
+def test_attached_init_warns_about_ignored_api_key_anomaly_rank(tmp_path):
+    body = """
+        import pyrometer
+        run = pyrometer.init(name="x", api_key="k", anomaly_detection=False, rank_zero_only=False)
+        run.finish()
+    """
+    proc, _spool = launch(tmp_path, body, opts=["--no-autolog"])
+    assert proc.returncode == 0, proc.stderr
+    assert "ignoring api_key, anomaly_detection, rank_zero_only" in proc.stderr

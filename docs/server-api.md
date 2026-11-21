@@ -1366,6 +1366,8 @@ Get derived statistics for a run.
 }
 ```
 
+`final_metrics` and `best_metrics[*].value` are rounded to 6 **significant digits** (not decimals), so a loss of `3.1234567e-9` is kept as `3.12346e-9` rather than `0`.
+
 `per_gpu` has one entry per GPU that reported snapshots (`gpu_index` is the CUDA ordinal; old rows count as GPU 0).
 `avg_gpu_utilization` is this process's own utilization where known (else the device's), `avg_device_utilization`
 the whole device's, `peak_process_memory_bytes` / `peak_memory_bytes` this process's / the device's peak VRAM.
@@ -1452,6 +1454,7 @@ The server broadcasts JSON events to all connected clients:
 | `system` | `POST /runs/{id}/system` | New system snapshot |
 | `param_stats` | `POST /runs/{id}/param-stats` | New gradient stats |
 | `logs` | `POST /runs/{id}/logs` | New console logs |
+| `run_backfill` | metrics / system / param-stats batch with timestamps older than the newest already stored for the run (more than 5 s older: a late `pyrometer sync` replay) | `{"type", "run_id", "kind": "metrics"\|"system"\|"param_stats"}`. Tells dashboards their live tail merge cannot contain the new rows, so they reload that series. Throttled to one per run and kind per 1.5 s with a trailing event after a burst. The first batch of a run, in-order batches and duplicate retries never trigger it |
 | `run_activity` | any successful ingest for a run (metrics, system, param stats, events, logs, artifacts, media, samples, profile) | `{"type", "run_id"}`. Throttled to one per run per 2 s (separate from the 500 ms per-type throttle) and delivered only to users who can read the run. Lets run lists refresh `updated_at`/order without polling |
 | `run_updated` (also) | archive / unarchive / bulk tag | Run organisation changed (refetch the run) |
 | `run_deleted` | `DELETE /runs/{id}`, bulk delete, or a move away from a project you can read | `{"type", "run_id", "project"?, "reason"?: "moved"}`: drop the run from lists |

@@ -11,6 +11,7 @@ import inspect
 
 import httpx
 
+from pyrometer import _launcher
 from pyrometer._autolog import AutologConfig, NullRun, name_loss, rank_info
 from pyrometer._hardware import fingerprint_fast
 from pyrometer._presets import PRESETS, Preset, get_preset
@@ -153,6 +154,7 @@ def init(
         return _attach_launcher_run(
             claimed, name=name, hyperparams=hyperparams, tags=tags, notes=notes, server=server, project=project,
             group=group, autolog=autolog, resume=resume, offline=offline, preset=preset,
+            api_key=api_key, anomaly_detection=anomaly_detection, rank_zero_only=rank_zero_only,
         )
     preset_obj = get_preset(preset or os.environ.get("PYROMETER_PRESET"))
     if monitor_interval is not None and not (isinstance(monitor_interval, (int, float)) and monitor_interval >= 0.1):
@@ -293,7 +295,8 @@ def _set_launcher_run(run: "Run | None") -> None:
 
 
 def _attach_launcher_run(
-    run: Run, *, name, hyperparams, tags, notes, server, project, group, autolog, resume, offline, preset
+    run: Run, *, name, hyperparams, tags, notes, server, project, group, autolog, resume, offline, preset,
+    api_key=None, anomaly_detection=True, rank_zero_only=True,
 ) -> Run:
     """The script's first ``init()`` under ``pyrometer run``: adopt the launcher's run instead of creating a second.
 
@@ -310,9 +313,8 @@ def _attach_launcher_run(
     if name and "name" not in explicit:
         body["name"] = name
     if hyperparams:
-        merged = {**run._launcher_hp, **hyperparams}  # type: ignore[attr-defined]
-        run._launcher_hp = merged  # type: ignore[attr-defined]
-        body["hyperparams"] = merged
+        run._launcher_script_hp = dict(hyperparams)  # type: ignore[attr-defined]
+        body["hyperparams"] = run._launcher_hp = _launcher.compose_hyperparams(run)  # type: ignore[attr-defined]
     if tags:
         union = list(dict.fromkeys([*run._launcher_tags, *tags]))  # type: ignore[attr-defined]
         run._launcher_tags = union  # type: ignore[attr-defined]
@@ -332,6 +334,12 @@ def _attach_launcher_run(
         ignored.append("offline")
     if server and server.rstrip("/") != run.server:
         ignored.append("server")
+    if api_key is not None:
+        ignored.append("api_key")
+    if anomaly_detection is not True:
+        ignored.append("anomaly_detection")
+    if rank_zero_only is not True:
+        ignored.append("rank_zero_only")
     if ignored:
         print(
             f"pyrometer: init() attached to the run started by `pyrometer run`; ignoring {', '.join(ignored)} "

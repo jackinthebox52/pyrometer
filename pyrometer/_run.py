@@ -257,6 +257,10 @@ class Run:
         self._launcher_claimed = False  # set when ``pyrometer run`` handed this run to the script's init()
         self._launcher_explicit: set[str] = set()  # launcher options given on the command line (win over init())
         self._launcher_hp: dict = {}
+        self._launcher_guess: dict = {}  # argv-parsed hyperparams (fallback when the script has no argparse)
+        self._launcher_parsed: dict | None = None  # the script's parsed argparse Namespace, when it used argparse
+        self._launcher_script_hp: dict = {}  # hyperparams the script passed to its own init()
+        self._launcher_target: str | None = None
         self._launcher_tags: list[str] = []
         self._launcher_project: str | None = None
         _active_runs.add(self)

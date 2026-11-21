@@ -93,6 +93,7 @@ from pyrometer.server.db import (
     db_update_run,
     RUN_INFO_FIELDS,
     db_recent_grad_norms,
+    db_newest_timestamp,
     db_recent_metrics,
     db_heartbeat,
     db_get_run_status,
@@ -228,10 +229,16 @@ def _ws_recheck_s() -> float:
         return 30.0
 
 
+BACKFILL_MARGIN_S = 5.0  # the dashboards' live tail refetch starts this far before its newest point
+BACKFILL_THROTTLE_MS = 1500
+
+
 class _WsManager:
     def __init__(self) -> None:
         self._connections: list[WebSocket] = []
         self._last_broadcast: dict[tuple[str, str], float] = {}
+        self._newest: dict[tuple[str, str], float] = {}  # (run, table) -> newest ingested timestamp
+        self._backfill_pending: set[tuple[str, str]] = set()
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -245,6 +252,53 @@ class _WsManager:
         """Drop throttle state of a deleted run."""
         for key in [k for k in self._last_broadcast if k[0] == run_id]:
             del self._last_broadcast[key]
+        for key in [k for k in self._newest if k[0] == run_id]:
+            del self._newest[key]
+
+    def newest(self, run_id: str, kind: str) -> float | None:
+        """Newest stored timestamp of ``kind`` ('metrics' / 'system' / 'param_stats') for a run (cached)."""
+        key = (run_id, kind)
+        if key not in self._newest:
+            found = db_newest_timestamp(run_id, kind)
+            if found is None:
+                return None
+            if len(self._newest) >= _THROTTLE_MAX_ENTRIES:
+                self._newest.clear()
+            self._newest[key] = found
+        return self._newest[key]
+
+    async def note_ingest(self, run_id: str, kind: str, timestamps: list[float], prior: float | None) -> None:
+        """Record an ingested batch; when it holds timestamps older than what the run already had (a late
+        replay), tell dashboards with ``run_backfill`` so they reload instead of merging only the live tail.
+
+        The signal is throttled with a trailing edge: a burst of replayed batches still ends with one event
+        sent after the last of them, so a reload never races ahead of the data.
+        """
+        if not timestamps:
+            return
+        key = (run_id, kind)
+        newest = max(timestamps)
+        self._newest[key] = max(newest, prior) if prior is not None else newest
+        if prior is None or min(timestamps) >= prior - BACKFILL_MARGIN_S:
+            return
+        payload = {"type": "run_backfill", "run_id": run_id, "kind": kind}
+        if not self._throttled((run_id, f"backfill:{kind}"), BACKFILL_THROTTLE_MS):
+            await self.broadcast(payload)
+            return
+        if key in self._backfill_pending:
+            return
+        self._backfill_pending.add(key)
+
+        async def trailing() -> None:
+            try:
+                await asyncio.sleep(BACKFILL_THROTTLE_MS / 1000)
+                await self.broadcast(payload)
+            except Exception:
+                pass
+            finally:
+                self._backfill_pending.discard(key)
+
+        asyncio.get_running_loop().create_task(trailing())
 
     def _throttled(self, key: tuple[str, str], throttle_ms: int) -> bool:
         now = time.monotonic()
@@ -1466,9 +1520,11 @@ async def heartbeat(run_id: str):
 @app.post("/runs/{run_id}/metrics", status_code=201)
 async def ingest_metrics(run_id: str, metrics: list[MetricEntry], request: Request):
     points = [m.model_dump() for m in metrics]
+    prior = _ws.newest(run_id, "metrics")
     inserted = _ingest_once(run_id, request, lambda: db_insert_metrics(run_id, points))
     if inserted is None:
         return _dup()
+    await _ws.note_ingest(run_id, "metrics", [p["timestamp"] for p in points], prior)
     alerts.check_metrics(run_id, points)
     await _ws.broadcast({"type": "metrics", "run_id": run_id}, throttle_key=(run_id, "metrics"))
     return ok({"inserted": inserted})
@@ -1538,8 +1594,10 @@ def get_profile_steps(run_id: str):
 
 @app.post("/runs/{run_id}/system", status_code=201)
 async def ingest_system_snapshot(run_id: str, snapshot: SystemSnapshot, request: Request):
+    prior = _ws.newest(run_id, "system")
     if _ingest_once(run_id, request, lambda: db_insert_system_snapshot(run_id, snapshot.model_dump()) or True) is None:
         return _dup()
+    await _ws.note_ingest(run_id, "system", [snapshot.timestamp], prior)
     await _ws.broadcast({"type": "system", "run_id": run_id}, throttle_key=(run_id, "system"))
     return ok({"inserted": True})
 
@@ -1562,9 +1620,11 @@ def get_system_snapshots(
 
 @app.post("/runs/{run_id}/param-stats", status_code=201)
 async def ingest_param_stats(run_id: str, stats: list[ParamStatEntry], request: Request):
+    prior = _ws.newest(run_id, "param_stats")
     inserted = _ingest_once(run_id, request, lambda: db_insert_param_stats(run_id, [s.model_dump() for s in stats]))
     if inserted is None:
         return _dup()
+    await _ws.note_ingest(run_id, "param_stats", [s.timestamp for s in stats], prior)
     await _ws.broadcast({"type": "param_stats", "run_id": run_id}, throttle_key=(run_id, "param_stats"))
     return ok({"inserted": inserted})
 
