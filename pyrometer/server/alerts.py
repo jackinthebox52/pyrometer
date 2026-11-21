@@ -205,7 +205,7 @@ def _check_thresholds(run: dict, rules: list[dict], points: list[dict]) -> None:
 def _fire(rule: dict, run: dict, title: str, body: str, severity: str, dedupe: tuple) -> None:
     """Apply dedupe and rate limit (persisted), then send."""
     dkey = hashlib.sha1(repr(dedupe).encode()).hexdigest()
-    verdict = db.db_alert_acquire(rule["id"], dkey, DEDUPE_WINDOW_S, rate_limit_per_min())
+    verdict = db.db_alert_acquire(rule["id"], dkey, DEDUPE_WINDOW_S, rate_limit_per_min(), run_id=run["run_id"])
     if verdict == "rate":
         _log.warning("alert rate limit reached for rule %s; dropping alert", rule["id"])
     if verdict != "ok":

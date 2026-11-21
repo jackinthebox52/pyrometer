@@ -221,6 +221,7 @@ def main() -> None:
                 "lr_schedule": "cosine",
             },
             tags=config["tags"],
+            group="lr-sweep",  # one group per sweep: filter by it in the dashboard
             notes=f"LR sweep arm: lr={lr}, seed={seed}. Same AdamW+cosine setup, same train/val split.",
         )
         print(f"[{run_name}] run_id={run.run_id}")

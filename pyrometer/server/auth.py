@@ -221,10 +221,10 @@ def _check_password(password: str) -> None:
 
 def list_users() -> list[dict]:
     """User metadata (never password hashes)."""
-    return [
-        {"username": u["username"], "role": u["role"], "created_at": u["created_at"]}
-        for u in _read()["users"]
-    ]
+    return sorted(
+        ({"username": u["username"], "role": u["role"], "created_at": u["created_at"]} for u in _read()["users"]),
+        key=lambda u: u["username"],
+    )
 
 
 def get_user(username: str) -> dict | None:
@@ -472,8 +472,45 @@ def create_key(name: str, project: str | None = None) -> tuple[str, str]:
 
 
 def list_keys() -> list[dict]:
-    """Key metadata (never hashes or secrets)."""
-    return [{"project": None, **{k: v for k, v in rec.items() if k != "hash"}} for rec in _read()["keys"]]
+    """Key metadata (never hashes or secrets), most recently used first; never-used keys last, newest first."""
+    keys = [
+        {"project": None, "last_used_at": None, **{k: v for k, v in rec.items() if k != "hash"}}
+        for rec in _read()["keys"]
+    ]
+    return sorted(keys, key=lambda k: (k["last_used_at"] or 0.0, k["created_at"]), reverse=True)
+
+
+def revoke_project_keys(project: str) -> int:
+    """Revoke every key bound to ``project`` (used when the project is deleted, so a re-created project of
+    the same name never inherits an old key). Returns how many were revoked."""
+    def apply(data: dict) -> int:
+        before = len(data["keys"])
+        data["keys"] = [k for k in data["keys"] if k.get("project") != project]
+        return before - len(data["keys"])
+
+    return int(_modify(apply))  # type: ignore[arg-type]
+
+
+# A key's ``last_used_at`` is written at most this often (every authenticated request would rewrite the file).
+KEY_TOUCH_INTERVAL_S = 60.0
+_key_touched: dict[str, float] = {}
+
+
+def _touch_key(key_id: str) -> None:
+    now = time.time()
+    if now - _key_touched.get(key_id, 0.0) < KEY_TOUCH_INTERVAL_S:
+        return
+    _key_touched[key_id] = now
+
+    def apply(data: dict) -> None:
+        for k in data["keys"]:
+            if k["id"] == key_id:
+                k["last_used_at"] = now
+
+    try:
+        _modify(apply)
+    except OSError:  # a read-only auth file must not break authentication
+        pass
 
 
 def revoke_key(key_id: str) -> bool:
@@ -496,6 +533,7 @@ def _verify_key(token: str) -> Principal | None:
     matched = hmac.compare_digest(_sha256(secret), expected)  # same work for unknown ids
     if record is None or not matched:
         return None
+    _touch_key(record["id"])
     project = record.get("project")
     return Principal(
         name=record["name"], role="project" if project else "global", via="key", project=project
@@ -571,6 +609,16 @@ def can_read_project(principal: Principal | None, project: str) -> bool:
     return row is not None and (row["visibility"] == "public" or db.db_is_member(project, principal.name))
 
 
+def can_read_snapshot(principal: Principal | None, project: str, visibility: str, members: list[str]) -> bool:
+    """``can_read_project`` against a remembered state (used to tell clients about a project that is
+    being deleted, when the database can no longer answer)."""
+    if principal is None or principal.role in ("admin", "global"):
+        return True
+    if principal.role == "project":
+        return principal.project == project
+    return visibility == "public" or principal.name in members
+
+
 def can_write_project(principal: Principal | None, project: str) -> bool:
     """Only API keys write run data; dashboard users and proxy identities never do."""
     if principal is None or principal.role == "global":
@@ -590,6 +638,26 @@ def visible_projects(principal: Principal | None) -> list[str] | None:
 # ---------------------------------------------------------------------------
 # Request gate
 # ---------------------------------------------------------------------------
+
+# Dashboard (browser) writes beyond the global "API keys only" rule: (method, path regex, who, keys_ok).
+# ``who``: "admin" = dashboard admins, "user" = any signed-in dashboard user. ``keys_ok``: whether API keys
+# reach the route at all (their per-project write check still applies; the route narrows further).
+_BROWSER_WRITES: tuple[tuple[str, re.Pattern[str], str, bool], ...] = (
+    ("PATCH", re.compile(r"^/runs/[^/]+$"), "admin", True),            # rename / tags / notes / group
+    ("DELETE", re.compile(r"^/runs/[^/]+$"), "admin", False),          # hard delete
+    ("POST", re.compile(r"^/runs/bulk$"), "admin", True),              # bulk; keys may only tag
+    ("POST", re.compile(r"^/runs/[^/]+/(archive|unarchive|move)$"), "admin", False),
+    ("PUT", re.compile(r"^/runs/[^/]+/pin$"), "user", False),
+    ("DELETE", re.compile(r"^/runs/[^/]+/pin$"), "user", False),
+)
+
+
+def _browser_write_rule(method: str, path: str) -> tuple[str, bool] | None:
+    for m, pattern, who, keys_ok in _BROWSER_WRITES:
+        if m == method and pattern.match(path):
+            return who, keys_ok
+    return None
+
 
 def _deny(is_ws: bool, status: int, message: str) -> None:
     if is_ws:
@@ -629,6 +697,7 @@ async def require_auth(conn: HTTPConnection) -> None:
     conn.state.principal = principal
 
     browser = principal.via != "key"
+    browser_rule = False  # a browser write the admin/user rule table allows: object check is a read check
     if path == "/admin" or path.startswith("/admin/"):
         if principal.role != "admin":
             _deny(is_ws, 403, "Admin access required")
@@ -644,6 +713,16 @@ async def require_auth(conn: HTTPConnection) -> None:
             _deny(is_ws, 403, "Only signed-in dashboard users can change their password")
         if not _same_origin(conn):
             _deny(is_ws, 403, "Cross-origin request refused")
+    elif not safe and (rule := _browser_write_rule(method, path)) is not None:
+        who, keys_ok = rule
+        if browser:
+            if who == "admin" and principal.role != "admin":
+                _deny(is_ws, 403, "Admin access required")
+            if not _same_origin(conn):
+                _deny(is_ws, 403, "Cross-origin request refused")
+            browser_rule = True
+        elif not keys_ok:
+            _deny(is_ws, 403, "API keys cannot do this" if who == "user" else "Admin access required")
     elif not safe and browser:
         _deny(is_ws, 403, "Writes require an API key; dashboard sessions are read-only")
 
@@ -651,6 +730,8 @@ async def require_auth(conn: HTTPConnection) -> None:
     if run_id:
         project = db.db_get_run_project(run_id)
         if project is not None:  # a missing run falls through to the route's own 404
-            allowed = can_read_project(principal, project) if safe else can_write_project(principal, project)
+            allowed = (
+                can_read_project(principal, project) if safe or browser_rule else can_write_project(principal, project)
+            )
             if not allowed:
                 _deny(is_ws, 404, "Run not found")

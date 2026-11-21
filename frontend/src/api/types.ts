@@ -13,6 +13,7 @@ export interface ApiKey {
   name: string
   project: string | null
   created_at: number
+  last_used_at?: number | null
 }
 
 export interface CreatedApiKey {
@@ -29,6 +30,11 @@ export interface Project {
   created_by: string
   runs: number | null
   members?: string[]
+  archived?: boolean
+  archived_at?: string | null
+  archived_runs?: number
+  last_activity?: string | null
+  retention?: { older_than_days: Record<string, number> } | null
 }
 
 export interface CreatedProject {
@@ -63,6 +69,11 @@ export interface Run {
   pytorch_version: string | null
   python_version: string | null
   hostname: string | null
+  updated_at?: string
+  group?: string | null
+  archived?: boolean
+  project_archived?: boolean
+  pinned?: boolean
 }
 
 export interface Metric {
@@ -150,7 +161,8 @@ export interface MediaItem {
   timestamp: number
   name: string
   media_type: 'image' | 'histogram' | 'figure'
-  data: string  // base64 PNG for image/figure, JSON string for histogram
+  data: string  // base64 PNG for image/figure (omitted with ?inline=false), JSON string for histogram
+  url?: string | null  // file-backed images/figures: GET this for the PNG
 }
 
 export interface BestMetricInfo {

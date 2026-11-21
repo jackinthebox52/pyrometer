@@ -70,6 +70,28 @@ Alternatives:
 
 If you lose the admin password: `pyrometer admin set-password` on the host.
 
+## Organising runs and projects
+
+Beyond the table above, these writes are allowed from the dashboard (same-origin required, also for proxy identities):
+
+| Action | Who |
+|--------|-----|
+| Rename a run, edit its tags, notes or group (`PATCH /runs/{id}`) | API keys that can write the run's project, and **admins**. Dashboard sessions still cannot set status or hardware fields |
+| Bulk tag (`POST /runs/bulk`, `action: tag`) | Same as above, per run |
+| Archive / unarchive, move, hard delete a run; bulk archive/move/delete | **Admins only**. API keys get `403`, regular users `403` |
+| Archive / unarchive / hard delete a project (`/admin/projects/...`), set its retention policy | **Admins only** |
+| Pin a run (`PUT/DELETE /runs/{id}/pin`, `GET /pins`) | Any signed-in dashboard user for runs they can see; pins are per user. API keys cannot pin |
+
+Why admins only for the destructive ones: a training-script key that leaks must not be able to wipe or relocate history, only
+write new data and tidy labels. Moving a run to another project changes who can write it, so a running run needs `force=true`: a
+key bound to the old project loses access, and the SDK's later writes would be refused. Deleting a project also revokes the keys
+bound to it, so a project re-created under the same name never inherits an old key. Admin actions never reveal private runs to
+others: invisible runs answer `404` exactly like missing ones. WebSocket sockets re-validate their credential, so a revoked key or
+ended session stops receiving events.
+
+API keys record `last_used_at` (updated at most once a minute per key, shown in Settings and `GET /admin/keys`, which lists the most
+recently used keys first).
+
 ## Alert webhooks
 
 Alert rules (Settings → Alerts, `/admin/alerts`) are admin-only. Webhook URLs usually embed a token, so they

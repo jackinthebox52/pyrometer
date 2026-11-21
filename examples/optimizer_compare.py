@@ -294,6 +294,7 @@ def main() -> None:
             name=run_name,
             hyperparams=hp,
             tags=config["tags"],
+            group="optimizer-compare",  # one group per sweep: filter by it in the dashboard
             notes=(
                 f"Optimizer comparison arm: {config['hyperparams']['optimizer']}. "
                 "Same architecture, dataset, and train/val split across all arms."

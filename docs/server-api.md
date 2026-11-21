@@ -15,6 +15,7 @@ Complete REST API and WebSocket reference for the Pyrometer server.
   - [List Runs](#get-runs)
   - [Get Run](#get-runsrun_id)
   - [Update Run](#patch-runsrun_id)
+- [Organising runs](#organising-runs-archive-move-delete-bulk-pins)
 - [Metrics](#metrics)
   - [Ingest Metrics](#post-runsrun_idmetrics)
   - [Get Metrics](#get-runsrun_idmetrics)
@@ -43,6 +44,8 @@ Complete REST API and WebSocket reference for the Pyrometer server.
   - [Ingest Media](#post-runsrun_idmedia)
   - [Get Media](#get-runsrun_idmedia)
   - [Get Media Names](#get-runsrun_idmedianames)
+- [Export](#export)
+- [Retention](#retention)
 - [Run Summaries](#run-summaries)
   - [Get Summary](#get-runsrun_idsummary)
   - [Get LLM Summary](#get-runsrun_idllm-summary)
@@ -95,7 +98,9 @@ curl -H "Authorization: Bearer $PYROMETER_API_KEY" http://localhost:8321/runs
 
 | Method | Path | Who | Description |
 |---|---|---|---|
-| `GET` | `/projects` | any | Projects the caller can see, with `visibility`, `runs`, `created_by` |
+| `GET` | `/projects` | any | Projects the caller can see, with `visibility`, `runs` (all), `archived_runs`, `created_by`, `archived`, `last_activity` (newest `updated_at` among non-archived runs, `null` if none). **Sorted by last activity** (projects without runs by creation time); `sort=name` for a-z; archived ones only with `include_archived=true` |
+| `GET` | `/projects/{name}/groups` | any (visible) | Run groups of the project: `[{"group", "runs", "running", "last_activity", "first_created"}]`, newest activity first; `include_archived` param. `404` for unknown or invisible projects |
+| `GET` | `/projects/{name}/export` | any (visible) | Parquet zip of the whole project, see [Export](#export) |
 | `POST` | `/projects` | global key, admin | Body `{"name", "visibility": "public"\|"private"}`. Returns `{"project", "key"}`; for a private project `key` is its own API key, shown once. `409` if the name exists |
 
 Names are 1-64 characters: letters, digits, `.`, `_`, `-`. `POST /runs` takes an optional `"project"`; a global
@@ -107,14 +112,17 @@ Session or trusted proxy; state changes must be same-origin.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` / `POST` | `/admin/keys` | List keys / create one. Body `{"name", "project"?}`; the key is returned only on creation |
+| `GET` / `POST` | `/admin/keys` | List keys (most recently used first, with `last_used_at`, `null` = never; written at most once a minute per key) / create one. Body `{"name", "project"?}`; the key is returned only on creation |
 | `DELETE` | `/admin/keys/{id}` | Revoke a key |
-| `GET` / `POST` | `/admin/users` | List users / create `{"username", "password", "role": "user"\|"admin"}` |
+| `GET` / `POST` | `/admin/users` | List users (alphabetical) / create `{"username", "password", "role": "user"\|"admin"}` |
 | `PATCH` | `/admin/users/{username}` | `{"role"?, "password"?}` |
 | `DELETE` | `/admin/users/{username}` | Delete (not yourself, not the last admin); ends their sessions and memberships |
 | `GET` | `/admin/projects/{name}` | Project plus `members` |
-| `PATCH` | `/admin/projects/{name}` | `{"visibility"?, "members"?: [usernames]}` |
-| `GET` / `POST` | `/admin/alerts` | List / create webhook alert rules (see [Alerts](#alerts)) |
+| `PATCH` | `/admin/projects/{name}` | `{"visibility"?, "members"?: [usernames], "retention"?}` (see [Retention](#retention)). Members are returned alphabetically |
+| `POST` | `/admin/projects/{name}/archive`, `/unarchive` | Hide the project and its runs from lists (`include_archived=true` shows them). Data and ingestion are untouched. `default` cannot be archived |
+| `DELETE` | `/admin/projects/{name}?cascade=false` | **Hard delete.** `409` while the project still has runs, unless `cascade=true`, which deletes every run completely (as `DELETE /runs/{id}`). Also removes its members, the alert rules scoped to it and **revokes the API keys bound to it** (so a re-created project of the same name inherits nothing). Returns `{"deleted", "runs_deleted", "keys_revoked", "alert_rules_removed"}`. `default` cannot be deleted |
+| `POST` | `/admin/projects/{name}/retention/run` | Apply the project's retention policy now; returns rows deleted per table |
+| `GET` / `POST` | `/admin/alerts` | List (most recently updated first; each rule has `updated_at`) / create webhook alert rules (see [Alerts](#alerts)) |
 | `PATCH` / `DELETE` | `/admin/alerts/{id}` | Update (e.g. `{"enabled": false}`) / delete a rule |
 | `POST` | `/admin/alerts/{id}/test` | Send a test message to the rule's webhook now (`502` if delivery fails) |
 
@@ -234,7 +242,8 @@ Create a new training run.
 | `hostname` | `string` | No | Machine hostname. |
 | `run_id` | `string` | No | Client-chosen id (`[A-Za-z0-9_-]`, 8-64 chars). The SDK always sends one. Repeating a create for an existing id returns that run unchanged (idempotent), so offline runs can be synced safely. Minted by the server if absent. |
 | `created_at` | `number` | No | Unix timestamp of run creation (offline runs keep their original start time). |
-| `resume` | `"must" \| "auto"` | No | Needs `run_id`. If the run exists, reattach: status back to `running` (from any status), heartbeat refreshed, name/hyperparams/tags kept. `"must"` returns 404 if the run is unknown, `"auto"` creates it. Requires write access to the run's project (otherwise 404); a `project` different from the run's gives 409. Response adds `resumed: true`, `previous_status`, `last_step` (max logged step or null), `hyperparams`, `tags`. Without `resume`, an existing id is returned unchanged. |
+| `resume` | `"must" \| "auto"` | No | Needs `run_id`. If the run exists, reattach: status back to `running` (from any status), heartbeat refreshed, name/hyperparams/tags kept. `"must"` returns 404 if the run is unknown, `"auto"` creates it. Requires write access to the run's project (otherwise 404); a `project` different from the run's gives 409. Response adds `resumed: true`, `previous_status`, `last_step` (max logged step or null), `hyperparams`, `tags`. Without `resume`, an existing id is returned unchanged, unless an explicit `project` names a *different* project than the run's: that is a `409` (and registers nothing). |
+| `group` | `string` | No | Sweep/experiment group, up to 128 characters (`init(group=...)`). Filter with `GET /runs?group=`, list with `GET /projects/{name}/groups`. |
 
 **Response** (201 Created):
 
@@ -256,7 +265,15 @@ Create a new training run.
 
 ### `GET /runs`
 
-List all runs, sorted newest-first.
+List the runs the caller can see, **most recently active first** by default.
+
+| Parameter | Description |
+|-----------|-------------|
+| `sort` | `updated` (default: `updated_at` desc, bumped by every successful ingest and every status/metadata change), `created` (desc) or `name` (a-z). Anything else is a `400` |
+| `include_archived` | `true` also lists archived runs and runs of archived projects (hidden by default) |
+| `group` | Only runs with this `group` |
+| `project` | Only runs of this project |
+| `status` | Only runs with this status |
 
 **Response**:
 
@@ -266,17 +283,26 @@ List all runs, sorted newest-first.
     {
       "run_id": "550e8400-e29b-41d4-a716-446655440000",
       "name": "my-experiment",
+      "project": "default",
       "status": "running",
       "created_at": "2024-01-15T10:30:00Z",
+      "updated_at": "2024-01-15T11:02:11Z",
       "finished_at": null,
       "hyperparams": {"lr": 0.0003},
       "gpu_model": "NVIDIA A100",
-      "tags": ["baseline"]
+      "tags": ["baseline"],
+      "group": "lr-sweep",
+      "archived": false,
+      "project_archived": false,
+      "pinned": false
     }
   ],
   "error": null
 }
 ```
+
+`pinned` is the caller's own pin (always `false` for API keys). `GET /runs/{run_id}` returns the same extra fields
+(`updated_at`, `group`, `archived`, `pinned`) plus `notes` and the hardware fields.
 
 ---
 
@@ -323,7 +349,7 @@ Get details for a specific run.
 
 ### `PATCH /runs/{run_id}`
 
-Update run status or notes.
+Update run status, notes, hardware info and the organisation fields (name, tags, group).
 
 **Request Body**:
 
@@ -337,8 +363,15 @@ Update run status or notes.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `status` | `string` | No | One of: `running`, `completed`, `failed`, `crashed`, `killed`. An explicit status always overwrites the current one (so a replayed `completed` from `pyrometer sync` replaces a server-detected `crashed`) |
-| `notes` | `string` | No | Updated notes text |
+| `notes` | `string` | No | Updated notes text (`""` clears it) |
+| `name` | `string` | No | Rename the run (1-200 characters, trimmed) |
+| `tags` | `list[string]` | No | **Replaces** the tag list (trimmed, deduplicated, at most 50 tags of at most 64 characters) |
+| `group` | `string\|null` | No | Set the run's group (max 128 characters); `""`/`null` clears it |
 | `git_hash`, `git_dirty`, `gpu_model`, `gpu_memory_total`, `cuda_version`, `pytorch_version`, `python_version`, `hostname` | various | No | Hardware/environment fields. The SDK sends these in a follow-up PATCH once its background probe (importing torch, initialising NVML; takes seconds) is done, so `init()` does not wait for it. Absent or null fields are left unchanged |
+
+**Who may call it**: API keys that can write the run's project (global key, or that project's key) may set every field.
+Dashboard **admins** (session or trusted proxy, same-origin) may set only `name`, `tags`, `notes` and `group`; sending
+`status` or a hardware field from a browser is a `403`. Regular users get `403`. An unknown run is a `404`. Every change bumps `updated_at`.
 
 Setting `status` to `running` also refreshes `last_heartbeat`, so a run revived this way is not swept straight back to `crashed`.
 
@@ -354,6 +387,32 @@ Setting `status` to `running` also refreshes `last_heartbeat`, so a run revived 
 ```
 
 **WebSocket Event**: `{"type": "run_updated", "run_id": "..."}`
+
+---
+
+### Organising runs: archive, move, delete, bulk, pins
+
+Dashboard **admins** only (session or trusted proxy, same-origin; see [auth.md](auth.md#organising-runs-and-projects)),
+except pins (any signed-in dashboard user) and bulk `tag` (also API keys that can write the run's project). API keys get
+`403` on the admin-only ones. A run the caller cannot see is a `404`.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/runs/{run_id}/archive` | Hide the run from lists (`GET /runs` needs `include_archived=true` to show it). Data is kept; opening it by id and ingesting into it keep working |
+| `POST` | `/runs/{run_id}/unarchive` | Undo |
+| `POST` | `/runs/{run_id}/move` | Body `{"project", "force"?: false}`. The target must exist (`404`) and not be archived (`409`). A run that is still `running` needs `force=true` (`409` otherwise): a key bound to the old project can no longer write it afterwards (its ingests get `404`) and a retried create naming the old project gets `409` |
+| `DELETE` | `/runs/{run_id}` | **Hard delete**: the run row and every row of it in every table (metrics, system snapshots, param stats, profile events, events, logs, artifacts, media, samples, run summaries, dedupe batch ids, alert state, pins) plus its media files on disk. Irreversible |
+| `POST` | `/runs/bulk` | Body `{"run_ids": [...up to 500], "action": "tag"\|"archive"\|"unarchive"\|"move"\|"delete", "add_tags"?, "remove_tags"?, "project"?, "force"?}` |
+| `PUT` | `/runs/{run_id}/pin` | Pin for the signed-in user (`403` for API keys, `404` for an unknown or invisible run) |
+| `DELETE` | `/runs/{run_id}/pin` | Unpin |
+| `GET` | `/pins` | The user's pinned runs, most recently pinned first (same shape as `GET /runs`; `include_archived` param). `403` for API keys |
+
+`POST /runs/bulk` answers `{"results": [{"run_id", "ok", "error"}], "succeeded", "failed"}`; one failure does not stop the others,
+and missing and invisible runs give the same `"Run not found"`. Only `tag` is open to API keys; the other actions are a `403`
+for them (checked up front, before anything runs). `tag` adds `add_tags` and removes `remove_tags` per run.
+
+**WebSocket events**: `run_updated` (archive, unarchive, tags), `run_deleted` (`{"type", "run_id", "project"}`), `run_moved`
+(`{"type", "run_id", "project"}` = new project), see [Event Types](#event-types).
 
 ---
 
@@ -450,6 +509,18 @@ Get all metrics for a run, optionally filtered by name.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `name` | `string` | Optional metric name filter |
+
+
+**Zoom and downsampling** (all optional; with none of them you get the full history, as before):
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `max_points` | `int` | Downsample each series to about this many points (clamped to 8..100000). A series that already fits is returned whole. Longer ones are cut into equal-width buckets along the step (or time) axis and each bucket keeps its minimum, maximum, first and last point, so a one-step spike is never averaged away. Done in one windowed SQL scan |
+| `step_min`, `step_max` | `int` | Only rows with `step` in this window (inclusive). Refetch with the visible range to zoom |
+| `t_min`, `t_max` | `float` | Only rows with `timestamp` in this window (Unix seconds) |
+
+When any of these is given, the response has a top-level `"meta": {"total", "returned", "downsampled", "max_points"}` next to `data`/`error`
+(`total` = rows in the window before downsampling). A min greater than its max is a `400`.
 
 **Request Examples**:
 
@@ -665,6 +736,18 @@ Ingest a GPU system snapshot.
 
 Get all system snapshots for a run.
 
+**Query Parameters**: `max_points`, `t_min`, `t_max` (below). `max_points` downsamples each GPU's series separately and keeps, per time bucket, the first and last snapshot plus the peak-utilization, lowest-utilization, peak-memory and peak-temperature snapshots.
+
+**Zoom and downsampling** (all optional; with none of them you get the full history, as before):
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `max_points` | `int` | Downsample each series to about this many points (clamped to 8..100000). A series that already fits is returned whole. Longer ones are cut into equal-width buckets along the step (or time) axis and each bucket keeps the rows listed above, so a one-step spike is never averaged away. Done in one windowed SQL scan |
+| `t_min`, `t_max` | `float` | Only rows with `timestamp` in this window (Unix seconds) |
+
+When any of these is given, the response has a top-level `"meta": {"total", "returned", "downsampled", "max_points"}` next to `data`/`error`
+(`total` = rows in the window before downsampling). A min greater than its max is a `400`.
+
 **Response**:
 
 ```json
@@ -760,6 +843,19 @@ Get parameter statistics, optionally filtered by parameter name.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `name` | `string` | Optional parameter name filter |
+
+Downsampling and zoom (`max_points`, `step_min/step_max`, `t_min/t_max`) work as for metrics; `max_points` applies per parameter and keeps, per bucket, the first and last step plus the peak gradient-norm and peak weight-norm steps (histograms included).
+
+**Zoom and downsampling** (all optional; with none of them you get the full history, as before):
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `max_points` | `int` | Downsample each series to about this many points (clamped to 8..100000). A series that already fits is returned whole. Longer ones are cut into equal-width buckets along the step (or time) axis and each bucket keeps the rows listed above, so a one-step spike is never averaged away. Done in one windowed SQL scan |
+| `step_min`, `step_max` | `int` | Only rows with `step` in this window (inclusive). Refetch with the visible range to zoom |
+| `t_min`, `t_max` | `float` | Only rows with `timestamp` in this window (Unix seconds) |
+
+When any of these is given, the response has a top-level `"meta": {"total", "returned", "downsampled", "max_points"}` next to `data`/`error`
+(`total` = rows in the window before downsampling). A min greater than its max is a `400`.
 
 **Response**:
 
@@ -1062,6 +1158,12 @@ Ingest media (images, histograms, figures). A new item replaces an existing one 
 
 Get media, optionally filtered by name.
 
+Image and figure payloads are **not stored in DuckDB**: the decoded PNG lives at `<data dir>/media/<run_id>/<hash>-<step>.png`
+(`PYROMETER_MEDIA_DIR` overrides the root) and the table keeps only its path. Existing databases are migrated on startup
+(rows whose payload is not valid base64 stay inline). Histograms stay inline. Each returned item has `"url"` (set for
+file-backed images/figures, `null` otherwise) and `"data"`. By default `data` is still the base64 payload (backward
+compatible); pass `inline=false` to leave it out (`null`) and load images lazily through `url`.
+
 **Query Parameters**:
 
 | Parameter | Type | Description |
@@ -1084,6 +1186,14 @@ Get media, optionally filtered by name.
   "error": null
 }
 ```
+
+---
+
+### `GET /runs/{run_id}/media/file?name=&step=`
+
+The PNG of one stored image/figure (`Content-Type: image/png`, `Cache-Control: private`). Same authorization as the run
+(`404` for unknown media or an invisible run, `401` without credentials), so a dashboard can use the `url` from the media list
+directly as `<img src>`; the session cookie authorizes it. `name` is a query parameter because names may contain `/`.
 
 ---
 
@@ -1134,6 +1244,36 @@ Filtering and sorting apply to the whole step before paging; `total` is the filt
 
 The key and filters are bound as SQL parameters (the key as a JSON path), never interpolated.
 `GET /runs/{run_id}/llm-summary` also includes a `SAMPLES` section (latest step's top/bottom 3 by reward, truncated).
+
+---
+
+## Export
+
+### `GET /runs/{run_id}/export` and `GET /projects/{name}/export`
+
+A zip of Parquet files, one per table, written with DuckDB `COPY` into a temp directory that is removed after the
+response: `runs`, `metrics`, `system_snapshots`, `param_stats`, `profile_events`, `events`, `logs`, `artifacts`, `media`,
+`samples`, `run_summaries`, plus the image files under `media/<run_id>/` (the `media` table's `path` column points at them).
+The project export covers every run of the project, archived ones included. Same visibility as reading the run/project
+(`404` otherwise). Credentials, alert rules and dedupe ids are never exported.
+
+---
+
+## Retention
+
+Raw data is kept forever by default. An admin can give a project an optional policy; a daily sweeper (first run one minute
+after start; `PYROMETER_RETENTION_INTERVAL` seconds between runs) deletes rows older than N days from the tables the policy names, by
+their own `timestamp`:
+
+```bash
+curl -X PATCH $URL/admin/projects/team-a -H "Cookie: ..." -H "Origin: $URL" -H 'Content-Type: application/json' \
+  -d '{"retention": {"older_than_days": {"system_snapshots": 30, "logs": 14}}}'
+```
+
+Allowed tables: `system_snapshots`, `logs`, `profile_events`, `param_stats`, `events`, `artifacts`, `media` (files removed too), `samples`
+and `metrics` (only when named explicitly). Runs are never deleted by it. `{"retention": null}` (or `{}`) switches it off; unknown tables or
+days outside (0, 36500] are a `400`. `GET /admin/projects/{name}` shows the policy. The `seen_batches` dedupe ids are not aged out: they live
+and die with their run.
 
 ---
 
@@ -1234,6 +1374,10 @@ const ws = new WebSocket("ws://localhost:8321/ws");
 
 **Keep-alive**: The server ignores client messages; the connection is kept alive by the client.
 
+**Re-authorization**: the credential behind the socket (key, session, proxy identity) is re-validated before every delivery and,
+for idle sockets, every `PYROMETER_WS_RECHECK` seconds (default 30). A revoked key, ended session or deleted user gets the socket closed
+(code 1008). Visibility is evaluated per event with the user's current role and memberships.
+
 **Reconnection**: Clients should implement exponential backoff on disconnect.
 
 ---
@@ -1254,6 +1398,11 @@ The server broadcasts JSON events to all connected clients:
 | `system` | `POST /runs/{id}/system` | New system snapshot |
 | `param_stats` | `POST /runs/{id}/param-stats` | New gradient stats |
 | `logs` | `POST /runs/{id}/logs` | New console logs |
+| `run_updated` (also) | archive / unarchive / bulk tag | Run organisation changed (refetch the run) |
+| `run_deleted` | `DELETE /runs/{id}`, bulk delete, or a move away from a project you can read | `{"type", "run_id", "project"?, "reason"?: "moved"}`: drop the run from lists |
+| `run_moved` | `POST /runs/{id}/move` | `{"type", "run_id", "project"}`: sent to users who can read both projects. Users who could only read the old project get `run_deleted` (`"reason": "moved"`), users who can only read the new one get `run_created` |
+| `project_updated` | project archive / unarchive | `{"type", "project"}`: refetch projects and runs |
+| `project_deleted` | `DELETE /admin/projects/{name}` | `{"type", "project"}`: sent to whoever could read it before the delete (its runs get no separate events) |
 
 **Throttling**: Events are throttled per-run to 500ms to avoid flooding clients during rapid updates.
 

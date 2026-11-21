@@ -1,11 +1,16 @@
 """DuckDB access layer — all queries live here, never in route handlers."""
 
+import base64
+import binascii
 import datetime
+import hashlib
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
+from urllib.parse import quote as _urlquote
 from collections.abc import Callable
 from pathlib import Path
 
@@ -16,7 +21,6 @@ _DB_PATH = os.environ.get(
     str(Path.home() / ".pyrometer" / "data.duckdb"),
 )
 
-_BATCH_TTL_S = 30 * 86400
 _lock = threading.RLock()  # re-entrant: ingest holds it across claim-batch + insert
 _conn: duckdb.DuckDBPyConnection | None = None
 
@@ -32,6 +36,12 @@ def get_conn() -> duckdb.DuckDBPyConnection:
 
 def get_lock() -> threading.RLock:
     return _lock
+
+
+def media_root() -> Path:
+    """Directory holding image/figure payloads: ``<data dir>/media`` (``PYROMETER_MEDIA_DIR`` overrides)."""
+    override = os.environ.get("PYROMETER_MEDIA_DIR")
+    return Path(override) if override else Path(_DB_PATH).parent / "media"
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +76,10 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS project VARCHAR")
     # Liveness: stamped by SDK heartbeats; NULL for runs from before heartbeats (never auto-crashed).
     conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS last_heartbeat DOUBLE")
+    # Organisation: last activity (any ingest / status / metadata change), sweep group, archive stamp.
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS updated_at DOUBLE")
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_group VARCHAR")
+    conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS archived_at DOUBLE")
     conn.execute("UPDATE runs SET project = 'default' WHERE project IS NULL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS projects (
@@ -75,6 +89,8 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             created_by VARCHAR
         )
     """)
+    conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS archived_at DOUBLE")
+    conn.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS retention JSON")  # NULL = keep everything
     conn.execute("""
         CREATE TABLE IF NOT EXISTS project_members (
             project  VARCHAR,
@@ -83,7 +99,8 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
     conn.execute(
-        "INSERT INTO projects VALUES ('default', 'public', ?, 'system') ON CONFLICT DO NOTHING",
+        "INSERT INTO projects (name, visibility, created_at, created_by) VALUES ('default', 'public', ?, 'system') "
+        "ON CONFLICT DO NOTHING",
         [time.time()],
     )
 
@@ -210,6 +227,8 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             data       VARCHAR
         )
     """)
+    # Image/figure payloads live in files under media_root(); ``path`` is relative to it and ``data`` NULL.
+    conn.execute("ALTER TABLE media ADD COLUMN IF NOT EXISTS path VARCHAR")
 
     # LLM/RL generation samples: one row per sample dict (JSON text), grouped by (name, step).
     conn.execute("""
@@ -233,7 +252,7 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             PRIMARY KEY (run_id, batch_id)
         )
     """)
-    conn.execute("DELETE FROM seen_batches WHERE seen_at < ?", [time.time() - _BATCH_TTL_S])
+    # seen_batches rows live as long as their run (deleted with it): a replay of any age stays a no-op.
 
     # Webhook alert rules (admin-managed). ``url`` is a secret: never returned by list/get helpers' callers unmasked.
     # A rule has one or more triggers (``triggers`` JSON list). The flat kind/min_severity/metric/op/threshold
@@ -256,6 +275,8 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
     conn.execute("ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS triggers JSON")
+    conn.execute("ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS updated_at DOUBLE")
+    conn.execute("UPDATE alert_rules SET updated_at = created_at WHERE updated_at IS NULL")
     for rid, kind, sev, metric, op, thr in conn.execute(
         "SELECT id, kind, min_severity, metric, op, threshold FROM alert_rules WHERE triggers IS NULL"
     ).fetchall():
@@ -271,6 +292,7 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             sent_at DOUBLE
         )
     """)
+    conn.execute("ALTER TABLE alert_sent ADD COLUMN IF NOT EXISTS run_id VARCHAR")  # NULL for rows from before
     conn.execute("""
         CREATE TABLE IF NOT EXISTS alert_violations (
             rule_id     VARCHAR,
@@ -298,7 +320,21 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
+    # Per-user pinned runs (dashboard users only).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pinned_runs (
+            username  VARCHAR,
+            run_id    VARCHAR,
+            pinned_at DOUBLE,
+            PRIMARY KEY (username, run_id)
+        )
+    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (key VARCHAR PRIMARY KEY, done_at DOUBLE)")
+
+    _backfill_updated_at(conn)
     _migrate_legacy_running(conn)
+    _repair_duplicates(conn)
+    _migrate_media_to_files(conn)
 
 
 # Every table with a ``timestamp`` column per run: the evidence a run was alive at some moment.
@@ -348,6 +384,106 @@ def _migrate_legacy_running(conn: duckdb.DuckDBPyConnection) -> None:
             conn.execute("UPDATE runs SET last_heartbeat = ? WHERE run_id = ?", [ts, run_id])
 
 
+def _backfill_updated_at(conn: duckdb.DuckDBPyConnection) -> None:
+    """Give runs without ``updated_at`` (databases from before it existed) their newest data timestamp."""
+    ids = [r[0] for r in conn.execute("SELECT run_id FROM runs WHERE updated_at IS NULL").fetchall()]
+    if not ids:
+        return
+    conn.execute(
+        "UPDATE runs SET updated_at = GREATEST(COALESCE(created_at, 0), COALESCE(finished_at, 0), "
+        "COALESCE(last_heartbeat, 0)) WHERE run_id IN (SELECT unnest(?::VARCHAR[]))",
+        [ids],
+    )
+    for table in _ACTIVITY_TABLES:
+        conn.execute(
+            f"UPDATE runs SET updated_at = t.m FROM (SELECT run_id, max(timestamp) AS m FROM {table} "
+            "WHERE run_id IN (SELECT unnest(?::VARCHAR[])) GROUP BY run_id) t "
+            "WHERE runs.run_id = t.run_id AND t.m > runs.updated_at",
+            [ids],
+        )
+
+
+def _meta_done(conn: duckdb.DuckDBPyConnection, key: str) -> bool:
+    return conn.execute("SELECT 1 FROM schema_meta WHERE key = ?", [key]).fetchone() is not None
+
+
+def _meta_mark(conn: duckdb.DuckDBPyConnection, key: str) -> None:
+    conn.execute("INSERT INTO schema_meta VALUES (?, ?) ON CONFLICT DO NOTHING", [key, time.time()])
+
+
+def _repair_duplicates(conn: duckdb.DuckDBPyConnection) -> None:
+    """One-time: keep only the newest row (by client timestamp) per key where legacy data has duplicates.
+
+    Before last-write-wins existed, a resumed run or a replayed spool could store the same
+    (run, name, step) twice in ``metrics`` / ``param_stats`` / ``media``. Writes dedupe now, so this
+    runs once (recorded in ``schema_meta``) and a clean table costs one aggregate scan.
+    """
+    if _meta_done(conn, "dedupe_v1"):
+        return
+    for table, key in (("metrics", "name"), ("param_stats", "param_name"), ("media", "name")):
+        dup = conn.execute(
+            f"SELECT 1 FROM (SELECT 1 FROM {table} GROUP BY run_id, {key}, step HAVING count(*) > 1 LIMIT 1)"
+        ).fetchone()
+        if dup is None:
+            continue
+        conn.execute(
+            f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM (SELECT rowid, row_number() OVER "
+            f"(PARTITION BY run_id, {key}, step ORDER BY timestamp DESC, rowid DESC) AS rn FROM {table}) "
+            "WHERE rn > 1)"
+        )
+    _meta_mark(conn, "dedupe_v1")
+
+
+MEDIA_FILE_TYPES = ("image", "figure")
+
+
+def _media_relpath(run_id: str, name: str, step: int) -> str:
+    return f"{run_id}/{hashlib.sha256(name.encode()).hexdigest()[:16]}-{step}.png"
+
+
+def _write_media_file(relpath: str, raw: bytes) -> None:
+    dest = media_root() / relpath
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    tmp.write_bytes(raw)
+    os.replace(tmp, dest)
+
+
+def _decode_b64(data: str) -> bytes | None:
+    try:
+        return base64.b64decode(data, validate=True) if data else None
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _migrate_media_to_files(conn: duckdb.DuckDBPyConnection) -> None:
+    """Move base64 image/figure payloads still stored in the table into files (batches, idempotent).
+
+    Rows whose payload is not valid base64 stay inline. DuckDB reuses the freed space but the database
+    file only shrinks after a checkpoint/compaction.
+    """
+    skipped: list[int] = [-1]
+    while True:
+        rows = conn.execute(
+            "SELECT rowid, run_id, name, step, data FROM media "
+            "WHERE path IS NULL AND data IS NOT NULL AND media_type IN ('image', 'figure') "
+            "AND rowid NOT IN (SELECT unnest(?::BIGINT[])) LIMIT 50",
+            [skipped],
+        ).fetchall()
+        moved = 0
+        for rowid, run_id, name, step, data in rows:
+            raw = _decode_b64(data)
+            if raw is None:
+                skipped.append(rowid)
+                continue
+            rel = _media_relpath(run_id, name, step)
+            _write_media_file(rel, raw)
+            conn.execute("UPDATE media SET path = ?, data = NULL WHERE rowid = ?", [rel, rowid])
+            moved += 1
+        if not rows:
+            return
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -367,6 +503,12 @@ def _parse_json(val):
     return val
 
 
+_LIST_COLS = (
+    "r.run_id, r.name, r.status, r.created_at, r.finished_at, r.hyperparams, r.gpu_model, r.tags, "
+    "r.project, r.last_heartbeat, r.updated_at, r.run_group, r.archived_at, p.archived_at"
+)
+
+
 def _row_to_run_summary(row: tuple) -> dict:
     return {
         "project": row[8],
@@ -376,25 +518,36 @@ def _row_to_run_summary(row: tuple) -> dict:
         "status": row[2],
         "created_at": _ts_to_iso(row[3]),
         "finished_at": _ts_to_iso(row[4]),
+        "updated_at": _ts_to_iso(row[10] if row[10] is not None else row[3]),
         "hyperparams": _parse_json(row[5]) or {},
         "gpu_model": row[6],
         "tags": _parse_json(row[7]) or [],
+        "group": row[11],
+        "archived": row[12] is not None,
+        "project_archived": row[13] is not None,
+        "pinned": False,  # filled in per user by the caller
     }
 
 
+_DETAIL_COLS = [
+    "run_id", "name", "status", "created_at", "finished_at",
+    "hyperparams", "git_hash", "git_dirty", "gpu_model", "gpu_memory_total",
+    "cuda_version", "pytorch_version", "python_version", "hostname", "tags", "notes",
+    "project", "last_heartbeat", "updated_at", "run_group", "archived_at",
+]
+
+
 def _row_to_run_detail(row: tuple) -> dict:
-    cols = [
-        "run_id", "name", "status", "created_at", "finished_at",
-        "hyperparams", "git_hash", "git_dirty", "gpu_model", "gpu_memory_total",
-        "cuda_version", "pytorch_version", "python_version", "hostname", "tags", "notes",
-        "project", "last_heartbeat",
-    ]
-    d = dict(zip(cols, row))
+    d = dict(zip(_DETAIL_COLS, row))
     d["hyperparams"] = _parse_json(d["hyperparams"]) or {}
     d["tags"] = _parse_json(d["tags"]) or []
     d["created_at"] = _ts_to_iso(d["created_at"])
     d["finished_at"] = _ts_to_iso(d["finished_at"])
     d["last_heartbeat"] = _ts_to_iso(d["last_heartbeat"])
+    d["updated_at"] = _ts_to_iso(d["updated_at"] if d["updated_at"] is not None else row[3])
+    d["group"] = d.pop("run_group")
+    d["archived"] = d.pop("archived_at") is not None
+    d["pinned"] = False
     return d
 
 
@@ -418,6 +571,7 @@ def db_create_run(
     project: str = "default",
     run_id: str | None = None,
     created_at: float | None = None,
+    group: str | None = None,
 ) -> dict:
     """Insert a run. ``run_id``/``created_at`` come from the SDK (offline runs keep their identity)."""
     run_id = run_id or str(uuid.uuid4())
@@ -431,10 +585,10 @@ def db_create_run(
             INSERT INTO runs (
                 run_id, name, status, created_at, finished_at, hyperparams, git_hash, git_dirty,
                 gpu_model, gpu_memory_total, cuda_version, pytorch_version, python_version,
-                hostname, tags, notes, project, last_heartbeat
+                hostname, tags, notes, project, last_heartbeat, updated_at, run_group
             ) VALUES (
                 ?, ?, 'running', ?, NULL,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             [
@@ -448,37 +602,78 @@ def db_create_run(
                 notes,
                 project,
                 time.time(),  # server clock: a run synced from a spool starts "alive" now
+                time.time(),  # updated_at
+                group,
             ],
         )
 
     return {
         "run_id": run_id, "name": resolved_name, "status": "running",
-        "created_at": _ts_to_iso(now), "project": project,
+        "created_at": _ts_to_iso(now), "project": project, "group": group,
     }
 
 
-def db_list_runs(projects: list[str] | None = None) -> list[dict]:
-    """All runs, or only those in ``projects`` (``None`` = no restriction)."""
+RUN_SORTS = ("updated", "created", "name")
+
+
+def db_list_runs(
+    projects: list[str] | None = None,
+    sort: str = "updated",
+    include_archived: bool = False,
+    group: str | None = None,
+    project: str | None = None,
+    status: str | None = None,
+    pinned_by: str | None = None,
+    run_ids: list[str] | None = None,
+) -> list[dict]:
+    """Runs the caller may see (``projects``: ``None`` = no restriction), newest activity first.
+
+    ``sort``: ``updated`` (``updated_at`` desc, the default), ``created`` (desc) or ``name`` (a-z).
+    Archived runs, and runs of archived projects, are hidden unless ``include_archived``.
+    ``pinned_by`` fills each run's ``pinned`` flag for that user; ``run_ids`` restricts to those runs.
+    """
     db_mark_stale_runs()
-    where, params = "", []
+    clauses: list[str] = []
+    params: list = []
     if projects is not None:
         if not projects:
             return []
-        where = f"WHERE project IN ({', '.join('?' * len(projects))})"
-        params = list(projects)
+        clauses.append(f"r.project IN ({', '.join('?' * len(projects))})")
+        params += projects
+    if not include_archived:
+        clauses.append("r.archived_at IS NULL AND p.archived_at IS NULL")
+    if group is not None:
+        clauses.append("r.run_group = ?")
+        params.append(group)
+    if project is not None:
+        clauses.append("r.project = ?")
+        params.append(project)
+    if status is not None:
+        clauses.append("r.status = ?")
+        params.append(status)
+    if run_ids is not None:
+        if not run_ids:
+            return []
+        clauses.append("r.run_id IN (SELECT unnest(?::VARCHAR[]))")
+        params.append(run_ids)
+    order = {
+        "created": "r.created_at DESC",
+        "name": "lower(r.name) ASC, r.created_at DESC",
+    }.get(sort, "COALESCE(r.updated_at, r.created_at) DESC, r.created_at DESC")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _lock:
-        conn = get_conn()
-        rows = conn.execute(
-            f"""
-            SELECT run_id, name, status, created_at, finished_at,
-                   hyperparams, gpu_model, tags, project, last_heartbeat
-            FROM runs
-            {where}
-            ORDER BY created_at DESC
-            """,
+        rows = get_conn().execute(
+            f"SELECT {_LIST_COLS} FROM runs r LEFT JOIN projects p ON p.name = r.project {where} ORDER BY {order}",
             params,
         ).fetchall()
-    return [_row_to_run_summary(r) for r in rows]
+        pinned = (
+            {r[0] for r in get_conn().execute("SELECT run_id FROM pinned_runs WHERE username = ?", [pinned_by]).fetchall()}
+            if pinned_by else set()
+        )
+    out = [_row_to_run_summary(r) for r in rows]
+    for run in out:
+        run["pinned"] = run["run_id"] in pinned
+    return out
 
 
 def db_get_run_project(run_id: str) -> str | None:
@@ -499,33 +694,58 @@ def _row_to_project(row: tuple) -> dict:
         "created_at": _ts_to_iso(row[2]),
         "created_by": row[3],
         "runs": row[4] if len(row) > 4 else None,
+        "archived": row[5] is not None if len(row) > 5 else False,
+        "archived_at": _ts_to_iso(row[5]) if len(row) > 5 else None,
+        "last_activity": _ts_to_iso(row[6]) if len(row) > 6 else None,
+        "archived_runs": row[7] if len(row) > 7 else 0,
     }
 
 
 def db_get_project(name: str) -> dict | None:
+    """One project (with its ``retention`` policy, which the list omits)."""
     with _lock:
         row = get_conn().execute(
-            "SELECT name, visibility, created_at, created_by FROM projects WHERE name = ?", [name]
+            "SELECT p.name, p.visibility, p.created_at, p.created_by, "
+            "(SELECT count(*) FROM runs r WHERE r.project = p.name), p.archived_at, "
+            "(SELECT max(r.updated_at) FROM runs r WHERE r.project = p.name AND r.archived_at IS NULL), "
+            "(SELECT count(*) FROM runs r WHERE r.project = p.name AND r.archived_at IS NOT NULL), p.retention "
+            "FROM projects p WHERE p.name = ?",
+            [name],
         ).fetchone()
-    return _row_to_project(row) if row else None
+    if not row:
+        return None
+    return {**_row_to_project(row[:8]), "retention": _parse_json(row[8])}
 
 
-def db_list_projects(names: list[str] | None = None) -> list[dict]:
-    """Projects with run counts; ``names`` restricts the result (``None`` = all)."""
-    where, params = "", []
+def db_list_projects(
+    names: list[str] | None = None, sort: str = "activity", include_archived: bool = False
+) -> list[dict]:
+    """Projects with run counts and ``last_activity``; ``names`` restricts the result (``None`` = all).
+
+    ``sort``: ``activity`` (newest run activity first; projects without runs fall back to their
+    creation time) or ``name``. Archived projects are hidden unless ``include_archived``.
+    """
+    clauses: list[str] = []
+    params: list = []
     if names is not None:
         if not names:
             return []
-        where = f"WHERE p.name IN ({', '.join('?' * len(names))})"
-        params = list(names)
+        clauses.append(f"p.name IN ({', '.join('?' * len(names))})")
+        params += names
+    if not include_archived:
+        clauses.append("p.archived_at IS NULL")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    order = "p.name" if sort == "name" else "COALESCE(max(CASE WHEN r.archived_at IS NULL THEN r.updated_at END), p.created_at) DESC, p.name"
     with _lock:
         rows = get_conn().execute(
             f"""
-            SELECT p.name, p.visibility, p.created_at, p.created_by, COUNT(r.run_id)
+            SELECT p.name, p.visibility, p.created_at, p.created_by, COUNT(r.run_id), p.archived_at,
+                   max(CASE WHEN r.archived_at IS NULL THEN r.updated_at END),
+                   COUNT(CASE WHEN r.archived_at IS NOT NULL THEN 1 END)
             FROM projects p LEFT JOIN runs r ON r.project = p.name
             {where}
-            GROUP BY p.name, p.visibility, p.created_at, p.created_by
-            ORDER BY p.name
+            GROUP BY p.name, p.visibility, p.created_at, p.created_by, p.archived_at
+            ORDER BY {order}
             """,
             params,
         ).fetchall()
@@ -537,7 +757,8 @@ def db_create_project(name: str, visibility: str, created_by: str) -> dict | Non
     with _lock:
         conn = get_conn()
         inserted = conn.execute(
-            "INSERT INTO projects VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING name",
+            "INSERT INTO projects (name, visibility, created_at, created_by) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT DO NOTHING RETURNING name",
             [name, visibility, time.time(), created_by],
         ).fetchone()
     return db_get_project(name) if inserted else None
@@ -549,6 +770,28 @@ def db_set_project_visibility(name: str, visibility: str) -> bool:
             "UPDATE projects SET visibility = ? WHERE name = ? RETURNING name", [visibility, name]
         ).fetchone()
     return row is not None
+
+
+def db_set_project_archived(name: str, archived: bool) -> bool:
+    with _lock:
+        row = get_conn().execute(
+            "UPDATE projects SET archived_at = ? WHERE name = ? RETURNING name",
+            [time.time() if archived else None, name],
+        ).fetchone()
+    return row is not None
+
+
+def db_delete_project(name: str) -> dict:
+    """Remove a project row, its membership and the alert rules scoped to it (its runs must be gone
+    already; see ``db_delete_run``). Returns ``{"alert_rules": n}`` removed."""
+    with _lock:
+        conn = get_conn()
+        rule_ids = [r[0] for r in conn.execute("SELECT id FROM alert_rules WHERE project = ?", [name]).fetchall()]
+        for rid in rule_ids:
+            db_delete_alert_rule(rid)
+        conn.execute("DELETE FROM project_members WHERE project = ?", [name])
+        conn.execute("DELETE FROM projects WHERE name = ?", [name])
+    return {"alert_rules": len(rule_ids)}
 
 
 def db_get_members(project: str) -> list[str]:
@@ -598,7 +841,9 @@ def db_get_run(run_id: str) -> dict | None:
     db_mark_stale_runs()
     with _lock:
         conn = get_conn()
-        row = conn.execute("SELECT * FROM runs WHERE run_id = ?", [run_id]).fetchone()
+        row = conn.execute(
+            f"SELECT {', '.join(_DETAIL_COLS)} FROM runs WHERE run_id = ?", [run_id]
+        ).fetchone()
     if row is None:
         return None
     return _row_to_run_detail(row)
@@ -664,11 +909,12 @@ def db_heartbeat(run_id: str) -> None:
         get_conn().execute(
             """
             UPDATE runs SET last_heartbeat = ?,
+                updated_at = CASE WHEN status = 'crashed' THEN ? ELSE updated_at END,
                 status = CASE WHEN status = 'crashed' THEN 'running' ELSE status END,
                 finished_at = CASE WHEN status = 'crashed' THEN NULL ELSE finished_at END
             WHERE run_id = ?
             """,
-            [time.time(), run_id],
+            [time.time(), time.time(), run_id],
         )
 
 
@@ -682,8 +928,8 @@ def db_resume_run(run_id: str) -> dict:
         conn = get_conn()
         prev = conn.execute("SELECT status FROM runs WHERE run_id = ?", [run_id]).fetchone()[0]
         conn.execute(
-            "UPDATE runs SET status = 'running', finished_at = NULL, last_heartbeat = ? WHERE run_id = ?",
-            [time.time(), run_id],
+            "UPDATE runs SET status = 'running', finished_at = NULL, last_heartbeat = ?, updated_at = ? WHERE run_id = ?",
+            [time.time(), time.time(), run_id],
         )
         last_step = conn.execute("SELECT MAX(step) FROM metrics WHERE run_id = ?", [run_id]).fetchone()[0]
     run = db_get_run(run_id)
@@ -702,15 +948,28 @@ RUN_INFO_FIELDS = (
 )
 
 
+RUN_META_FIELDS = ("name", "tags", "run_group")  # organisation fields (rename / retag / regroup)
+
+
+def db_touch_run(run_id: str, ts: float | None = None) -> None:
+    """Stamp ``updated_at`` (called on every successful ingest)."""
+    with _lock:
+        get_conn().execute("UPDATE runs SET updated_at = ? WHERE run_id = ?", [ts or time.time(), run_id])
+
+
 def db_update_run(
-    run_id: str, status: str | None, notes: str | None, info: dict | None = None
+    run_id: str, status: str | None, notes: str | None, info: dict | None = None, meta: dict | None = None
 ) -> None:
-    """Update status / notes / hardware info. Setting ``running`` also counts as a heartbeat, so a
-    run revived by a status PATCH (or a resume) is not immediately swept back to ``crashed``."""
+    """Update status / notes / hardware info / name, tags, group. Setting ``running`` also counts as a
+    heartbeat, so a run revived by a status PATCH (or a resume) is not immediately swept back to
+    ``crashed``. Any change bumps ``updated_at``. ``meta`` keys: ``name``, ``tags`` (list), ``run_group``
+    (``None`` clears)."""
     with _lock:
         conn = get_conn()
+        now = time.time()
+        changed = False
         if status is not None:
-            now = time.time()
+            changed = True
             finished_at = now if status in TERMINAL_STATUSES else None
             if status == "running":
                 conn.execute(
@@ -723,13 +982,182 @@ def db_update_run(
                     [status, finished_at, run_id],
                 )
         if notes is not None:
-            conn.execute(
-                "UPDATE runs SET notes = ? WHERE run_id = ?",
-                [notes, run_id],
-            )
+            changed = True
+            conn.execute("UPDATE runs SET notes = ? WHERE run_id = ?", [notes, run_id])
         for col, val in (info or {}).items():
             if col in RUN_INFO_FIELDS and val is not None:  # whitelist: the column name is interpolated
+                changed = True
                 conn.execute(f"UPDATE runs SET {col} = ? WHERE run_id = ?", [val, run_id])
+        for col, val in (meta or {}).items():
+            if col in RUN_META_FIELDS:
+                changed = True
+                conn.execute(
+                    f"UPDATE runs SET {col} = ? WHERE run_id = ?",
+                    [json.dumps(val) if col == "tags" else val, run_id],
+                )
+        if changed:
+            conn.execute("UPDATE runs SET updated_at = ? WHERE run_id = ?", [now, run_id])
+
+
+def db_set_run_archived(run_id: str, archived: bool) -> bool:
+    """Archive/unarchive a run. ``False`` if it does not exist. Archiving also bumps ``updated_at``."""
+    with _lock:
+        row = get_conn().execute(
+            "UPDATE runs SET archived_at = ?, updated_at = ? WHERE run_id = ? RETURNING run_id",
+            [time.time() if archived else None, time.time(), run_id],
+        ).fetchone()
+    return row is not None
+
+
+def db_move_run(run_id: str, project: str) -> bool:
+    with _lock:
+        row = get_conn().execute(
+            "UPDATE runs SET project = ?, updated_at = ? WHERE run_id = ? RETURNING run_id",
+            [project, time.time(), run_id],
+        ).fetchone()
+    return row is not None
+
+
+# Every table with a ``run_id`` column except ``runs`` itself: everything a hard delete must clear.
+RUN_CHILD_TABLES = (
+    "metrics", "profile_events", "system_snapshots", "param_stats", "events", "logs", "artifacts",
+    "media", "samples", "seen_batches", "run_summaries", "alert_violations", "alert_sent", "pinned_runs",
+)
+
+
+def _remove_media_dir(run_id: str) -> None:
+    if run_id and "/" not in run_id and "\\" not in run_id and run_id not in (".", ".."):
+        shutil.rmtree(media_root() / run_id, ignore_errors=True)
+
+
+def db_delete_run(run_id: str) -> bool:
+    """Hard-delete a run: its row, every child table (incl. seen batch ids, samples, summaries, alert
+    state, pins) and its media files on disk. ``False`` if it did not exist."""
+    with _lock:
+        conn = get_conn()
+        exists = conn.execute("SELECT 1 FROM runs WHERE run_id = ?", [run_id]).fetchone() is not None
+        for table in RUN_CHILD_TABLES:
+            conn.execute(f"DELETE FROM {table} WHERE run_id = ?", [run_id])
+        conn.execute("DELETE FROM runs WHERE run_id = ?", [run_id])
+        _remove_media_dir(run_id)
+    return exists
+
+
+def db_list_run_ids(project: str) -> list[str]:
+    with _lock:
+        return [r[0] for r in get_conn().execute("SELECT run_id FROM runs WHERE project = ?", [project]).fetchall()]
+
+
+def db_list_groups(project: str, include_archived: bool = False) -> list[dict]:
+    """Groups of a project (``init(group=...)``), most recently active first."""
+    where = "" if include_archived else " AND archived_at IS NULL"
+    with _lock:
+        rows = get_conn().execute(
+            "SELECT run_group, count(*), max(COALESCE(updated_at, created_at)), min(created_at), "
+            "count(CASE WHEN status = 'running' THEN 1 END) FROM runs "
+            f"WHERE project = ? AND run_group IS NOT NULL{where} GROUP BY run_group "
+            "ORDER BY max(COALESCE(updated_at, created_at)) DESC, run_group",
+            [project],
+        ).fetchall()
+    return [
+        {"group": r[0], "runs": r[1], "last_activity": _ts_to_iso(r[2]), "first_created": _ts_to_iso(r[3]), "running": r[4]}
+        for r in rows
+    ]
+
+
+# --- pins ------------------------------------------------------------------
+
+def db_pin_run(username: str, run_id: str) -> None:
+    with _lock:
+        get_conn().execute(
+            "INSERT INTO pinned_runs VALUES (?, ?, ?) ON CONFLICT DO NOTHING", [username, run_id, time.time()]
+        )
+
+
+def db_unpin_run(username: str, run_id: str) -> None:
+    with _lock:
+        get_conn().execute("DELETE FROM pinned_runs WHERE username = ? AND run_id = ?", [username, run_id])
+
+
+def db_pinned_run_ids(username: str) -> list[str]:
+    """The user's pinned run ids, most recently pinned first."""
+    with _lock:
+        rows = get_conn().execute(
+            "SELECT run_id FROM pinned_runs WHERE username = ? ORDER BY pinned_at DESC", [username]
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def db_is_pinned(username: str, run_id: str) -> bool:
+    with _lock:
+        return get_conn().execute(
+            "SELECT 1 FROM pinned_runs WHERE username = ? AND run_id = ?", [username, run_id]
+        ).fetchone() is not None
+
+
+# ---------------------------------------------------------------------------
+# Read-side downsampling (min/max/first/last per bucket, so spikes survive)
+# ---------------------------------------------------------------------------
+
+MIN_POINTS, MAX_POINTS_CAP = 8, 100_000
+
+
+def clamp_max_points(n: int) -> int:
+    return max(MIN_POINTS, min(int(n), MAX_POINTS_CAP))
+
+
+def _range_where(
+    axis_step: bool, step_min: int | None, step_max: int | None, t_min: float | None, t_max: float | None
+) -> tuple[str, list]:
+    """``AND ...`` fragment limiting rows to the requested step and/or time window."""
+    sql, params = "", []
+    for cond, col, val in (
+        (axis_step and step_min is not None, "step >= ?", step_min),
+        (axis_step and step_max is not None, "step <= ?", step_max),
+        (t_min is not None, "timestamp >= ?", t_min),
+        (t_max is not None, "timestamp <= ?", t_max),
+    ):
+        if cond:
+            sql += f" AND {col}"
+            params.append(val)
+    return sql, params
+
+
+def _query_series(
+    conn, table: str, cols: list[str], where: str, params: list, part: str, axis: str,
+    orderings: list[str], order_by: str, max_points: int | None,
+) -> tuple[list[tuple], int]:
+    """Rows of ``table`` matching ``where``; with ``max_points``, at most about that many per series.
+
+    A series (``part`` expression, e.g. the metric name) with <= ``max_points`` rows is returned whole.
+    A longer one is cut into ``max_points // len(orderings)`` equal-width buckets along ``axis`` and from each
+    bucket the rows winning each of ``orderings`` (e.g. ``value DESC`` = the bucket's peak) are kept, so a
+    one-step spike is never averaged away. Everything is one windowed scan in SQL. Returns
+    ``(rows, total_rows_before_downsampling)``; ``cols`` are plain column names or ``expr AS alias``.
+    """
+    names = [c.split(" AS ")[-1] for c in cols]
+    total = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}", params).fetchone()[0]
+    if max_points is None or total <= max_points:
+        rows = conn.execute(f"SELECT {', '.join(cols)} FROM {table} WHERE {where} ORDER BY {order_by}", params).fetchall()
+        return rows, total
+    nb = max(1, max_points // len(orderings))
+    ranks = ", ".join(f"row_number() OVER (PARTITION BY _p, _b ORDER BY {o}) AS _r{i}" for i, o in enumerate(orderings))
+    keep = " OR ".join(f"_r{i} = 1" for i in range(len(orderings)))
+    sql = f"""
+        WITH base AS (
+            SELECT {', '.join(cols)}, {part} AS _p, {axis} AS _x FROM {table} WHERE {where}
+        ), win AS (
+            SELECT *, count(*) OVER (PARTITION BY _p) AS _c,
+                   min(_x) OVER (PARTITION BY _p) AS _lo, max(_x) OVER (PARTITION BY _p) AS _hi
+            FROM base
+        ), bk AS (
+            SELECT *, CASE WHEN _hi > _lo
+                THEN least({nb - 1}, CAST(floor((_x - _lo)::DOUBLE / (_hi - _lo) * {nb}) AS INTEGER)) ELSE 0 END AS _b
+            FROM win
+        ), rk AS (SELECT *, {ranks} FROM bk)
+        SELECT {', '.join(names)} FROM rk WHERE _c <= {int(max_points)} OR {keep} ORDER BY {order_by}
+    """
+    return conn.execute(sql, params).fetchall(), total
 
 
 # ---------------------------------------------------------------------------
@@ -753,43 +1181,72 @@ def db_release_batch(run_id: str, batch_id: str) -> None:
         get_conn().execute("DELETE FROM seen_batches WHERE run_id = ? AND batch_id = ?", [run_id, batch_id])
 
 
-def _delete_keys(conn, table: str, run_id: str, name_col: str, keys: list[tuple[str, int]]) -> None:
-    """Delete the rows of ``run_id`` whose (``name_col``, step) is in ``keys`` (``table``/``name_col`` are constants).
+def _replace_newer(conn, table: str, run_id: str, name_col: str, rows: dict[tuple[str, int], tuple], ts_pos: int) -> list[tuple]:
+    """Last write wins per (run, ``name_col``, step), judged by the client timestamp.
 
-    One statement for the whole batch. Skipped when the run has nothing at or after the batch's
-    first step, which is the normal case for a run that only moves forward (DuckDB answers that
-    from its per-row-group min/max statistics without reading the data).
+    ``rows`` maps (name, step) to the row tuple to insert (its timestamp is at ``ts_pos``). An existing
+    row with the same key is replaced only if the incoming timestamp is >= its own, so a very late replay
+    cannot overwrite newer values. Returns the rows to insert (those not beaten by a newer stored row)
+    after deleting the superseded ones (``table``/``name_col`` are constants, never user input).
+
+    Skipped, via DuckDB's per-row-group min/max statistics, when the run has nothing at or after the
+    batch's first step: the normal case for a run that only moves forward.
     """
-    if not keys:
-        return
-    first = min(k[1] for k in keys)
+    if not rows:
+        return []
+    first = min(k[1] for k in rows)
     if conn.execute(f"SELECT 1 FROM {table} WHERE run_id = ? AND step >= ? LIMIT 1", [run_id, first]).fetchone() is None:
-        return
-    conn.execute(
-        f"DELETE FROM {table} WHERE run_id = ? AND ({name_col}, step) IN "
-        "(SELECT n, s FROM (SELECT unnest(?::VARCHAR[]) AS n, unnest(?::INTEGER[]) AS s))",
+        return list(rows.values())
+    keys = list(rows)
+    existing = conn.execute(
+        f"SELECT {name_col}, step, max(timestamp) FROM {table} WHERE run_id = ? AND ({name_col}, step) IN "
+        "(SELECT n, s FROM (SELECT unnest(?::VARCHAR[]) AS n, unnest(?::INTEGER[]) AS s)) GROUP BY 1, 2",
         [run_id, [k[0] for k in keys], [k[1] for k in keys]],
-    )
+    ).fetchall()
+    newest = {(n, st): ts for n, st, ts in existing}
+    keep, drop = [], []
+    for key, row in rows.items():
+        old = newest.get(key)
+        if old is None:
+            keep.append(row)
+        elif row[ts_pos] >= old:
+            keep.append(row)
+            drop.append(key)
+    if drop:
+        conn.execute(
+            f"DELETE FROM {table} WHERE run_id = ? AND ({name_col}, step) IN "
+            "(SELECT n, s FROM (SELECT unnest(?::VARCHAR[]) AS n, unnest(?::INTEGER[]) AS s))",
+            [run_id, [k[0] for k in drop], [k[1] for k in drop]],
+        )
+    return keep
+
+
+def _newest_per_key(rows: list[tuple], key_of, ts_of) -> dict:
+    """Collapse a batch to one row per key: the highest timestamp wins, arrival order breaks ties."""
+    out: dict = {}
+    for r in rows:
+        k = key_of(r)
+        if k not in out or ts_of(r) >= ts_of(out[k]):
+            out[k] = r
+    return out
 
 
 def db_insert_metrics(run_id: str, metrics: list[dict]) -> int:
-    """Store metric points, last write wins per (run, name, step).
+    """Store metric points, last write wins per (run, name, step) by client timestamp.
 
     A resumed run that logs a step again (or a replayed spool) replaces the earlier value instead of
-    duplicating it: the batch is collapsed to its newest point per key (arrival order), existing rows
-    with the same keys are deleted, then the batch is inserted. Deduping on write keeps every read
-    (charts, summaries, alerts) a plain scan. Returns the number of points stored. Rows duplicated
-    before this existed are not repaired.
+    duplicating it, unless the stored value carries a newer timestamp (a late replay must not clobber
+    fresher data). Deduping on write keeps every read (charts, summaries, alerts) a plain scan.
+    Returns the number of points stored.
     """
-    latest: dict[tuple[str, int], dict] = {}
-    for m in metrics:
-        latest[(m["name"], m["step"])] = m
-    rows = [(run_id, m["step"], m["timestamp"], m["name"], m["value"]) for m in latest.values()]
+    rows = [(run_id, m["step"], m["timestamp"], m["name"], m["value"]) for m in metrics]
+    latest = _newest_per_key(rows, lambda r: (r[3], r[1]), lambda r: r[2])
     with _lock:
         conn = get_conn()
-        _delete_keys(conn, "metrics", run_id, "name", list(latest))
-        conn.executemany("INSERT INTO metrics VALUES (?, ?, ?, ?, ?)", rows)
-    return len(rows)
+        keep = _replace_newer(conn, "metrics", run_id, "name", latest, 2)
+        if keep:
+            conn.executemany("INSERT INTO metrics VALUES (?, ?, ?, ?, ?)", keep)
+    return len(keep)
 
 
 def db_recent_metrics(run_id: str, limit: int = 100) -> dict[str, list[float]]:
@@ -810,22 +1267,34 @@ def db_recent_metrics(run_id: str, limit: int = 100) -> dict[str, list[float]]:
     return out
 
 
-def db_get_metrics(run_id: str, name: str | None = None) -> list[dict]:
+def db_get_metrics(
+    run_id: str,
+    name: str | None = None,
+    max_points: int | None = None,
+    step_min: int | None = None,
+    step_max: int | None = None,
+    t_min: float | None = None,
+    t_max: float | None = None,
+    with_total: bool = False,
+):
+    """Metric points ordered by step. ``name`` limits to one metric; ``step_*``/``t_*`` select a window
+    (zoom). ``max_points`` downsamples each metric independently (see ``_query_series``: per bucket the
+    min, max, first and last point). ``with_total`` returns ``(rows, points_in_window)``."""
+    where, params = "run_id = ?", [run_id]
+    if name:
+        where += " AND name = ?"
+        params.append(name)
+    frag, extra = _range_where(True, step_min, step_max, t_min, t_max)
+    where += frag
+    params += extra
     with _lock:
-        conn = get_conn()
-        if name:
-            rows = conn.execute(
-                "SELECT step, timestamp, name, value FROM metrics "
-                "WHERE run_id = ? AND name = ? ORDER BY step",
-                [run_id, name],
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT step, timestamp, name, value FROM metrics "
-                "WHERE run_id = ? ORDER BY step",
-                [run_id],
-            ).fetchall()
-    return [{"step": r[0], "timestamp": r[1], "name": r[2], "value": r[3]} for r in rows]
+        rows, total = _query_series(
+            get_conn(), "metrics", ["step", "timestamp", "name", "value"], where, params, "name", "step",
+            ["value ASC, step", "value DESC, step", "step ASC", "step DESC"], "step, name",
+            None if max_points is None else clamp_max_points(max_points),
+        )
+    out = [{"step": r[0], "timestamp": r[1], "name": r[2], "value": r[3]} for r in rows]
+    return (out, total) if with_total else out
 
 
 def db_get_metric_names(run_id: str) -> list[str]:
@@ -948,29 +1417,39 @@ def db_gpu_count(run_id: str) -> int:
     return int(row[0]) if row else 0
 
 
-def db_get_system_snapshots(run_id: str) -> list[dict]:
-    with _lock:
-        conn = get_conn()
-        rows = conn.execute(
-            """
-            SELECT timestamp, gpu_utilization, memory_used, memory_total,
-                   temperature, power_draw, fan_speed, sm_clock_mhz, memory_clock_mhz,
-                   process_memory_used, process_exclusive,
-                   attributed_utilization, attributed_power, COALESCE(gpu_index, 0)
-            FROM system_snapshots
-            WHERE run_id = ?
-            ORDER BY timestamp, 14
-            """,
-            [run_id],
-        ).fetchall()
+_SYSTEM_COLS = [
+    "timestamp", "gpu_utilization", "memory_used", "memory_total",
+    "temperature", "power_draw", "fan_speed", "sm_clock_mhz", "memory_clock_mhz",
+    "process_memory_used", "process_exclusive",
+    "attributed_utilization", "attributed_power", "COALESCE(gpu_index, 0) AS gpu_index",
+]
 
-    cols = [
-        "timestamp", "gpu_utilization", "memory_used", "memory_total",
-        "temperature", "power_draw", "fan_speed", "sm_clock_mhz", "memory_clock_mhz",
-        "process_memory_used", "process_exclusive",
-        "attributed_utilization", "attributed_power", "gpu_index",
-    ]
-    return [dict(zip(cols, r)) for r in rows]
+
+def db_get_system_snapshots(
+    run_id: str,
+    max_points: int | None = None,
+    t_min: float | None = None,
+    t_max: float | None = None,
+    with_total: bool = False,
+):
+    """System snapshots ordered by time then GPU. ``t_min``/``t_max`` select a window; ``max_points``
+    downsamples each GPU's series: per time bucket the first and last snapshot plus the ones with the
+    peak utilization, lowest utilization, peak memory and peak temperature."""
+    where, params = "run_id = ?", [run_id]
+    frag, extra = _range_where(False, None, None, t_min, t_max)
+    where += frag
+    params += extra
+    with _lock:
+        rows, total = _query_series(
+            get_conn(), "system_snapshots", _SYSTEM_COLS, where, params, "COALESCE(gpu_index, 0)", "timestamp",
+            ["timestamp ASC", "timestamp DESC", "gpu_utilization DESC NULLS LAST, timestamp",
+             "gpu_utilization ASC NULLS LAST, timestamp", "memory_used DESC NULLS LAST, timestamp",
+             "temperature DESC NULLS LAST, timestamp"],
+            "timestamp, gpu_index", None if max_points is None else clamp_max_points(max_points),
+        )
+    cols = [c.split(" AS ")[-1] for c in _SYSTEM_COLS]
+    out = [dict(zip(cols, r)) for r in rows]
+    return (out, total) if with_total else out
 
 
 # ---------------------------------------------------------------------------
@@ -1005,41 +1484,51 @@ def db_insert_param_stats(run_id: str, stats: list[dict]) -> int:
         )
         for s in stats
     ]
-    # Last write wins per (run, param_name, step), like metrics.
-    rows = list({(r[3], r[1]): r for r in rows}.values())
+    # Last write wins per (run, param_name, step) by client timestamp, like metrics.
+    latest = _newest_per_key(rows, lambda r: (r[3], r[1]), lambda r: r[2])
     with _lock:
         conn = get_conn()
-        _delete_keys(conn, "param_stats", run_id, "param_name", [(r[3], r[1]) for r in rows])
-        conn.executemany(
-            "INSERT INTO param_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+        keep = _replace_newer(conn, "param_stats", run_id, "param_name", latest, 2)
+        if keep:
+            conn.executemany(
+                "INSERT INTO param_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", keep
+            )
+    return len(keep)
+
+
+def db_get_param_stats(
+    run_id: str,
+    param_name: str | None = None,
+    max_points: int | None = None,
+    step_min: int | None = None,
+    step_max: int | None = None,
+    t_min: float | None = None,
+    t_max: float | None = None,
+    with_total: bool = False,
+):
+    """Param stats ordered by parameter then step. Windows and ``max_points`` as for ``db_get_metrics``;
+    downsampling is per parameter and keeps, per bucket, the first and last step and the steps with
+    the peak gradient norm and peak weight norm."""
+    where, params = "run_id = ?", [run_id]
+    if param_name:
+        where += " AND param_name = ?"
+        params.append(param_name)
+    frag, extra = _range_where(True, step_min, step_max, t_min, t_max)
+    where += frag
+    params += extra
+    with _lock:
+        rows, total = _query_series(
+            get_conn(), "param_stats", _PARAM_STAT_COLS, where, params, "param_name", "step",
+            ["step ASC", "step DESC", "grad_norm DESC NULLS LAST, step", "weight_norm DESC NULLS LAST, step"],
+            "param_name, step", None if max_points is None else clamp_max_points(max_points),
         )
-    return len(rows)
-
-
-def db_get_param_stats(run_id: str, param_name: str | None = None) -> list[dict]:
-    with _lock:
-        conn = get_conn()
-        if param_name:
-            rows = conn.execute(
-                "SELECT step, timestamp, param_name, grad_norm, grad_min, grad_max, grad_mean, "
-                "weight_norm, weight_min, weight_max, weight_mean, grad_histogram, weight_histogram "
-                "FROM param_stats WHERE run_id = ? AND param_name = ? ORDER BY step",
-                [run_id, param_name],
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT step, timestamp, param_name, grad_norm, grad_min, grad_max, grad_mean, "
-                "weight_norm, weight_min, weight_max, weight_mean, grad_histogram, weight_histogram "
-                "FROM param_stats WHERE run_id = ? ORDER BY param_name, step",
-                [run_id],
-            ).fetchall()
     result = []
     for r in rows:
         d = dict(zip(_PARAM_STAT_COLS, r))
         d["grad_histogram"] = _parse_json(d["grad_histogram"]) or []
         d["weight_histogram"] = _parse_json(d["weight_histogram"]) or []
         result.append(d)
-    return result
+    return (result, total) if with_total else result
 
 
 def db_get_param_stat_names(run_id: str) -> list[str]:
@@ -1169,40 +1658,74 @@ def db_get_artifacts(run_id: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def db_insert_media(run_id: str, item: dict) -> None:
-    """Store a media item; replaces an earlier one with the same (run, name, step)."""
+    """Store a media item; replaces an earlier one with the same (run, name, step) unless that one
+    carries a newer client timestamp. Image/figure payloads (base64 PNG) are written to
+    ``<media root>/<run_id>/`` and only their path is kept in the table; anything else (histogram JSON,
+    or a payload that is not valid base64) stays in the ``data`` column."""
+    path, data = None, item["data"]
+    if item["media_type"] in MEDIA_FILE_TYPES:
+        raw = _decode_b64(data)
+        if raw is not None:
+            path, data = _media_relpath(run_id, item["name"], item["step"]), None
+    row = (run_id, item["step"], item["timestamp"], item["name"], item["media_type"], data, path)
     with _lock:
         conn = get_conn()
-        _delete_keys(conn, "media", run_id, "name", [(item["name"], item["step"])])
-        conn.execute(
-            "INSERT INTO media VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                run_id,
-                item["step"],
-                item["timestamp"],
-                item["name"],
-                item["media_type"],
-                item["data"],
-            ],
-        )
+        keep = _replace_newer(conn, "media", run_id, "name", {(item["name"], item["step"]): row}, 2)
+        if keep:
+            if path is not None:
+                _write_media_file(path, raw)
+            conn.execute("INSERT INTO media VALUES (?, ?, ?, ?, ?, ?, ?)", row)
 
 
-def db_get_media(run_id: str, name: str | None = None) -> list[dict]:
+def _media_rows(rows: list[tuple], run_id: str, inline: bool) -> list[dict]:
+    out = []
+    for step, ts, name, mtype, data, path in rows:
+        item = {"step": step, "timestamp": ts, "name": name, "media_type": mtype, "data": data,
+                "url": None}
+        if path is not None:
+            item["url"] = f"/runs/{run_id}/media/file?name={_urlquote(name)}&step={step}"
+            if inline:
+                try:
+                    item["data"] = base64.b64encode((media_root() / path).read_bytes()).decode()
+                except OSError:
+                    item["data"] = None  # file lost (manual cleanup): metadata is still listed
+            else:
+                item["data"] = None
+        out.append(item)
+    return out
+
+
+def db_get_media(run_id: str, name: str | None = None, inline: bool = True) -> list[dict]:
+    """Media items of a run. File-backed images/figures carry a ``url`` (see ``GET /runs/{id}/media/file``);
+    ``inline`` (default, backward compatible) also returns their base64 ``data``, ``False`` omits it."""
     with _lock:
         conn = get_conn()
         if name:
             rows = conn.execute(
-                "SELECT step, timestamp, name, media_type, data "
+                "SELECT step, timestamp, name, media_type, data, path "
                 "FROM media WHERE run_id = ? AND name = ? ORDER BY step",
                 [run_id, name],
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT step, timestamp, name, media_type, data "
+                "SELECT step, timestamp, name, media_type, data, path "
                 "FROM media WHERE run_id = ? ORDER BY name, step",
                 [run_id],
             ).fetchall()
-    cols = ["step", "timestamp", "name", "media_type", "data"]
-    return [dict(zip(cols, r)) for r in rows]
+    return _media_rows(rows, run_id, inline)
+
+
+def db_get_media_file(run_id: str, name: str, step: int) -> Path | None:
+    """Disk path of a stored image/figure, or ``None`` (unknown item, or payload kept inline)."""
+    with _lock:
+        row = get_conn().execute(
+            "SELECT path FROM media WHERE run_id = ? AND name = ? AND step = ? AND path IS NOT NULL",
+            [run_id, name, step],
+        ).fetchone()
+    if row is None:
+        return None
+    path = media_root() / row[0]
+    return path if path.is_file() else None
 
 
 def db_get_media_names(run_id: str) -> list[str]:
@@ -1235,6 +1758,11 @@ def db_insert_samples(
     with _lock:
         conn = get_conn()
         if mode == "replace":
+            newest = conn.execute(
+                "SELECT max(timestamp) FROM samples WHERE run_id = ? AND name = ? AND step = ?", [run_id, name, step]
+            ).fetchone()[0]
+            if newest is not None and newest > timestamp:
+                return 0  # a late replay must not overwrite newer samples
             conn.execute("DELETE FROM samples WHERE run_id = ? AND name = ? AND step = ?", [run_id, name, step])
             start = 0
         else:
@@ -1499,9 +2027,11 @@ def db_compute_run_summary(run_id: str) -> dict | None:
         "efficiency_details": {k: round(v, 3) for k, v in efficiency_details.items()},
     }
 
-    # Upsert
+    # Upsert (unless the run was hard-deleted while this was computing: that must leave no row behind)
     with _lock:
         conn = get_conn()
+        if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", [run_id]).fetchone() is None:
+            return None
         conn.execute("DELETE FROM run_summaries WHERE run_id = ?", [run_id])
         conn.execute(
             "INSERT INTO run_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1555,7 +2085,7 @@ def db_get_run_summary(run_id: str) -> dict | None:
 # Alert rules
 # ---------------------------------------------------------------------------
 
-_ALERT_COLS = "id, name, url, format, project, enabled, created_at, created_by, triggers, kind, min_severity, metric, op, threshold"
+_ALERT_COLS = "id, name, url, format, project, enabled, created_at, created_by, triggers, kind, min_severity, metric, op, threshold, updated_at"
 
 
 def _row_to_alert_rule(r: tuple) -> dict:
@@ -1565,13 +2095,14 @@ def _row_to_alert_rule(r: tuple) -> dict:
     return {
         "id": r[0], "name": r[1], "url": r[2], "format": r[3], "project": r[4],
         "enabled": bool(r[5]), "created_at": r[6], "created_by": r[7], "triggers": triggers,
+        "updated_at": r[14] if r[14] is not None else r[6],
     }
 
 
 def db_list_alert_rules() -> list[dict]:
     """All alert rules, including the (secret) webhook ``url``. Callers must mask it."""
     with _lock:
-        rows = get_conn().execute(f"SELECT {_ALERT_COLS} FROM alert_rules ORDER BY created_at").fetchall()
+        rows = get_conn().execute(f"SELECT {_ALERT_COLS} FROM alert_rules ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC").fetchall()
     return [_row_to_alert_rule(r) for r in rows]
 
 
@@ -1585,10 +2116,10 @@ def db_create_alert_rule(rule: dict, created_by: str) -> dict:
     rule_id = uuid.uuid4().hex[:12]
     with _lock:
         get_conn().execute(
-            "INSERT INTO alert_rules (id, name, url, format, project, enabled, created_at, created_by, triggers) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO alert_rules (id, name, url, format, project, enabled, created_at, created_by, triggers, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [rule_id, rule["name"], rule["url"], rule["format"], rule.get("project"),
-             rule.get("enabled", True), time.time(), created_by, json.dumps(rule["triggers"])],
+             rule.get("enabled", True), time.time(), created_by, json.dumps(rule["triggers"]), time.time()],
         )
     return db_get_alert_rule(rule_id)
 
@@ -1604,8 +2135,8 @@ def db_update_alert_rule(rule_id: str, fields: dict) -> bool:
         if cols:
             values = [json.dumps(fields[c]) if c == "triggers" else fields[c] for c in cols]
             conn.execute(
-                f"UPDATE alert_rules SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
-                values + [rule_id],
+                f"UPDATE alert_rules SET {', '.join(c + ' = ?' for c in cols)}, updated_at = ? WHERE id = ?",
+                values + [time.time(), rule_id],
             )
     return True
 
@@ -1630,7 +2161,9 @@ def db_matching_alert_rules(project: str | None) -> list[dict]:
     return [_row_to_alert_rule(r) for r in rows]
 
 
-def db_alert_acquire(rule_id: str, dkey: str, window_s: float, per_minute: int, now: float | None = None) -> str:
+def db_alert_acquire(
+    rule_id: str, dkey: str, window_s: float, per_minute: int, now: float | None = None, run_id: str | None = None
+) -> str:
     """Decide whether an alert may be sent and record it, atomically.
 
     Returns ``"ok"`` (recorded: send it), ``"dup"`` (the same ``dkey`` was sent within ``window_s``) or
@@ -1649,7 +2182,7 @@ def db_alert_acquire(rule_id: str, dkey: str, window_s: float, per_minute: int, 
         ).fetchone()[0]
         if recent >= per_minute:
             return "rate"
-        conn.execute("INSERT INTO alert_sent VALUES (?, ?, ?)", [rule_id, dkey, now])
+        conn.execute("INSERT INTO alert_sent (rule_id, dkey, sent_at, run_id) VALUES (?, ?, ?, ?)", [rule_id, dkey, now, run_id])
     return "ok"
 
 
@@ -1691,3 +2224,126 @@ def db_get_run_for_alert(run_id: str) -> dict | None:
     with _lock:
         row = get_conn().execute("SELECT run_id, name, project FROM runs WHERE run_id = ?", [run_id]).fetchone()
     return {"run_id": row[0], "name": row[1] or row[0], "project": row[2]} if row else None
+
+
+# ---------------------------------------------------------------------------
+# Retention (optional per-project policy; off by default)
+# ---------------------------------------------------------------------------
+
+# Tables a policy may thin out by age (``timestamp`` < now - N days). ``runs`` is never touched;
+# ``metrics`` is deletable only when a policy names it explicitly.
+RETENTION_TABLES = (
+    "system_snapshots", "logs", "profile_events", "param_stats", "events", "artifacts", "media", "samples", "metrics",
+)
+
+
+def validate_retention(policy: object) -> dict:
+    """Normalise ``{"older_than_days": {table: days}}``; ``ValueError`` on anything else."""
+    if not isinstance(policy, dict) or set(policy) - {"older_than_days"}:
+        raise ValueError('retention must look like {"older_than_days": {"system_snapshots": 30}}')
+    days = policy.get("older_than_days") or {}
+    if not isinstance(days, dict):
+        raise ValueError("older_than_days must be an object mapping table -> days")
+    clean: dict[str, float] = {}
+    for table, n in days.items():
+        if table not in RETENTION_TABLES:
+            raise ValueError(f"unknown retention table {table!r}; choose from {', '.join(RETENTION_TABLES)}")
+        if isinstance(n, bool) or not isinstance(n, (int, float)) or not 0 < n <= 36500:
+            raise ValueError(f"days for {table} must be a number between 0 and 36500")
+        clean[table] = n
+    return {"older_than_days": clean}
+
+
+def db_set_project_retention(name: str, policy: dict | None) -> bool:
+    """Set (or with ``None``/empty clear) a project's retention policy."""
+    clean = validate_retention(policy) if policy else {"older_than_days": {}}
+    value = json.dumps(clean) if clean["older_than_days"] else None
+    with _lock:
+        row = get_conn().execute(
+            "UPDATE projects SET retention = ? WHERE name = ? RETURNING name", [value, name]
+        ).fetchone()
+    return row is not None
+
+
+def db_apply_retention(project: str | None = None, now: float | None = None) -> dict[str, dict[str, int]]:
+    """Delete rows older than each project's policy (all projects with one, or just ``project``).
+
+    Returns ``{project: {table: rows_deleted}}`` for what was removed. Media files of deleted media rows
+    go too. Only the tables a policy names are touched.
+    """
+    now = time.time() if now is None else now
+    out: dict[str, dict[str, int]] = {}
+    with _lock:
+        conn = get_conn()
+        where, params = "retention IS NOT NULL", []
+        if project is not None:
+            where += " AND name = ?"
+            params.append(project)
+        for name, raw in conn.execute(f"SELECT name, retention FROM projects WHERE {where}", params).fetchall():
+            try:
+                policy = validate_retention(_parse_json(raw))
+            except ValueError:
+                continue
+            for table, days in policy["older_than_days"].items():
+                cutoff = now - float(days) * 86400
+                sub = "timestamp < ? AND run_id IN (SELECT run_id FROM runs WHERE project = ?)"
+                if table == "media":
+                    for (rel,) in conn.execute(
+                        f"SELECT path FROM media WHERE {sub} AND path IS NOT NULL", [cutoff, name]
+                    ).fetchall():
+                        try:
+                            (media_root() / rel).unlink()
+                        except OSError:
+                            pass
+                n = conn.execute(f"DELETE FROM {table} WHERE {sub}", [cutoff, name]).fetchone()[0]
+                if n:
+                    out.setdefault(name, {})[table] = int(n)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Export (Parquet)
+# ---------------------------------------------------------------------------
+
+EXPORT_TABLES = (
+    "metrics", "system_snapshots", "param_stats", "profile_events", "events", "logs", "artifacts",
+    "media", "samples", "run_summaries",
+)
+
+
+def _sql_str(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def db_export_parquet(dest: Path, run_id: str | None = None, project: str | None = None) -> dict[str, int]:
+    """Write one Parquet file per table (``runs`` plus ``EXPORT_TABLES``) for a run or a whole project.
+
+    Returns ``{table: rows}``. Runs under the lock with DuckDB ``COPY``; ``dest`` must exist. Credentials,
+    alert rules and the dedupe table are never exported. File-backed media is described by its ``path``
+    column (relative to the media directory); the caller adds the files themselves.
+    """
+    assert (run_id is None) != (project is None)
+    if run_id is not None:
+        runs_where = f"run_id = {_sql_str(run_id)}"
+    else:
+        runs_where = f"project = {_sql_str(project)}"
+    counts: dict[str, int] = {}
+    with _lock:
+        conn = get_conn()
+        for table in ("runs", *EXPORT_TABLES):
+            where = runs_where if table == "runs" else f"run_id IN (SELECT run_id FROM runs WHERE {runs_where})"
+            target = _sql_str(str(dest / f"{table}.parquet"))
+            conn.execute(f"COPY (SELECT * FROM {table} WHERE {where}) TO {target} (FORMAT PARQUET)")
+            counts[table] = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}").fetchone()[0]
+    return counts
+
+
+def db_export_media_files(run_ids: list[str]) -> list[tuple[Path, str]]:
+    """``(disk path, relative path)`` of every stored media file of ``run_ids`` (for the export zip)."""
+    if not run_ids:
+        return []
+    with _lock:
+        rows = get_conn().execute(
+            "SELECT path FROM media WHERE path IS NOT NULL AND run_id IN (SELECT unnest(?::VARCHAR[]))", [run_ids]
+        ).fetchall()
+    return [(media_root() / r[0], r[0]) for r in rows if (media_root() / r[0]).is_file()]

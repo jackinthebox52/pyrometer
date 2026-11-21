@@ -50,6 +50,7 @@ def main() -> None:
             "seed": SEED,
         },
         tags=["synthetic", "mlp", "baseline"],
+        group="synthetic-baselines",  # groups related runs; filter by it in the dashboard
         resume=args.resume,
     )
     print(f"Run ID: {run.run_id}" + (f" (resumed after step {run.last_step})" if run.resumed else ""))

@@ -56,6 +56,7 @@ run = pyrometer.init(
 | `api_key` | `str \| None` | `$PYROMETER_API_KEY` | API key (create one in the dashboard under **API keys**, or `pyrometer keys create`). Not needed against a `--no-auth` local server. Prefer the environment variable so the key stays out of source control. |
 
 | `project` | `str \| None` | `None` | Project for the run. A global key registers an unknown project as public on first use; a project key defaults to its own project; otherwise runs go to the public `default` project. |
+| `group` | `str \| None` | `$PYROMETER_GROUP` | Name of the experiment or sweep the run belongs to (max 128 chars), e.g. `group="lr-sweep"`. The server lists a project's groups (`GET /projects/{name}/groups`) and filters runs by group (`GET /runs?group=`). Not changed by `resume`. |
 | `offline` | `bool \| None` | `$PYROMETER_MODE == "offline"` | Record to the local spool without touching the network (including run creation); upload later with `pyrometer sync`. See [Durable delivery](#durable-delivery-offline-mode-and-pyrometer-sync). |
 | `resume` | `str \| None` | `$PYROMETER_RUN_ID` implies `"auto"` | Continue an existing run: a run id, or `"auto"` (use `$PYROMETER_RUN_ID`; resume if it exists, create it with that id otherwise). See [Resuming a run](#resuming-a-run). |
 | `anomaly_detection` | `bool \| dict` | `True` | `False` disables automatic anomaly events; a dict overrides thresholds. See [Anomaly Detection](#anomaly-detection). |

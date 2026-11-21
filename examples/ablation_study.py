@@ -345,6 +345,7 @@ def main() -> None:
             name=config["name"],
             hyperparams=hp,
             tags=config["tags"],
+            group="ablation-study",
             notes=config["notes"],
         )
         print(f"[{config['name']}] run_id={run.run_id}")

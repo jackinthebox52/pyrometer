@@ -27,6 +27,7 @@ def init(
     offline: bool | None = None,
     anomaly_detection: bool | dict = True,
     resume: str | None = None,
+    group: str | None = None,
 ) -> Run:
     """Initialize a new training run and register it with the Pyrometer server.
 
@@ -78,6 +79,11 @@ def init(
             write wins per metric name and step). Offline mode: the run id is trusted, ``run.last_step`` is
             ``None``, and the resume happens when you ``pyrometer sync``. Resuming into a
             different ``project`` than the run's raises ``ValueError``.
+
+        group: Name of the experiment or sweep this run belongs to (e.g. ``"lr-sweep-2026-11"``).
+            The dashboard lists a project's groups and can filter runs by group. Defaults to the
+            ``PYROMETER_GROUP`` environment variable. Up to 128 characters; stored on the run and
+            not changed by ``resume``.
 
     Delivery is durable. Every payload is appended to an on-disk journal
     (``~/.pyrometer/spool/<run_id>/``) before it is sent and acknowledged after, so a hard kill
@@ -137,6 +143,7 @@ def init(
         "tags": tags or [],
         "notes": notes,
         "project": project,
+        "group": (group if group is not None else os.environ.get("PYROMETER_GROUP", "")).strip()[:128] or None,
         **hw,
     }
     if resume_mode:

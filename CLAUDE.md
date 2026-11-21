@@ -60,7 +60,7 @@ keeping the chat log free of live credentials.
 - Use the context7 tool if you ever need up-to-date information about a library. (e.g. pytorch, scikit-learn, numpy, uvicorn)
 
 ## SDK Public API (canonical reference)
-- `pyrometer.init(name, hyperparams, tags, server, api_key, project, offline, anomaly_detection)` → Run  (`server` ← `PYROMETER_SERVER`, `api_key` ← `PYROMETER_API_KEY` if omitted; `offline` ← `PYROMETER_MODE=offline`: spool only, upload with `pyrometer sync`; `anomaly_detection` True|False|dict of threshold overrides; `resume=<run_id>|"auto"` (← `PYROMETER_RUN_ID`) reattaches to an existing run, see `run.resumed` / `run.last_step`)
+- `pyrometer.init(name, hyperparams, tags, server, api_key, project, group, offline, anomaly_detection)` → Run  (`server` ← `PYROMETER_SERVER`, `api_key` ← `PYROMETER_API_KEY` if omitted; `group` ← `PYROMETER_GROUP` (sweep/experiment name; filter + list per project); `offline` ← `PYROMETER_MODE=offline`: spool only, upload with `pyrometer sync`; `anomaly_detection` True|False|dict of threshold overrides; `resume=<run_id>|"auto"` (← `PYROMETER_RUN_ID`) reattaches to an existing run, see `run.resumed` / `run.last_step`)
 - `pyrometer.create_project(name, private, server, api_key)` → dict  (needs a global key; private projects return their own key)
 - `run.log(metrics_dict, step)` → None
 - `run.profile(step)` → context manager wrapping torch.profiler

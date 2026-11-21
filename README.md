@@ -19,6 +19,8 @@ Track metrics, compare runs, and profile GPU kernels — all local, no cloud, no
   (e.g. ignore `seed`) showing mean +/- std bands; Samples tab to browse and compare generations across steps/runs.
 - **Alerts**: admin-configured webhooks (generic JSON, ntfy, Discord, Slack) for crashes, failures, event severity,
   anomalies and metric thresholds.
+- **Organisation**: runs sort by last activity; rename, retag and annotate runs, archive or hard-delete runs and projects (admins), move runs between projects, bulk actions, per-user pins, `init(group=...)` sweeps ([docs/server-api.md](docs/server-api.md)).
+- **Data lifecycle**: server-side downsampling and zoom on reads (spikes preserved), images stored as files, Parquet export per run/project, optional per-project retention policy.
 - **Auth and projects**: accounts, API keys, public/private projects ([docs/auth.md](docs/auth.md)).
 
 ---

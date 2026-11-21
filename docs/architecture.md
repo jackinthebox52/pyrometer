@@ -228,6 +228,14 @@ One row per training run. Small table, read frequently.
 | `hostname` | `VARCHAR` | Machine hostname |
 | `tags` | `JSON` | Array of tag strings |
 | `notes` | `VARCHAR` | Free-text notes |
+| `project` | `VARCHAR` | Owning project |
+| `updated_at` | `DOUBLE` | Last activity: bumped on every successful ingest (not duplicate batches) and every status/metadata change. Backfilled at migration from the newest data of each run. Default run sort |
+| `run_group` | `VARCHAR` | `init(group=...)` (exposed as `group`) |
+| `archived_at` | `DOUBLE` | Archive stamp (null = active). Archived runs, and runs of archived projects, are hidden from lists by default |
+
+Related organisation tables: `projects` (+ `archived_at`, `retention` JSON policy), `pinned_runs(username, run_id, pinned_at)` for per-user pins,
+`schema_meta(key, done_at)` for one-time repairs (legacy duplicate rows), and `alert_rules.updated_at`. A hard delete clears `runs` and every table
+that has a `run_id` column (`RUN_CHILD_TABLES` in `db.py`) plus `<data dir>/media/<run_id>/`. `seen_batches` rows live as long as their run.
 
 ---
 
@@ -382,7 +390,8 @@ Images, histograms, figures.
 | `timestamp` | `DOUBLE` | Unix timestamp |
 | `name` | `VARCHAR` | Media name |
 | `media_type` | `VARCHAR` | `image`, `histogram`, `figure` |
-| `data` | `VARCHAR` | Base64 PNG or JSON string |
+| `data` | `VARCHAR` | JSON string (histograms) or an inline base64 PNG that could not be decoded; `NULL` for file-backed images/figures |
+| `path` | `VARCHAR` | Image/figure file, relative to `<data dir>/media` (`<run_id>/<sha256(name)[:16]>-<step>.png`); `NULL` if the payload is inline |
 
 ---
 
@@ -567,10 +576,14 @@ class _WsManager:
     _connections: list[WebSocket]
     _last_broadcast: dict[tuple[str, str], float]  # throttle state
 
-    async def broadcast(payload, throttle_key=None, throttle_ms=500):
-        # Throttle to avoid flooding during rapid updates
+    async def broadcast(payload, throttle_key=None, throttle_ms=500, project=None, readable=None):
+        # Throttle to avoid flooding during rapid updates (the throttle map is bounded)
+        # Per connection: re-authenticate (revoked key/session -> close 1008), then filter by project visibility
         # Fire-and-forget send (dead connections silently removed)
 ```
+
+`broadcast_move` sends `run_moved` / `run_deleted` / `run_created` depending on which of the old and new projects a client can
+read, so no private project name leaks. Idle sockets re-validate their credential every `PYROMETER_WS_RECHECK` seconds.
 
 #### Static File Serving
 
