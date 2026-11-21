@@ -662,6 +662,7 @@ class _AutologEngine:
             self._last_emit_k = k
             ev = self._make_event(self._driver_opt()) if (cfg.throughput and now is not None) else None
             ds = k - self._win_k
+            first_window = ev is not None and self._win_ev is None
             if ev is not None:
                 # CUDA: defer the rates until both window-edge events have completed (see _resolve_rates)
                 if self._win_ev is not None and ds > 0:
@@ -697,6 +698,13 @@ class _AutologEngine:
             if gn is not None:
                 device_vals["auto/grad_norm"] = gn
         self._ship(k, ts, metrics, device_vals)
+        if first_window:
+            # The first cadence pays one-time costs (pinned buffers, event setup: ~10 ms), which would otherwise
+            # land inside the first measured window and under-report launch-bound steps. Start the window afterwards.
+            ev2 = self._make_event(opt)
+            if ev2 is not None:
+                with self._lock:
+                    self._win_ev = ev2
 
     def _rate_metrics(self, ds: int, dt: float, tokens: int, samples: int, wait: float) -> dict[str, float]:
         m = {"auto/steps_per_sec": ds / dt}

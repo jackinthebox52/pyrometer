@@ -703,6 +703,47 @@ def test_cuda_rates_come_from_completed_work_events(calls, monkeypatch):
     run.finish()
 
 
+def test_first_rate_window_excludes_first_cadence_one_time_cost(calls, monkeypatch):
+    """The first cadence's one-time setup cost (pinned buffers, ...) must not fall inside the first measured window."""
+    state = {"done": True, "t": 0.0}
+
+    class FakeEvent:
+        def __init__(self) -> None:
+            self.t = state["t"]
+            state["t"] += 1000.0
+
+        def query(self) -> bool:
+            return state["done"]
+
+        def synchronize(self) -> None:
+            pass
+
+        def elapsed_time(self, other) -> float:
+            return other.t - self.t
+
+    orig_ship = _autolog._AutologEngine._ship
+    first = {"done": False}
+
+    def slow_first_ship(self, *a, **kw):
+        if not first["done"]:
+            first["done"] = True
+            state["t"] += 50000.0  # one-time init cost during the first cadence
+        return orig_ship(self, *a, **kw)
+
+    monkeypatch.setattr(_autolog._AutologEngine, "_make_event", staticmethod(lambda opt: FakeEvent()))
+    monkeypatch.setattr(_autolog._AutologEngine, "_ship", slow_first_ship)
+    run = start(name="gpu-first-window", autolog={"log_every": 5})
+    model = torch.nn.Linear(2, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(10):
+        opt.zero_grad()
+        model(torch.randn(3, 2)).sum().backward()
+        opt.step()
+    rates = [(k, m["auto/steps_per_sec"]) for k, m in calls if "auto/steps_per_sec" in m]
+    assert rates[0] == (5, pytest.approx(4.0))  # 4 steps in 1000 ms, not diluted by the 50 s setup
+    run.finish()
+
+
 def test_off_cadence_backwards_are_counted_but_not_retained(calls):
     """Hot-path trim: a backward that cannot reach a cadence step only bumps the micro-batch count; the loss of
     the backward right before a cadence step is kept and logged as usual."""
