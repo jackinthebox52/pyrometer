@@ -288,7 +288,7 @@ def test_session_reports_role():
 def test_websocket_only_delivers_events_for_visible_runs(client, gkey):
     make_private(client, gkey, "secret")
     user = signed_in("bob", "user")
-    with user.websocket_connect("/ws") as ws:
+    with user.websocket_connect("/ws", headers={"Origin": "http://testserver"}) as ws:
         post_run(client, gkey, "secret")  # hidden from bob: must not be delivered
         visible = post_run(client, gkey, "open").json()["data"]["run_id"]
         msg = ws.receive_json()
@@ -298,7 +298,7 @@ def test_websocket_only_delivers_events_for_visible_runs(client, gkey):
 def test_websocket_admin_receives_everything(client, gkey):
     make_private(client, gkey, "secret")
     admin = signed_in("root", "admin")
-    with admin.websocket_connect("/ws") as ws:
+    with admin.websocket_connect("/ws", headers={"Origin": "http://testserver"}) as ws:
         hidden = post_run(client, gkey, "secret").json()["data"]["run_id"]
         assert ws.receive_json()["run_id"] == hidden
 

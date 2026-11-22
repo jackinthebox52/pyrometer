@@ -298,8 +298,113 @@ def test_websocket_requires_auth(client):
 
 
 def test_websocket_accepts_admin_session(admin):
-    with admin.websocket_connect("/ws"):
+    with admin.websocket_connect("/ws", headers=ORIGIN):
         pass
+
+
+def _ws_rejected(client, headers) -> bool:
+    try:
+        with client.websocket_connect("/ws", headers=headers):
+            return False
+    except WebSocketDisconnect as e:
+        assert e.code == 1008
+        return True
+
+
+def test_websocket_cross_origin_session_rejected(admin):
+    assert _ws_rejected(admin, {"Origin": "https://evil.example.com"})
+    assert _ws_rejected(admin, {})  # a browser-credential socket must carry a same-origin Origin
+    assert not _ws_rejected(admin, ORIGIN)
+
+
+def test_websocket_api_key_without_origin_ok_but_wrong_key_not(client):
+    assert not _ws_rejected(client, bearer(make_key()))
+    assert _ws_rejected(client, bearer("pyro_bad_key"))
+
+
+def test_websocket_origin_behind_trusted_proxy(monkeypatch):
+    monkeypatch.setenv("PYROMETER_TRUSTED_PROXIES", "127.0.0.1")
+    proxied = {"X-authentik-username": "alice", "Origin": "https://pyro.example.com", "X-Forwarded-Host": "pyro.example.com"}
+    trusted = TestClient(app, client=("127.0.0.1", 1))
+    assert not _ws_rejected(trusted, proxied)
+    assert _ws_rejected(trusted, {**proxied, "Origin": "https://evil.example.com"})
+    assert _ws_rejected(trusted, {"X-authentik-username": "alice"})  # proxy identity, no Origin
+    # X-Forwarded-Host is ignored from an untrusted peer (and the identity header is too)
+    untrusted = TestClient(app, client=("203.0.113.9", 1))
+    assert _ws_rejected(untrusted, proxied)
+
+
+# --- login throttle isolation ---------------------------------------------
+
+def _login(ip, user, password="wrong wrong wrong", headers=None):
+    c = TestClient(app, client=(ip, 1000))
+    return c.post("/auth/login", json={"username": user, "password": password}, headers=headers or {}).status_code
+
+
+def test_lockout_is_per_user_and_ip():
+    auth.create_user("alice", PASSWORD, "user")
+    auth.create_user("bob", PASSWORD, "user")
+    for _ in range(auth._MAX_FAILURES):
+        assert _login("203.0.113.1", "alice") == 401
+    assert _login("203.0.113.1", "alice", PASSWORD) == 429           # locked for this pair
+    assert _login("203.0.113.2", "alice", PASSWORD) == 200           # same user, other IP
+    assert _login("203.0.113.1", "bob", PASSWORD) == 200             # other user, same IP
+
+
+def test_success_clears_only_that_pair():
+    auth.create_user("alice", PASSWORD, "user")
+    for _ in range(3):
+        _login("203.0.113.1", "alice")
+    assert _login("203.0.113.1", "alice", PASSWORD) == 200
+    assert ("u", "alice", "203.0.113.1") not in auth._failures
+    assert len(auth._failures[("ip", "203.0.113.1")]) == 3
+
+
+def test_per_ip_cap_blocks_username_spraying(monkeypatch):
+    monkeypatch.setattr(auth, "_MAX_FAILURES_PER_IP", 12)
+    auth.create_user("alice", PASSWORD, "user")
+    for i in range(12):
+        assert _login("203.0.113.1", f"ghost{i}") == 401   # each pair is far below its own cap
+    assert _login("203.0.113.1", "alice", PASSWORD) == 429
+    assert _login("203.0.113.2", "alice", PASSWORD) == 200
+
+
+def test_throttle_uses_forwarded_for_only_from_trusted_proxy(monkeypatch):
+    monkeypatch.setenv("PYROMETER_TRUSTED_PROXIES", "127.0.0.1")
+    auth.create_user("alice", PASSWORD, "user")
+
+    def via_proxy(client_addr, password="wrong wrong wrong"):
+        return _login("127.0.0.1", "alice", password, {"X-Forwarded-For": f"198.51.100.250, {client_addr}"})
+
+    for _ in range(auth._MAX_FAILURES):
+        assert via_proxy("203.0.113.1") == 401
+    assert via_proxy("203.0.113.1", PASSWORD) == 429
+    assert via_proxy("203.0.113.2", PASSWORD) == 200   # other real client behind the same proxy
+    # an untrusted peer cannot pick its bucket with a forged header
+    for _ in range(auth._MAX_FAILURES):
+        assert _login("192.0.2.7", "alice", headers={"X-Forwarded-For": "203.0.113.77"}) == 401
+    assert ("u", "alice", "192.0.2.7") in auth._failures
+    assert ("u", "alice", "203.0.113.77") not in auth._failures
+
+
+def test_throttle_prunes_old_entries_and_bounds_memory(monkeypatch):
+    monkeypatch.setattr(auth, "_MAX_THROTTLE_KEYS", 50)
+    auth._record_failure("old", "203.0.113.1")
+    for key in list(auth._failures):
+        auth._failures[key] = [auth.time.monotonic() - auth._FAILURE_WINDOW - 1]
+    auth._check_throttle("anyone", "203.0.113.9")
+    assert not auth._failures                     # expired buckets are dropped
+    for i in range(500):
+        auth._record_failure(f"u{i}", f"198.51.100.{i % 250}")
+    assert len(auth._failures) <= 50
+
+
+def test_password_change_failures_use_same_throttle(admin):
+    for _ in range(auth._MAX_FAILURES):
+        r = admin.post("/auth/password", json={"current": "bad bad bad", "new": "another long one"}, headers=ORIGIN)
+        assert r.status_code == 403
+    assert admin.post("/auth/password", json={"current": PASSWORD, "new": "another long one"}, headers=ORIGIN).status_code == 429
+    assert _login("203.0.113.5", "admin", PASSWORD) == 200  # other IP unaffected
 
 
 # --- local mode / fail-closed ---------------------------------------------

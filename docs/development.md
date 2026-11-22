@@ -87,7 +87,6 @@ pyrometer/
 ├── pyproject.toml          # Python dependencies
 ├── uv.lock                 # Lock file
 ├── README.md
-├── SPEC.md
 └── CLAUDE.md
 ```
 

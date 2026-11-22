@@ -82,7 +82,7 @@ curl -H "Authorization: Bearer $PYROMETER_API_KEY" http://localhost:8321/runs
 | `401` | Missing or invalid credentials (`WWW-Authenticate: Bearer`) |
 | `403` | Authenticated, but not allowed: e.g. an API key on `/admin/*`, a project key registering a project, a dashboard session writing run data, or a cross-origin browser request |
 | `404` | Also returned for runs/projects the caller may not see |
-| `429` | Too many failed login/setup attempts |
+| `429` | Too many failed login/setup attempts (throttled per username + client IP, plus a per-IP cap) |
 
 ### Session
 
@@ -126,13 +126,13 @@ Session or trusted proxy; state changes must be same-origin.
 | `PATCH` / `DELETE` | `/admin/alerts/{id}` | Update (e.g. `{"enabled": false}`) / delete a rule |
 | `POST` | `/admin/alerts/{id}/test` | Send a test message to the rule's webhook now (`502` if delivery fails) |
 
-In `--no-auth` local mode all endpoints are open. A WebSocket without valid credentials is rejected at the handshake, and
+In `--no-auth` local mode all endpoints are open. A WebSocket without valid credentials, or a cookie/proxy-identity one with a missing or cross-origin `Origin`, is rejected at the handshake (close code 1008; API-key clients need no `Origin`), and
 events are only delivered for runs the connected user may see.
 
 --------|---------|
 | `401` | Missing or invalid credentials (`WWW-Authenticate: Bearer`) |
 | `403` | Authenticated, but not allowed: an API key on `/admin/*`, a browser session writing run data, or a cross-origin admin request |
-| `429` | Too many failed login/setup attempts |
+| `429` | Too many failed login/setup attempts (throttled per username + client IP, plus a per-IP cap) |
 
 | Method | Path | Description |
 |---|---|---|

@@ -61,9 +61,12 @@ _DUMMY_HASH = hashlib.sha256(b"pyrometer-dummy").hexdigest()
 # scrypt: N=2^15, r=8, p=1 (~32 MiB, ~100 ms)
 _SCRYPT_LOG_N, _SCRYPT_R, _SCRYPT_P = 15, 8, 1
 
-# Login/setup throttle: this many failures within the window blocks further attempts.
+# Login/setup throttle: this many failures within the window blocks further attempts, per
+# (username, client IP). A looser per-IP cap stops one address from spraying many usernames.
 _MAX_FAILURES = 10
+_MAX_FAILURES_PER_IP = 50
 _FAILURE_WINDOW = 600.0
+_MAX_THROTTLE_KEYS = 4096  # memory bound on tracked (user, ip) / ip buckets
 
 
 class RateLimited(Exception):
@@ -319,33 +322,56 @@ def delete_user(username: str) -> bool:
     return deleted
 
 
-def change_own_password(username: str, current: str, new: str) -> None:
+def change_own_password(username: str, current: str, new: str, client_ip: str = "") -> None:
     """Self-service change; verifies ``current`` first. Raises ``PermissionError`` if it is wrong."""
     _check_password(new)
-    _check_throttle()
+    _check_throttle(username, client_ip)
     user = get_user(username)
     if user is None or not _verify_password(current, user["password_hash"]):
-        _record_failure()
+        _record_failure(username, client_ip)
         raise PermissionError("Current password is incorrect")
     set_password(username, new)
 
 
 # ---------------------------------------------------------------------------
-# Throttle (in-memory, global: behind a proxy there is no trustworthy client address)
+# Throttle (in-memory, per (username, client IP) plus a looser per-IP cap)
 # ---------------------------------------------------------------------------
 
-_failures: list[float] = []
+# bucket key -> failure timestamps. Keys: ("u", username, ip) and ("ip", ip). One dict so tests can ``.clear()`` it.
+_failures: dict[tuple[str, ...], list[float]] = {}
 
 
-def _check_throttle() -> None:
+def _throttle_keys(username: str, ip: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return ("u", username.strip().lower()[:64], ip), ("ip", ip)
+
+
+def _prune_failures(now: float) -> None:
+    for key in list(_failures):
+        live = [t for t in _failures[key] if now - t < _FAILURE_WINDOW]
+        if live:
+            _failures[key] = live
+        else:
+            del _failures[key]
+    if len(_failures) > _MAX_THROTTLE_KEYS:  # still too many fresh buckets: keep the most recent half
+        newest = sorted(_failures.items(), key=lambda kv: kv[1][-1])[_MAX_THROTTLE_KEYS // 2:]
+        _failures.clear()
+        _failures.update(newest)
+
+
+def _check_throttle(username: str, ip: str) -> None:
     now = time.monotonic()
-    _failures[:] = [t for t in _failures if now - t < _FAILURE_WINDOW]
-    if len(_failures) >= _MAX_FAILURES:
+    _prune_failures(now)
+    user_key, ip_key = _throttle_keys(username, ip)
+    if len(_failures.get(user_key, ())) >= _MAX_FAILURES or len(_failures.get(ip_key, ())) >= _MAX_FAILURES_PER_IP:
         raise RateLimited()
 
 
-def _record_failure() -> None:
-    _failures.append(time.monotonic())
+def _record_failure(username: str, ip: str) -> None:
+    now = time.monotonic()
+    if len(_failures) >= _MAX_THROTTLE_KEYS:
+        _prune_failures(now)
+    for key in _throttle_keys(username, ip):
+        _failures.setdefault(key, []).append(now)
 
 
 # ---------------------------------------------------------------------------
@@ -374,18 +400,18 @@ def setup_token() -> str | None:
         return _setup_token
 
 
-def claim_setup(token: str, username: str, password: str) -> str:
+def claim_setup(token: str, username: str, password: str, client_ip: str = "") -> str:
     """Create the first admin if ``token`` is the live setup token; returns the username.
 
     Raises ``PermissionError`` for a wrong token or if setup is already done, ``RateLimited`` after
     too many failures, ``ValueError`` for a bad username or weak password.
     """
     global _setup_token
-    _check_throttle()
+    _check_throttle("<setup>", client_ip)
     with _setup_lock:
         expected = setup_token()
         if expected is None or not hmac.compare_digest(token.encode(), expected.encode()):
-            _record_failure()
+            _record_failure("<setup>", client_ip)
             raise PermissionError("Invalid setup token, or setup is already complete")
         username = _clean_username(username)
         create_user(username, password, "admin")
@@ -397,18 +423,18 @@ def claim_setup(token: str, username: str, password: str) -> str:
 # Admin sessions
 # ---------------------------------------------------------------------------
 
-def login(username: str, password: str) -> str:
+def login(username: str, password: str, client_ip: str = "") -> str:
     """Verify a user's password and return a new session token (raw; shown to the browser once)."""
-    _check_throttle()
+    _check_throttle(username, client_ip)
     user = get_user(username)
     if user is None:  # burn the same time as a real check
         _verify_password(password, _hash_password("pyrometer-dummy"))
     ok = user is not None and _verify_password(password, user["password_hash"])
     if not ok:
-        _record_failure()
+        _record_failure(username, client_ip)
         raise PermissionError("Invalid username or password")
     username = user["username"]
-    _failures.clear()
+    _failures.pop(_throttle_keys(username, client_ip)[0], None)  # only this (user, ip); the per-IP count stays
     token = secrets.token_urlsafe(32)
     now = time.time()
 
@@ -561,6 +587,24 @@ def is_https(conn: HTTPConnection) -> bool:
     return _peer_is_trusted_proxy(conn) and conn.headers.get("x-forwarded-proto") == "https"
 
 
+def client_ip(conn: HTTPConnection) -> str:
+    """Address used to key the login throttle. The socket peer, unless it is a trusted proxy: then the
+    right-most ``X-Forwarded-For`` entry that is not itself a trusted proxy (left entries are client-supplied)."""
+    peer = conn.client.host if conn.client else ""
+    if not _peer_is_trusted_proxy(conn):
+        return peer
+    nets = _trusted_proxies()
+    for part in reversed(conn.headers.get("x-forwarded-for", "").split(",")):
+        part = part.strip()
+        try:
+            addr = ipaddress.ip_address(part)
+        except ValueError:
+            return peer  # malformed chain: fall back to the proxy itself rather than trust it
+        if not any(addr in net for net in nets):
+            return str(addr)
+    return peer
+
+
 def _same_origin(conn: HTTPConnection) -> bool:
     """CSRF defence in depth for browser-authenticated state changes: Origin must match our Host."""
     origin = conn.headers.get("origin")
@@ -571,6 +615,14 @@ def _same_origin(conn: HTTPConnection) -> bool:
         allowed.add(conn.headers.get("x-forwarded-host", ""))
     allowed.discard("")
     return urlparse(origin).netloc in allowed
+
+
+def ws_origin_ok(conn: HTTPConnection, principal: Principal) -> bool:
+    """WebSocket handshakes are not covered by CORS. Browser-credential connections (session cookie,
+    proxy identity) need a same-origin ``Origin``; API-key clients (non-browser) may send none."""
+    if principal.via == "key":
+        return True
+    return _same_origin(conn)
 
 
 def authenticate(conn: HTTPConnection) -> Principal | None:
@@ -695,6 +747,8 @@ async def require_auth(conn: HTTPConnection) -> None:
             headers={"WWW-Authenticate": "Bearer"},
         )
     conn.state.principal = principal
+    if is_ws and not ws_origin_ok(conn, principal):
+        raise WebSocketException(code=1008)
 
     browser = principal.via != "key"
     browser_rule = False  # a browser write the admin/user rule table allows: object check is a read check

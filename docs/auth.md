@@ -138,10 +138,18 @@ Or pass `server=` / `api_key=` explicitly. If the server rejects the key, `init(
   stored only as hashes, expire after 30 days, and end on logout, password change or reset, or account deletion.
   A role change applies to existing sessions immediately.
 - The session cookie is `HttpOnly` and `SameSite=Strict`, and `Secure` when the request arrived over HTTPS.
-- Failed logins are throttled: 10 failures in 10 minutes blocks further attempts (HTTP 429) until the window
-  clears. The limit is global, since behind a proxy there is no trustworthy client address. API keys are unaffected.
+- Failed logins are throttled per **(username, client IP)**: 10 failures in 10 minutes blocks further attempts from that
+  address for that account (HTTP 429) until the window clears. A looser per-IP cap (50 failures in 10 minutes across all
+  usernames) stops one address spraying many accounts. Failures never affect a different user or a different IP.
+  Setup-token guesses and wrong current passwords on `POST /auth/password` use the same mechanism. A successful login
+  clears only its own (username, IP) counter. Counters are in memory, pruned as they expire, and capped at 4096 buckets.
+  The client IP is the socket peer, or, when the peer is a trusted proxy, the right-most `X-Forwarded-For` entry that is
+  not itself a trusted proxy. API keys are unaffected.
 - State-changing browser requests (anything under `/admin`, `POST /projects`, `POST /auth/password`) must be
   same-origin: `Origin` must match `Host` (or `X-Forwarded-Host` from a trusted proxy). This is on top of `SameSite=Strict`.
+- WebSocket handshakes (`/ws`) are not covered by CORS, so cookie-session and proxy-identity connections must send an
+  `Origin` matching `Host` (or `X-Forwarded-Host` from a trusted proxy); otherwise the handshake is closed with code 1008.
+  API-key clients (scripts) are non-browser and may connect without an `Origin`.
 - The last admin can't be deleted or demoted, and you can't delete your own account.
 
 ## Reverse-proxy identity (authentik)

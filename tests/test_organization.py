@@ -709,7 +709,7 @@ def test_websocket_closes_when_key_is_revoked(sdk):
 def test_websocket_closes_when_session_ends(sdk):
     signed_in("root", "admin")
     bob = signed_in("bob", "user")
-    with bob.websocket_connect("/ws") as ws:
+    with bob.websocket_connect("/ws", headers={"Origin": "http://testserver"}) as ws:
         auth.delete_user("bob")
         new_run(sdk, "x")
         with pytest.raises(WebSocketDisconnect):
@@ -729,7 +729,7 @@ def test_websocket_events_for_delete_archive_move(sdk, admin, bob):
     sdk.post("/projects", json={"name": "priv", "visibility": "private"})
     sdk.post("/projects", json={"name": "pub", "visibility": "public"})
     pub, priv = new_run(sdk, "a", "pub"), new_run(sdk, "b", "priv")
-    with bob.websocket_connect("/ws") as ws, admin.websocket_connect("/ws") as ws_admin:
+    with bob.websocket_connect("/ws", headers={"Origin": "http://testserver"}) as ws, admin.websocket_connect("/ws", headers={"Origin": "http://testserver"}) as ws_admin:
         admin.post(f"/runs/{pub}/archive", headers=ORIGIN)
         assert ws.receive_json() == {"type": "run_updated", "run_id": pub}
         assert ws_admin.receive_json()["type"] == "run_updated"
@@ -750,6 +750,6 @@ def test_websocket_events_for_delete_archive_move(sdk, admin, bob):
 
 def test_websocket_project_delete_event_reaches_readers(sdk, admin, bob):
     sdk.post("/projects", json={"name": "pub2", "visibility": "public"})
-    with bob.websocket_connect("/ws") as ws:
+    with bob.websocket_connect("/ws", headers={"Origin": "http://testserver"}) as ws:
         admin.delete("/admin/projects/pub2", headers=ORIGIN)
         assert ws.receive_json() == {"type": "project_deleted", "project": "pub2"}

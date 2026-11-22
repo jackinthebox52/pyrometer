@@ -754,8 +754,8 @@ def auth_session(request: Request):
 def auth_setup(req: SetupRequest, request: Request, response: Response):
     """First run: exchange the one-time setup token (from the server log) for the first admin account."""
     try:
-        username = auth.claim_setup(req.token.strip(), req.username, req.password)
-        session = auth.login(username, req.password)
+        username = auth.claim_setup(req.token.strip(), req.username, req.password, auth.client_ip(request))
+        session = auth.login(username, req.password, auth.client_ip(request))
     except RateLimited:
         err("Too many failed attempts; try again later", 429)
     except PermissionError as e:
@@ -770,7 +770,7 @@ def auth_setup(req: SetupRequest, request: Request, response: Response):
 def auth_login(req: LoginRequest, request: Request, response: Response):
     """Username/password login; sets an HttpOnly, SameSite=Strict, read-only session cookie."""
     try:
-        session = auth.login(req.username, req.password)
+        session = auth.login(req.username, req.password, auth.client_ip(request))
     except RateLimited:
         err("Too many failed attempts; try again later", 429)
     except PermissionError as e:
@@ -793,8 +793,8 @@ def auth_change_password(req: ChangePasswordRequest, request: Request, response:
     if principal is None:
         err("Not available in local no-auth mode", 400)
     try:
-        auth.change_own_password(principal.name, req.current, req.new)
-        session = auth.login(principal.name, req.new)
+        auth.change_own_password(principal.name, req.current, req.new, auth.client_ip(request))
+        session = auth.login(principal.name, req.new, auth.client_ip(request))
     except RateLimited:
         err("Too many failed attempts; try again later", 429)
     except PermissionError as e:
