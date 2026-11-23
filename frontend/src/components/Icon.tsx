@@ -19,6 +19,7 @@ export type IconName =
   | 'plus'
   | 'pencil'
   | 'expand'
+  | 'sun'
 
 /** 16x16 viewBox line paths, drawn with a 1.5 stroke in `currentColor`. */
 const PATHS: Record<IconName, string> = {
@@ -28,6 +29,7 @@ const PATHS: Record<IconName, string> = {
   x: 'M3.5 3.5l9 9M12.5 3.5l-9 9',
   pin: 'M9.5 1.5l5 5-2 .5-2.5 2.5.5 3-1 1-3-3-4.5 4.5M5 6l1-1 3 .5',
   compare: 'M2 3v10M2 8h4M6 5v6M10 5v6M14 3v10M10 8h4',
+  sun: 'M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M13 3l-1 1M4 12l-1 1',
   settings: 'M2 4h7M12 4h2M2 12h2M7 12h7M10.5 4a1.5 1.5 0 1 0 0 .01M5.5 12a1.5 1.5 0 1 0 0 .01',
   copy: 'M5.5 5.5h8v8h-8zM10.5 5.5v-3h-8v8h3',
   more: 'M3 8h.01M8 8h.01M13 8h.01',

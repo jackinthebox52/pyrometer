@@ -20,7 +20,7 @@ export default function ExpandModal({ onClose, children }: Props) {
     <div
       onClick={onClose}
       className="fixed inset-0 z-[200] flex items-center justify-center p-4 sm:p-8 "
-      style={{ backgroundColor: `${N.n1}d9` }}
+      style={{ backgroundColor: `color-mix(in srgb, ${N.n1} 85%, transparent)` }}
     >
       <div
         role="dialog"

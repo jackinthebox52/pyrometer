@@ -870,3 +870,7 @@ Discord or Slack), one or more triggers (run crashed, run failed, event at or ab
 metric threshold such as `loss > 5`; pick one and press **Add trigger**, repeat for more; the rule fires when any
 matches) and an optional project. **Send test** posts a test message; rules can be
 disabled or deleted. After saving, the URL is shown masked (host only). See [server-api.md](server-api.md#alerts).
+
+## Light and dark theme
+
+The dashboard follows your OS colour scheme. Use **Theme** in the sidebar footer to switch; the choice is saved in your browser. Append `?theme=light` or `?theme=dark` to the URL (before the `#`) to force one.

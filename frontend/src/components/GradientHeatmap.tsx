@@ -298,7 +298,7 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
           <div
             style={{
               position: 'absolute', top: 0, bottom: 0, left: selBox.left, width: selBox.width,
-              backgroundColor: `${N.n8}14`, border: `1px solid ${N.n7}`, pointerEvents: 'none',
+              backgroundColor: `color-mix(in srgb, ${N.n8} 8%, transparent)`, border: `1px solid ${N.n7}`, pointerEvents: 'none',
             }}
           />
         )}

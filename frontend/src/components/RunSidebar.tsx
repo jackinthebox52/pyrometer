@@ -8,7 +8,7 @@ import { useWebSocket } from '../hooks/useWebSocket.ts'
 import { useSession } from '../hooks/useSession.ts'
 import ConfirmDialog from './ConfirmDialog.tsx'
 import Icon from './Icon.tsx'
-import { heatColor } from '../theme.ts'
+import { heatColor, isLight } from '../theme.ts'
 import {
   EMPTY_FILTERS,
   applyLiveRun,
@@ -44,6 +44,13 @@ const field =
   'h-[30px] w-full rounded-[2px] border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text outline-none placeholder:text-py-faint'
 const smallBtn =
   'h-7 rounded-[2px] border border-py-border-hi bg-py-surface px-2 text-xs text-py-soft transition-colors duration-150 hover:bg-py-elevated hover:text-py-text disabled:cursor-not-allowed disabled:opacity-50'
+function toggleTheme() {
+  const next = isLight() ? 'dark' : 'light'
+  document.documentElement.dataset.theme = next
+  try { localStorage.setItem('pyrometer.theme', next) } catch { /* ignore */ }
+  window.location.reload() // chart colours computed in JS pick up the new ramp
+}
+
 const quietLink =
   'flex items-center gap-1.5 text-xs text-py-muted transition-colors duration-150 hover:text-py-text'
 
@@ -588,6 +595,10 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
           <Icon name="settings" size={14} />
           Settings
         </NavLink>
+        <button onClick={toggleTheme} className={quietLink} title="Switch light / dark theme">
+          <Icon name="sun" size={14} />
+          Theme
+        </button>
         <button onClick={() => api.logout().finally(() => window.location.reload())} className={quietLink}>
           <Icon name="x" size={14} />
           Sign out
