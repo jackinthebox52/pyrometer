@@ -2,6 +2,7 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import type { RunEvent, SystemSnapshot } from '../api/types.ts'
 import { C, N, RED, heatColor } from '../theme.ts'
+import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 /**
  * The firing curve: the run's GPU utilisation over its whole life, drawn as an area of thin vertical slices, each
@@ -22,6 +23,8 @@ const CONE_BAND = 14
 const AXIS_H = 18
 const PLOT_TOP = CONE_BAND
 const PLOT_H = H - CONE_BAND - AXIS_H
+const COL_PX = 4 // inline mode: fixed pixels per slice
+const COL_SECS = 2 // inline mode: fixed seconds per slice (one system snapshot)
 const DRAG_PX = 4
 const CLICK_WINDOW = 0.025
 
@@ -35,6 +38,8 @@ export interface FiringCurveProps {
   /** Step in effect at a timestamp, if known (labels the readout). */
   stepAt?: (t: number) => number | null
   onSelectRange?: (tMin: number, tMax: number) => void
+  /** Fit the whole run into the width in ~300 grouped slices (the popup). Default: a fixed time scale that scrolls. */
+  fit?: boolean
 }
 
 interface Column {
@@ -146,10 +151,34 @@ export function contiguousRuns(cols: Column[]): Run[] {
 
 const isAnomaly = (e: RunEvent) => e.event_type === 'anomaly_detected'
 
-export default function FiringCurve({ snapshots, events, startTime, running, stepAt, onSelectRange }: FiringCurveProps) {
-  const boxRef = useRef<HTMLDivElement>(null)
+export default function FiringCurve(props: FiringCurveProps) {
+  const [open, setOpen] = useState(false)
+  const { fit, onSelectRange } = props
+  return (
+    <>
+      <FiringCurveBody {...props} onExpand={fit ? undefined : () => setOpen(true)} />
+      {open && (
+        <ExpandModal onClose={() => setOpen(false)}>
+          <div className="p-3 pt-10">
+            <FiringCurveBody
+              {...props}
+              fit
+              onSelectRange={onSelectRange && ((a, b) => { setOpen(false); onSelectRange(a, b) })}
+            />
+          </div>
+        </ExpandModal>
+      )}
+    </>
+  )
+}
+
+function FiringCurveBody({ snapshots, events, startTime, running, stepAt, onSelectRange, fit, onExpand }: FiringCurveProps & { onExpand?: () => void }) {
+  const boxRef = useRef<HTMLDivElement | null>(null)
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const stickRef = useRef(true)
+  const [scrollLeft, setScrollLeft] = useState(0)
   const gradId = useId()
-  const [width, setWidth] = useState(0)
+  const [boxW, setBoxW] = useState(0)
   const [hoverX, setHoverX] = useState<number | null>(null)
   const [drag, setDrag] = useState<{ x0: number; x1: number } | null>(null)
   const dragRef = useRef<{ x0: number; moved: boolean } | null>(null)
@@ -157,7 +186,7 @@ export default function FiringCurve({ snapshots, events, startTime, running, ste
   useEffect(() => {
     const el = boxRef.current
     if (!el) return
-    const read = () => setWidth(el.clientWidth)
+    const read = () => setBoxW(el.clientWidth)
     read()
     if (typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(read)
@@ -174,12 +203,24 @@ export default function FiringCurve({ snapshots, events, startTime, running, ste
       if (s.timestamp < lo) lo = s.timestamp
       if (s.timestamp > hi) hi = s.timestamp
     }
-    const c = buildColumns(withUtil, lo, hi)
+    const n = fit ? COLUMNS : Math.max(1, Math.ceil((hi - lo) / COL_SECS))
+    const end = fit ? hi : lo + n * COL_SECS
+    const c = buildColumns(withUtil, lo, hi > lo ? end : lo + 1, n)
     const known = c.filter((x) => x.util != null) as { t: number; util: number }[]
     const m = known.length ? known.reduce((a, x) => a + x.util, 0) / known.length : null
     const lastCol = [...c].reverse().find((x) => x.util != null)
-    return { t0: lo, t1: hi > lo ? hi : lo + 1, cols: c, mean: m, current: lastCol?.util ?? null }
-  }, [snapshots])
+    return { t0: lo, t1: hi > lo ? end : lo + 1, cols: c, mean: m, current: lastCol?.util ?? null }
+  }, [snapshots, fit])
+
+  // Fixed scale (inline): the plot grows past the card and scrolls; a finished short run stretches to fill it.
+  const width = fit || cols.length === 0 ? boxW : running ? Math.max(1, cols.length * COL_PX) : Math.max(boxW, cols.length * COL_PX)
+  const scrolls = width > boxW + 1
+
+  // Follow the live edge unless the reader scrolled back.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el && scrolls && stickRef.current) el.scrollLeft = el.scrollWidth
+  }, [width, scrolls])
 
   const span = t1 - t0
   // Elapsed time counts from run start (snapshots normally begin a little after it); never later than the first sample.
@@ -246,11 +287,11 @@ export default function FiringCurve({ snapshots, events, startTime, running, ste
     }
   }
 
-  const slice = width / COLUMNS
+  const slice = width / Math.max(1, cols.length)
   const runs = useMemo(() => contiguousRuns(cols), [cols])
   const ticks = width > 0 && !empty ? niceTicks(t1 - origin, Math.max(2, Math.floor(width / 110))).filter((e) => origin + e >= t0 && origin + e <= t1) : []
 
-  const readoutLeft = hoverX != null && width > 0 && hoverX > width * 0.6
+  const readoutLeft = hoverX != null && boxW > 0 && hoverX - scrollLeft > boxW * 0.6
   const step = hoverT != null ? stepAt?.(hoverT) ?? null : null
 
   return (
@@ -258,9 +299,10 @@ export default function FiringCurve({ snapshots, events, startTime, running, ste
       <div className="flex items-baseline justify-between gap-3">
         <h2 className="text-[13px] font-semibold text-py-text">GPU load</h2>
         {!empty && (
-          <div className="num text-[11px] text-py-muted">
+          <div className="num flex items-center text-[11px] text-py-muted">
             {mean != null && <span>mean {mean.toFixed(0)}%</span>}
             {running && current != null && <span className="ml-3">now <span className="text-py-text">{current.toFixed(0)}%</span></span>}
+            {onExpand && <span className="ml-3"><ExpandButton onClick={onExpand} /></span>}
           </div>
         )}
       </div>
@@ -272,7 +314,17 @@ export default function FiringCurve({ snapshots, events, startTime, running, ste
             : 'No GPU samples were recorded for this run.'}
         </div>
       ) : (
-        <div ref={boxRef} className="relative w-full select-none" style={{ height: H }}>
+        <div
+          ref={(el) => { boxRef.current = el; scrollRef.current = el }}
+          className="w-full select-none overflow-x-auto overflow-y-hidden"
+          style={{ height: H + (fit ? 0 : 8) }}
+          onScroll={(e) => {
+            const el = e.currentTarget
+            stickRef.current = el.scrollWidth - el.scrollLeft - el.clientWidth < 24
+            setScrollLeft(el.scrollLeft)
+          }}
+        >
+         <div className="relative" style={{ width: width || undefined, height: H }}>
           {width > 0 && (
             <svg width={width} height={H} role="img" aria-label={`GPU utilisation, mean ${mean?.toFixed(0) ?? 'unknown'} percent`} className="block overflow-visible">
               <line x1={0} x2={width} y1={PLOT_TOP + PLOT_H} y2={PLOT_TOP + PLOT_H} stroke={N.n5} strokeWidth={1} />
@@ -358,9 +410,14 @@ export default function FiringCurve({ snapshots, events, startTime, running, ste
               )}
             </div>
           )}
+         </div>
         </div>
       )}
-      {!empty && onSelectRange && <p className="pb-0.5 text-[11px] text-py-faint">Drag to open that period in Metrics.</p>}
+      {!empty && onSelectRange && (
+        <p className="pb-0.5 text-[11px] text-py-faint">
+          Drag to open that period in Metrics.{scrolls && ' Scroll back for earlier time, or expand for the whole run.'}
+        </p>
+      )}
     </section>
   )
 }

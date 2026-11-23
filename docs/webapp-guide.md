@@ -151,7 +151,7 @@ with no data are hidden):
 
 ### GPU load curve
 
-The Overview opens on the run's GPU utilisation over its whole life, coloured by load on a blackbody scale (idle is dark red,
+The Overview shows the run's GPU utilisation at a fixed time scale (one slice per 2 s). Long runs scroll sideways, and a live run follows the newest data until you scroll back. The expand button opens the whole run, grouped into larger slices, in a popup. It shows utilisation coloured by load on a blackbody scale (idle is dark red,
 busy is amber, flat-out is white), averaged across GPUs (process-attributed utilisation when available). Triangle marks above it
 are events; red ones are anomalies. Hover for elapsed time, step, GPU % and the nearest event. Drag across a period (or click a
 point) to open the Metrics tab zoomed to that time window; **Reset zoom** returns to the full run.
