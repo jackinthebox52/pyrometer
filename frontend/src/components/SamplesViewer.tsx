@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client.ts'
+import Icon from './Icon.tsx'
 import type { SampleStep, SamplesPage } from '../api/types.ts'
 
 export interface SamplesRun {
@@ -19,7 +20,8 @@ interface PaneState {
 
 const PAGE = 50
 const CLIP = 240
-const mono = 'JetBrains Mono, monospace'
+const selCls = 'h-7 rounded border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text'
+const btnCls = 'h-7 rounded border border-py-border-hi bg-py-surface px-3 text-[13px] text-py-soft transition-colors hover:bg-py-elevated hover:text-py-text disabled:cursor-not-allowed disabled:opacity-50'
 
 /** Trim and collapse whitespace so pinned prompts match across formatting differences (server does the same). */
 export function normWs(text: string): string {
@@ -85,40 +87,40 @@ function SamplePane({
 
   const myStepsForName = steps.filter((s) => s.name === pane.name)
   const total = page?.total ?? 0
-  const sel = { backgroundColor: '#0d0f14', border: '1px solid #252830', color: '#c8cad6', fontFamily: mono }
 
   return (
-    <div className="rounded-lg min-w-0" style={{ backgroundColor: '#111318', border: '1px solid #252830' }}>
-      <div className="flex flex-wrap items-center gap-2 px-3 py-2" style={{ borderBottom: '1px solid #1a1d24' }}>
-        <span className="text-xs font-mono" style={{ color: pane.color ?? '#8b8fa8' }}>{pane.label}</span>
-        <select className="text-xs rounded px-1 py-0.5" style={sel} value={pane.name}
+    <div className="min-w-0 rounded border border-py-border bg-py-surface">
+      <div className="flex flex-wrap items-center gap-2 border-b border-py-border px-3 py-2">
+        <span className="font-mono text-xs" style={pane.color ? { color: pane.color } : undefined}>{pane.label}</span>
+        <select className={selCls} value={pane.name} aria-label="Sample stream"
           onChange={(e) => {
             const first = steps.find((s) => s.name === e.target.value)
             if (first) onChange({ name: first.name, step: first.step })
           }}>
           {[...new Set(steps.map((s) => s.name))].map((n) => <option key={n}>{n}</option>)}
         </select>
-        <select className="text-xs rounded px-1 py-0.5" style={sel} value={pane.step}
+        <select className={`${selCls} num`} value={pane.step} aria-label="Sample step"
           onChange={(e) => onChange({ step: Number(e.target.value) })}>
           {myStepsForName.map((s) => <option key={s.step} value={s.step}>step {s.step} ({s.count})</option>)}
         </select>
-        <input className="text-xs rounded px-2 py-0.5 flex-1 min-w-[80px]" style={sel}
-          placeholder="filter (whole step)" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        {onRemove && (
-          <button className="text-xs font-mono" style={{ color: '#6b6f85' }} onClick={onRemove}>remove</button>
-        )}
+        <input className={`${selCls} min-w-[80px] flex-1 placeholder:text-py-faint`}
+          placeholder="Filter the whole step" value={filter} onChange={(e) => setFilter(e.target.value)} />
+        {onRemove && <button className={btnCls} onClick={onRemove}>Remove pane</button>}
       </div>
-      {error && <div className="p-3 text-xs font-mono" style={{ color: '#ef4444' }}>{error}</div>}
-      <div style={{ overflowX: 'auto', maxHeight: 520, overflowY: 'auto' }}>
-        <table className="w-full text-xs" style={{ fontFamily: mono, borderCollapse: 'collapse' }}>
+      {error && <div className="p-3 font-mono text-xs text-py-red">{error}</div>}
+      <div className="max-h-[520px] overflow-auto">
+        <table className="w-full border-collapse text-[13px]">
           <thead>
-            <tr style={{ position: 'sticky', top: 0, backgroundColor: '#111318' }}>
-              <th style={{ width: 28 }} />
+            <tr className="sticky top-0 bg-py-surface">
+              <th className="w-7" />
               {columns.map((c) => (
-                <th key={c} className="text-left px-2 py-1 cursor-pointer select-none"
-                  style={{ color: '#8b8fa8', fontWeight: 500 }}
+                <th key={c} className="cursor-pointer select-none px-2 py-1.5 text-left text-xs font-medium text-py-muted hover:text-py-text"
+                  aria-sort={sortKey === c ? (desc ? 'descending' : 'ascending') : 'none'}
                   onClick={() => { if (sortKey === c) setDesc(!desc); else { setSortKey(c); setDesc(true) } }}>
-                  {c}{sortKey === c ? (desc ? ' ▼' : ' ▲') : ''}
+                  <span className="inline-flex items-center gap-1">
+                    {c}
+                    {sortKey === c && <Icon name="chevron-down" size={12} className={desc ? '' : 'rotate-180'} />}
+                  </span>
                 </th>
               ))}
             </tr>
@@ -127,27 +129,31 @@ function SamplePane({
             {rows.map((it) => {
               const prompt = normWs(fmt(it.sample.prompt))
               return (
-                <tr key={it.idx} style={{ borderTop: '1px solid #1a1d24', verticalAlign: 'top' }}>
+                <tr key={it.idx} className="border-t border-py-border align-top hover:bg-py-elevated">
                   <td className="px-1 py-1">
                     {'prompt' in it.sample && (
                       <button title={pin === prompt ? 'Unpin prompt' : 'Show this prompt in every pane'}
-                        style={{ color: pin === prompt ? '#f59e0b' : '#4a4e60' }}
+                        aria-label={pin === prompt ? 'Unpin prompt' : 'Pin prompt'}
+                        aria-pressed={pin === prompt}
+                        className={`transition-colors ${pin === prompt ? 'text-py-text' : 'text-py-faint hover:text-py-text'}`}
                         onClick={() => onPin(pin === prompt ? null : prompt)}>
-                        ◆
+                        <Icon name="pin" size={14} />
                       </button>
                     )}
                   </td>
                   {columns.map((c) => {
-                    const text = fmt(it.sample[c])
+                    const raw = it.sample[c]
+                    const text = fmt(raw)
                     const id = `${it.idx}:${c}`
                     const long = text.length > CLIP
                     const expanded = open.has(id)
+                    const isNum = typeof raw === 'number'
                     return (
-                      <td key={c} className="px-2 py-1"
-                        style={{ color: '#c8cad6', maxWidth: 420, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                      <td key={c}
+                        className={`max-w-[420px] whitespace-pre-wrap break-words px-2 py-1 text-py-soft ${isNum ? 'num text-right text-xs text-py-text' : ''}`}>
                         {long && !expanded ? text.slice(0, CLIP) + '…' : text}
                         {long && (
-                          <button className="ml-1" style={{ color: '#6b8afd' }}
+                          <button className="ml-1 text-py-muted underline hover:text-py-text"
                             onClick={() => setOpen((prev) => {
                               const n = new Set(prev)
                               if (n.has(id)) n.delete(id); else n.add(id)
@@ -165,14 +171,13 @@ function SamplePane({
           </tbody>
         </table>
         {page && rows.length === 0 && (
-          <div className="p-3 text-xs font-mono" style={{ color: '#4a4e60' }}>No matching samples.</div>
+          <div className="p-3 text-[13px] text-py-muted">No matching samples.</div>
         )}
       </div>
-      <div className="flex items-center gap-2 px-3 py-1.5 text-xs font-mono"
-        style={{ borderTop: '1px solid #1a1d24', color: '#6b6f85' }}>
-        <span>{total === 0 ? 0 : offset + 1}-{Math.min(offset + PAGE, total)} of {total}</span>
-        <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>prev</button>
-        <button disabled={offset + PAGE >= total} onClick={() => setOffset(offset + PAGE)}>next</button>
+      <div className="flex items-center gap-2 border-t border-py-border px-3 py-1.5 text-xs text-py-muted">
+        <span className="num">{total === 0 ? 0 : offset + 1}-{Math.min(offset + PAGE, total)} of {total}</span>
+        <button className={btnCls} disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>Prev</button>
+        <button className={btnCls} disabled={offset + PAGE >= total} onClick={() => setOffset(offset + PAGE)}>Next</button>
       </div>
     </div>
   )
@@ -180,7 +185,7 @@ function SamplePane({
 
 /**
  * Generation samples (run.log_samples). One pane per run in compare view; on a single run the
- * "add pane" button opens another step side by side. Pinning a prompt (◆) filters every pane to
+ * "add pane" button opens another step side by side. Pinning a prompt filters every pane to
  * rows with that exact prompt, so one prompt can be followed across steps and runs.
  */
 export default function SamplesViewer({ runs }: { runs: SamplesRun[] }) {
@@ -217,15 +222,13 @@ export default function SamplesViewer({ runs }: { runs: SamplesRun[] }) {
 
   return (
     <div className="mb-6">
-      <h2 className="text-xs font-mono uppercase mb-3" style={{ color: '#c8cad6', letterSpacing: '0.12em' }}>
-        Samples
-      </h2>
-      <div className="flex items-center gap-3 mb-2 text-xs font-mono" style={{ color: '#6b6f85' }}>
-        {pin && <button onClick={() => setPin(null)} style={{ color: '#f59e0b' }}>clear pinned prompt</button>}
+      <h2 className="mb-3 text-[15px] font-semibold text-py-text">Samples</h2>
+      <div className="mb-2 flex items-center gap-3">
+        {pin && <button className={btnCls} onClick={() => setPin(null)}>Clear pinned prompt</button>}
         {single && (
-          <button style={{ color: '#6b8afd' }}
+          <button className={btnCls}
             onClick={() => setPanes((p) => [...p, { ...p[p.length - 1], key: Math.max(...p.map((x) => x.key)) + 1 }])}>
-            + add pane to compare steps
+            Add pane to compare steps
           </button>
         )}
       </div>

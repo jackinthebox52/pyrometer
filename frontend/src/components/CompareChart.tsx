@@ -26,13 +26,16 @@ import type { ExternalZoom } from './MetricChart.tsx'
 import type { XSource } from '../utils/xAxis.ts'
 import { aggregate } from '../utils/grouping.ts'
 import type { BandKind } from '../utils/grouping.ts'
-import ChartControls from './ChartControls.tsx'
+import ChartControls, { ChartChips } from './ChartControls.tsx'
+import { CHART, N } from '../theme.ts'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 export interface RunSeries {
   runId: string
   name: string
   color: string
+  /** Line opacity (default 1); used to dim a device twin of a per-process line. */
+  opacity?: number
   metrics: Metric[]
   /** Enables the x-axis selector; resolved per run (each run's own axis metric / start time). */
   source?: XSource
@@ -313,48 +316,48 @@ export default function CompareChart({
             ? formatMetricValue(s.metrics[s.metrics.length - 1].value)
             : null,
       }))
-  const chartHeight = expanded ? 440 : 200
+  const chartHeight = expanded ? 440 : 190
 
   return (
     <>
       <div
         ref={wrapRef}
-        className="rounded-lg p-4 flex flex-col"
-        style={{ backgroundColor: '#111318', border: '1px solid #252830', height: '100%' }}
+        className="group flex h-full flex-col rounded-sm border border-py-border bg-py-surface p-3"
         onWheel={onWheel}
       >
         {/* Header */}
-        <div className="flex items-center justify-between mb-2 gap-2">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="num truncate text-xs text-py-soft" title={metricName}>
               {metricName}
             </span>
+            <ChartChips opts={opts} />
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1">
             {zoomed && (
               <button
+                type="button"
                 onClick={resetZoom}
                 title="Back to the full range"
-                className="text-xs font-mono"
-                style={{ background: 'none', border: '1px solid #353840', borderRadius: 4, color: '#f59e0b', padding: '0 6px', cursor: 'pointer' }}
+                className="h-6 rounded-sm border border-py-border-hi bg-py-surface px-2 text-xs text-py-soft transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text"
               >
-                reset zoom{self.loading ? ' …' : ''}
+                Reset zoom{self.loading ? '…' : ''}
               </button>
             )}
+            <ChartControls
+              opts={opts}
+              onChange={setOpts}
+              dropped={dropped}
+              axisMetrics={hasAxisSelector ? axisNames : undefined}
+              axes={axes}
+              overridden={overridden}
+              onReset={resetOpts}
+            />
             {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
           </div>
         </div>
-        <ChartControls
-          opts={opts}
-          onChange={setOpts}
-          dropped={dropped}
-          axisMetrics={hasAxisSelector ? axisNames : undefined}
-          axes={axes}
-          overridden={overridden}
-          onReset={resetOpts}
-        />
         {(excluded.length > 0 || skipped > 0 || nonMonotonic.length > 0) && (
-          <div className="text-xs font-mono mb-2" style={{ color: '#f59e0b', fontSize: 10 }}>
+          <div className="mb-2 text-[11px] text-py-muted">
             {excluded.length > 0 &&
               `Excluded (no ${axisMetricName(axis)} logged): ${excluded.map((s) => s.name).join(', ')}. `}
             {skipped > 0 && `${skipped} point${skipped === 1 ? '' : 's'} without ${axisLabel(axis)} hidden. `}
@@ -366,46 +369,47 @@ export default function CompareChart({
           {legendEntries.map((s) => {
             const hidden = isHidden(s.id)
             return (
-              <span
+              <button
+                type="button"
                 key={s.id}
-                className="text-xs font-mono flex items-center gap-1.5 cursor-pointer select-none"
-                style={{ opacity: hidden ? 0.35 : 1 }}
+                className={`flex items-center gap-1.5 rounded-sm text-xs transition-opacity duration-150 ease-out hover:text-py-text ${hidden ? 'opacity-40' : ''}`}
                 onClick={() => toggleLocal(s.id)}
-                title={hidden ? 'Click to show' : 'Click to hide'}
+                aria-pressed={!hidden}
+                title={hidden ? 'Show this series' : 'Hide this series'}
               >
-                <span style={{
-                  display: 'inline-block', width: 20, height: 2,
-                  backgroundColor: s.color, borderRadius: 1, flexShrink: 0,
-                }} />
-                <span style={{ color: '#8b8fa8' }}>{s.name}</span>
-                {s.badge != null && <span style={{ color: s.color }}>{s.badge}</span>}
-              </span>
+                <span
+                  className="inline-block h-0.5 w-5 shrink-0 rounded-[1px]"
+                  style={{ backgroundColor: s.color }}
+                />
+                <span className="num text-py-soft">{s.name}</span>
+                {s.badge != null && <span className="num text-py-muted">{s.badge}</span>}
+              </button>
             )
           })}
         </div>
 
         <div style={{ marginTop: 'auto' }}>
           {!hasData ? (
-            <div className="flex items-center justify-center text-xs font-mono"
-              style={{ height: chartHeight, color: '#4a4e60' }}>
-              no data
+            <div className="flex items-center justify-center text-xs text-py-faint"
+              style={{ height: chartHeight }}>
+              No data logged yet
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={chartHeight}>
-              <ComposedChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 0 }} {...handlers} style={onSelect ? { cursor: 'crosshair', userSelect: 'none' } : undefined}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" vertical={false} />
+              <ComposedChart data={data} margin={{ top: 4, right: 18, left: 4, bottom: 0 }} {...handlers} style={onSelect ? { cursor: 'crosshair', userSelect: 'none' } : undefined}>
+                <CartesianGrid strokeDasharray="2 4" stroke={CHART.grid} vertical={false} />
                 <XAxis
                   dataKey="x"
                   type="number"
                   domain={['dataMin', 'dataMax']}
                   tickFormatter={tickFmt}
-                  tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
+                  tick={CHART.tick}
                   tickLine={false}
-                  axisLine={false}
+                  axisLine={{ stroke: CHART.axis }}
                   minTickGap={48}
                 />
                 <YAxis
-                  tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
+                  tick={CHART.tick}
                   tickLine={false}
                   axisLine={false}
                   tickFormatter={opts.logY ? formatLogTick : formatMetricValue}
@@ -416,18 +420,10 @@ export default function CompareChart({
                   allowDataOverflow={opts.logY}
                 />
                 {log?.minor.map((y) => (
-                  <ReferenceLine key={`m${y}`} y={y} stroke="#1e2128" strokeOpacity={0.6} strokeWidth={1} />
+                  <ReferenceLine key={`m${y}`} y={y} stroke={CHART.grid} strokeOpacity={0.6} strokeWidth={1} />
                 ))}
                 <Tooltip
-                  contentStyle={{
-                    backgroundColor: '#1a1d24',
-                    border: '1px solid #353840',
-                    borderRadius: 6,
-                    fontSize: 12,
-                    fontFamily: 'JetBrains Mono',
-                    padding: '6px 10px',
-                  }}
-                  labelStyle={{ color: '#8b8fa8', marginBottom: 4 }}
+                  {...CHART.tooltip}
                   labelFormatter={(v) => formatXLabel(axis, Number(v))}
                   formatter={(v: number, key: string, item: { payload?: Record<string, number | null> }) => {
                     const g = groups?.find((x) => x.id === key)
@@ -438,10 +434,9 @@ export default function CompareChart({
                     const run = series.find((s) => s.runId === key)
                     return [v == null ? '—' : formatMetricValue(v), run?.name ?? key]
                   }}
-                  itemStyle={{ padding: '1px 0' }}
-                  cursor={{ stroke: '#353840', strokeWidth: 1 }}
+                  cursor={{ stroke: N.n5, strokeWidth: 1 }}
                 />
-                {area && <ReferenceArea x1={area[0]} x2={area[1]} fill="#f59e0b" fillOpacity={0.12} stroke="#f59e0b" strokeOpacity={0.4} />}
+                {area && <ReferenceArea x1={area[0]} x2={area[1]} fill={N.n8} fillOpacity={0.08} stroke={N.n7} strokeWidth={1} />}
                 {groups && visibleGroups.map((g) => (
                   <Area
                     key={`${g.id}__band`}
@@ -476,7 +471,7 @@ export default function CompareChart({
                     type="monotone"
                     dataKey={`${s.runId}__raw`}
                     stroke={s.color}
-                    strokeOpacity={0.25}
+                    strokeOpacity={0.3}
                     strokeWidth={1}
                     dot={false}
                     activeDot={false}
@@ -491,6 +486,7 @@ export default function CompareChart({
                     type="monotone"
                     dataKey={s.runId}
                     stroke={s.color}
+                    strokeOpacity={s.opacity ?? 1}
                     strokeWidth={1.5}
                     dot={false}
                     activeDot={{ r: 3, fill: s.color, strokeWidth: 0 }}
@@ -502,13 +498,7 @@ export default function CompareChart({
             </ResponsiveContainer>
           )}
 
-          {!expanded && (
-            <div className="mt-1 text-right">
-              <span className="text-xs font-mono" style={{ color: '#2a2d38' }}>
-                {zoomable ? 'drag to zoom · ' : ''}shift+scroll to smooth{self.failed ? ' · zoom fetch failed' : ''}
-              </span>
-            </div>
-          )}
+        {!expanded && self.failed && <div className="mt-1 text-right text-[11px] text-py-faint">Zoom fetch failed.</div>}
         </div>
       </div>
 

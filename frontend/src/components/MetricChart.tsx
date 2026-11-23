@@ -20,7 +20,9 @@ import type { RangeQuery, XZoom } from '../utils/series.ts'
 import { useDragZoom } from '../hooks/useDragZoom.ts'
 import { useZoomFetch } from '../hooks/useZoomFetch.ts'
 import { useMeasuredWidth } from '../hooks/useMeasuredWidth.ts'
-import ChartControls from './ChartControls.tsx'
+import ChartControls, { ChartChips } from './ChartControls.tsx'
+import Icon from './Icon.tsx'
+import { CHART, N, RED, SERIES } from '../theme.ts'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 interface Props {
@@ -58,10 +60,9 @@ interface Row {
   raw: number | null
 }
 
-function eventColor(severity: string): string {
-  if (severity === 'error') return '#ef4444'
-  if (severity === 'warning') return '#f59e0b'
-  return '#60a5fa'
+/** Anomalies are red; every other event is a neutral marker. */
+function eventColor(anomaly: boolean): string {
+  return anomaly ? RED : N.n6
 }
 
 function Chart({
@@ -84,7 +85,7 @@ function Chart({
   lineColor: string
   height: number
   /** Events already mapped to x positions. */
-  events?: { x: number; severity: string }[]
+  events?: { x: number; anomaly: boolean }[]
 }) {
   // Deduplicate by x (keep first per position to avoid overlapping lines)
   const eventMarkers = useMemo(() => {
@@ -107,20 +108,20 @@ function Chart({
 
   return (
     <ResponsiveContainer width="100%" height={height}>
-      <LineChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 0 }} {...handlers} style={onSelect ? { cursor: 'crosshair', userSelect: 'none' } : undefined}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" vertical={false} />
+      <LineChart data={data} margin={{ top: 4, right: 18, left: 4, bottom: 0 }} {...handlers} style={onSelect ? { cursor: 'crosshair', userSelect: 'none' } : undefined}>
+        <CartesianGrid strokeDasharray="2 4" stroke={CHART.grid} vertical={false} />
         <XAxis
           dataKey="x"
           type="number"
           domain={['dataMin', 'dataMax']}
           tickFormatter={tickFmt}
-          tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
+          tick={CHART.tick}
           tickLine={false}
-          axisLine={false}
+          axisLine={{ stroke: CHART.axis }}
           minTickGap={48}
         />
         <YAxis
-          tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
+          tick={CHART.tick}
           tickLine={false}
           axisLine={false}
           tickFormatter={logY ? formatLogTick : formatMetricValue}
@@ -131,37 +132,22 @@ function Chart({
           allowDataOverflow={logY}
         />
         {log?.minor.map((y) => (
-          <ReferenceLine key={`m${y}`} y={y} stroke="#1e2128" strokeOpacity={0.6} strokeWidth={1} />
+          <ReferenceLine key={`m${y}`} y={y} stroke={CHART.grid} strokeOpacity={0.6} strokeWidth={1} />
         ))}
         <Tooltip
-          contentStyle={{
-            backgroundColor: '#1a1d24',
-            border: '1px solid #353840',
-            borderRadius: 6,
-            fontSize: 12,
-            fontFamily: 'JetBrains Mono',
-            padding: '6px 10px',
-          }}
-          labelStyle={{ color: '#8b8fa8', marginBottom: 2 }}
-          itemStyle={{ color: lineColor }}
+          {...CHART.tooltip}
           labelFormatter={(v) => formatXLabel(axis, Number(v))}
           formatter={(v: number) => [formatMetricValue(v), '']}
-          cursor={{ stroke: '#353840', strokeWidth: 1 }}
+          cursor={{ stroke: N.n5, strokeWidth: 1 }}
         />
-        {area && <ReferenceArea x1={area[0]} x2={area[1]} fill="#f59e0b" fillOpacity={0.12} stroke="#f59e0b" strokeOpacity={0.4} />}
+        {area && <ReferenceArea x1={area[0]} x2={area[1]} fill={N.n8} fillOpacity={0.08} stroke={N.n7} strokeWidth={1} />}
         {eventMarkers.map((ev, i) => (
           <ReferenceLine
             key={i}
             x={ev.x}
-            stroke={eventColor(ev.severity)}
+            stroke={eventColor(ev.anomaly)}
             strokeWidth={1}
             strokeDasharray="3 3"
-            label={{
-              value: '●',
-              position: 'top',
-              fontSize: 7,
-              fill: eventColor(ev.severity),
-            }}
           />
         ))}
         {showRaw && (
@@ -169,7 +155,7 @@ function Chart({
             type="monotone"
             dataKey="raw"
             stroke={lineColor}
-            strokeOpacity={0.25}
+            strokeOpacity={0.3}
             strokeWidth={1}
             dot={false}
             activeDot={false}
@@ -194,7 +180,7 @@ function Chart({
 export default function MetricChart({
   name,
   data,
-  lineColor = '#f59e0b',
+  lineColor = SERIES,
   events,
   expanded = false,
   source,
@@ -275,13 +261,13 @@ export default function MetricChart({
   }, [shownData, opts, name, axis, shownSrc])
 
   const { markers, unmapped } = useMemo(() => {
-    const markers: { x: number; severity: string }[] = []
+    const markers: { x: number; anomaly: boolean }[] = []
     let unmapped = 0
     for (const ev of showLocalEvents ? (events ?? []) : []) {
       const x = eventX(ev, axis, shownSrc, firstTimestamp(shownData))
       if (x == null) {
         if (ev.step != null) unmapped++ // step-less events simply have no place on step/metric axes
-      } else markers.push({ x, severity: ev.severity })
+      } else markers.push({ x, anomaly: ev.event_type === 'anomaly_detected' })
     }
     return { markers, unmapped }
   }, [events, showLocalEvents, axis, shownSrc, shownData])
@@ -296,72 +282,63 @@ export default function MetricChart({
     setOpts({ alpha: Math.min(MAX_ALPHA, Math.max(0, alpha + (e.deltaY < 0 ? 0.05 : -0.05))) })
   }, [alpha, setOpts])
 
-  const chartHeight = expanded ? 440 : 160
+  const chartHeight = expanded ? 440 : 190
 
   return (
     <>
       <div
         ref={containerRef}
-        className="rounded-lg p-4"
-        style={{ backgroundColor: '#111318', border: '1px solid #252830' }}
+        className="group rounded-sm border border-py-border bg-py-surface p-3"
         onWheel={onWheel}
       >
-        <div className="flex items-baseline justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="num truncate text-xs text-py-soft" title={name}>
               {name}
             </span>
+            <ChartChips opts={opts} />
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1">
             {zoomed && (
               <button
+                type="button"
                 onClick={resetZoom}
                 title="Back to the full range"
-                className="text-xs font-mono"
-                style={{ background: 'none', border: '1px solid #353840', borderRadius: 4, color: '#f59e0b', padding: '0 6px', cursor: 'pointer' }}
+                className="h-6 rounded-sm border border-py-border-hi bg-py-surface px-2 text-xs text-py-soft transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text"
               >
-                reset zoom{self.loading ? ' …' : ''}
+                Reset zoom{self.loading ? '…' : ''}
               </button>
             )}
-            {last !== null && (
-              <span className="text-sm font-mono font-medium" style={{ color: lineColor }}>
-                {formatMetricValue(last)}
-              </span>
-            )}
+            {last !== null && <span className="num mr-1 text-[13px] text-py-text">{formatMetricValue(last)}</span>}
             {!expanded && events && events.length > 0 && (
               <button
+                type="button"
                 onClick={() => setShowLocalEvents((v) => !v)}
                 title={showLocalEvents ? 'Hide event markers' : 'Show event markers'}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  padding: '0 2px',
-                  cursor: 'pointer',
-                  fontSize: 10,
-                  color: showLocalEvents ? '#60a5fa' : '#2a2d38',
-                  lineHeight: 1,
-                }}
+                aria-label={showLocalEvents ? 'Hide event markers' : 'Show event markers'}
+                aria-pressed={showLocalEvents}
+                className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-py-muted transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text"
               >
-                ◆
+                <Icon name={showLocalEvents ? 'eye' : 'eye-off'} size={14} />
               </button>
+            )}
+            {data.length > 0 && (
+              <ChartControls
+                opts={opts}
+                onChange={setOpts}
+                dropped={dropped}
+                axisMetrics={source ? axisNames : undefined}
+                axes={axes}
+                overridden={overridden}
+                onReset={resetOpts}
+              />
             )}
             {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
           </div>
         </div>
 
-        {data.length > 0 && (
-          <ChartControls
-            opts={opts}
-            onChange={setOpts}
-            dropped={dropped}
-            axisMetrics={source ? axisNames : undefined}
-            axes={axes}
-            overridden={overridden}
-            onReset={resetOpts}
-          />
-        )}
         {(axisMissing || skipped > 0 || nonMonotonic || unmapped > 0) && (
-          <div className="text-xs font-mono mb-1" style={{ color: '#f59e0b', fontSize: 10 }}>
+          <div className="mb-1 text-[11px] text-py-muted">
             {axisMissing && `no ${axisMetricName(wanted)} logged for this run, showing step. `}
             {skipped > 0 && `${skipped} point${skipped === 1 ? '' : 's'} without ${axisLabel(axis)} hidden. `}
             {nonMonotonic && `${axisLabel(axis)} is not monotonic in step; points sorted by x. `}
@@ -370,11 +347,8 @@ export default function MetricChart({
         )}
 
         {data.length === 0 ? (
-          <div
-            className="flex items-center justify-center text-xs font-mono"
-            style={{ height: 160, color: '#4a4e60' }}
-          >
-            no data
+          <div className="flex items-center justify-center text-xs text-py-faint" style={{ height: chartHeight }}>
+            No data logged yet
           </div>
         ) : (
           <Chart
@@ -390,13 +364,7 @@ export default function MetricChart({
           />
         )}
 
-        {!expanded && (
-          <div className="mt-1 text-right">
-            <span className="text-xs font-mono" style={{ color: '#2a2d38' }}>
-              {zoomable ? 'drag to zoom · ' : ''}shift+scroll to smooth{self.failed ? ' · zoom fetch failed' : ''}
-            </span>
-          </div>
-        )}
+        {!expanded && self.failed && <div className="mt-1 text-right text-[11px] text-py-faint">Zoom fetch failed.</div>}
       </div>
 
       {isExpanded && (

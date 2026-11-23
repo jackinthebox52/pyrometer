@@ -8,22 +8,23 @@ export type OpCategory =
   | 'matmul' | 'conv' | 'attention' | 'norm' | 'activation' | 'loss' | 'optimizer' | 'autograd'
   | 'reduction' | 'shape' | 'transfer' | 'memory' | 'elementwise' | 'overhead' | 'other'
 
+/** Warm-world palette: matmul steel blue, attention heat amber, optimizer red, overhead bone, other a dark neutral. */
 export const LEGEND: readonly { key: OpCategory; color: string; label: string }[] = [
-  { key: 'matmul', color: '#2563eb', label: 'matmul' },
-  { key: 'conv', color: '#15803d', label: 'conv' },
-  { key: 'attention', color: '#facc15', label: 'attention' },
-  { key: 'norm', color: '#a855f7', label: 'norm' },
-  { key: 'activation', color: '#0d9488', label: 'activation' },
-  { key: 'loss', color: '#f472b6', label: 'loss' },
-  { key: 'optimizer', color: '#dc2626', label: 'optimizer' },
-  { key: 'autograd', color: '#a5b4fc', label: 'autograd' },
-  { key: 'reduction', color: '#bef264', label: 'reduction' },
-  { key: 'shape', color: '#22d3ee', label: 'shape/layout/indexing' },
-  { key: 'transfer', color: '#f97316', label: 'transfer' },
-  { key: 'memory', color: '#92400e', label: 'memory/fill' },
-  { key: 'elementwise', color: '#7c8798', label: 'elementwise' },
-  { key: 'overhead', color: '#e2e8f0', label: 'cuda overhead' },
-  { key: 'other', color: '#3b4252', label: 'other' },
+  { key: 'matmul', color: '#3d6fcf', label: 'matmul' },
+  { key: 'conv', color: '#2f9a84', label: 'conv' },
+  { key: 'attention', color: '#f6b23c', label: 'attention' },
+  { key: 'norm', color: '#b77fdc', label: 'norm' },
+  { key: 'activation', color: '#8fa02e', label: 'activation' },
+  { key: 'loss', color: '#e8809f', label: 'loss' },
+  { key: 'optimizer', color: '#c93c3c', label: 'optimizer' },
+  { key: 'autograd', color: '#b4b8e8', label: 'autograd' },
+  { key: 'reduction', color: '#dcc27c', label: 'reduction' },
+  { key: 'shape', color: '#45cfe0', label: 'shape/layout/indexing' },
+  { key: 'transfer', color: '#e87430', label: 'transfer' },
+  { key: 'memory', color: '#8f5a2e', label: 'memory/fill' },
+  { key: 'elementwise', color: '#9a8d7c', label: 'elementwise' },
+  { key: 'overhead', color: '#f0e8dc', label: 'cuda overhead' },
+  { key: 'other', color: '#4a3d32', label: 'other' },
 ]
 
 export const CATEGORY_COLOR: Record<OpCategory, string> = Object.fromEntries(

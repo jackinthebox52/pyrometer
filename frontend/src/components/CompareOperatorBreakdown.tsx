@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import type { ProfileEvent } from '../api/types.ts'
 import { formatMicroseconds } from '../utils/format.ts'
+import { CHART, N } from '../theme.ts'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 export interface ProfileSeries {
@@ -24,10 +25,10 @@ export default function CompareOperatorBreakdown({ series, expanded = false }: P
   if (!hasData) {
     return (
       <div
-        className="flex items-center justify-center text-xs font-mono rounded-lg"
-        style={{ height: 160, backgroundColor: '#111318', border: '1px solid #252830', color: '#4a4e60' }}
+        className="flex items-center justify-center rounded-sm border border-py-border bg-py-surface text-xs text-py-faint"
+        style={{ height: 160 }}
       >
-        no profile data
+        No profile data for this step
       </div>
     )
   }
@@ -72,19 +73,17 @@ export default function CompareOperatorBreakdown({ series, expanded = false }: P
 
   return (
     <>
-      <div className="rounded-lg p-4" style={{ backgroundColor: '#111318', border: '1px solid #252830' }}>
+      <div className="rounded-sm border border-py-border bg-py-surface p-3">
         <div className="flex items-center justify-between mb-2">
-          <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
-            Operator Breakdown
-          </span>
+          <span className="text-[13px] font-semibold text-py-text">Operator breakdown</span>
           {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
         </div>
 
         <div className="flex flex-wrap gap-4 mb-3">
           {series.map((s) => (
             <div key={s.runId} className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: s.color }} />
-              <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>{s.name}</span>
+              <div className="h-2 w-2 rounded-[1px]" style={{ backgroundColor: s.color }} />
+              <span className="text-[11px] text-py-muted">{s.name}</span>
             </div>
           ))}
         </div>
@@ -96,10 +95,10 @@ export default function CompareOperatorBreakdown({ series, expanded = false }: P
             margin={{ top: 0, right: 56, left: 16, bottom: 0 }}
             barSize={9}
           >
-            <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" horizontal={false} />
+            <CartesianGrid strokeDasharray="2 4" stroke={CHART.grid} horizontal={false} />
             <XAxis
               type="number"
-              tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
+              tick={CHART.tick}
               tickLine={false}
               axisLine={false}
               tickFormatter={formatMicroseconds}
@@ -108,25 +107,17 @@ export default function CompareOperatorBreakdown({ series, expanded = false }: P
               type="category"
               dataKey="name"
               width={165}
-              tick={{ fontSize: 10, fill: '#8b8fa8', fontFamily: 'JetBrains Mono' }}
+              tick={{ ...CHART.tick, fill: N.n8 }}
               tickLine={false}
               axisLine={false}
             />
             <Tooltip
-              contentStyle={{
-                backgroundColor: '#1a1d24',
-                border: '1px solid #353840',
-                borderRadius: 6,
-                fontSize: 12,
-                fontFamily: 'JetBrains Mono',
-                padding: '6px 10px',
-              }}
-              labelStyle={{ color: '#e8eaf0', marginBottom: 4 }}
+            {...CHART.tooltip}
               formatter={(value: number, runId: string) => {
                 const run = series.find((s) => s.runId === runId)
                 return [formatMicroseconds(value), run?.name ?? runId]
               }}
-              cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+              cursor={{ fill: N.n3, fillOpacity: 0.5 }}
             />
             {series.map((s) => (
               <Bar

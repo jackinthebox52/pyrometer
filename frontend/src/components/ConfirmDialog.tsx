@@ -68,7 +68,7 @@ export default function ConfirmDialog({ title, children, confirmLabel, requireTe
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[300] flex items-center justify-center bg-black/70 p-6"
+      className="fixed inset-0 z-[300] flex items-center justify-center bg-py-n0/80 p-6"
       onMouseDown={() => !busy && onCancel()}
     >
       <form
@@ -79,37 +79,37 @@ export default function ConfirmDialog({ title, children, confirmLabel, requireTe
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={onKeyDown}
         onSubmit={submit}
-        className="w-full max-w-md rounded-lg border border-py-border-hi bg-py-surface p-5 flex flex-col gap-3"
+        className="w-full max-w-md rounded border border-py-border-hi bg-py-surface p-5 flex flex-col gap-3"
       >
-        <h2 className="text-sm font-semibold text-py-text">{title}</h2>
-        <div className="text-xs leading-relaxed text-py-muted flex flex-col gap-2">{children}</div>
+        <h2 className="text-[15px] font-semibold text-py-text">{title}</h2>
+        <div className="text-[13px] leading-relaxed text-py-muted flex flex-col gap-2">{children}</div>
         {requireText !== undefined && (
-          <label className="flex flex-col gap-1 text-xs text-py-muted">
+          <label className="flex flex-col gap-1 text-[13px] text-py-muted">
             Type <code className="font-mono text-py-text">{requireText}</code> to confirm
             <input
               value={typed}
               onChange={(e) => setTyped(e.target.value)}
               autoComplete="off"
               spellCheck={false}
-              className="rounded border border-py-border bg-py-elevated px-2 py-1.5 text-xs font-mono text-py-text outline-none focus:border-py-border-hi"
+              className="h-8 rounded border border-py-border-hi bg-py-elevated px-2 font-mono text-[13px] text-py-text"
             />
           </label>
         )}
-        {error && <p role="alert" className="text-xs text-py-crashed">{error}</p>}
+        {error && <p role="alert" className="text-[13px] text-py-red">{error}</p>}
         <div className="flex justify-end gap-2">
           <button
             type="button"
             data-cancel
             onClick={onCancel}
             disabled={busy}
-            className="rounded border border-py-border px-3 py-1.5 text-xs font-mono text-py-muted"
+            className="h-8 rounded border border-py-border-hi bg-py-surface px-3 text-[13px] text-py-soft transition-colors hover:bg-py-elevated hover:text-py-text disabled:cursor-not-allowed disabled:opacity-50"
           >
             Cancel
           </button>
           <button
             type="submit"
             disabled={blocked}
-            className={`rounded px-3 py-1.5 text-xs font-mono disabled:opacity-40 ${danger ? 'bg-py-crashed text-white' : 'bg-py-amber text-black'}`}
+            className={`h-8 rounded px-3 text-[13px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${danger ? 'border border-py-red bg-py-red text-py-n0 hover:bg-py-red/85' : 'bg-py-n8 text-py-base hover:bg-py-text'}`}
           >
             {busy ? 'Working…' : confirmLabel}
           </button>

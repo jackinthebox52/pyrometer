@@ -3,6 +3,7 @@ import * as d3 from 'd3'
 import type { ProfileEvent } from '../api/types.ts'
 import { formatMicroseconds } from '../utils/format.ts'
 import { LEGEND, opColor } from '../utils/kernelColors.ts'
+import { HEAT, N, STEEL } from '../theme.ts'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 interface Props {
@@ -96,7 +97,7 @@ export default function KernelTimeline({ events }: Props) {
           name: '(other)',
           cpuUs: 0,
           cudaUs: 0,
-          color: '#252830',
+          color: N.n4,
           inputShapes: [],
           memoryBytes: null,
           isOther: true,
@@ -140,10 +141,10 @@ export default function KernelTimeline({ events }: Props) {
 
     function styleAxis(ag: d3.Selection<SVGGElement, unknown, null, undefined>) {
       ag.select('.domain').remove()
-      ag.selectAll('.tick line').attr('stroke', '#1e2128').attr('stroke-dasharray', '3,2')
+      ag.selectAll('.tick line').attr('stroke', N.n4).attr('stroke-dasharray', '2,4')
       ag
         .selectAll('.tick text')
-        .attr('fill', '#4a4e60')
+        .attr('fill', N.n7)
         .attr('font-size', 10)
         .attr('font-family', 'JetBrains Mono, monospace')
         .attr('dy', 14)
@@ -169,7 +170,7 @@ export default function KernelTimeline({ events }: Props) {
         .attr('y', LANE_H / 2)
         .attr('text-anchor', 'end')
         .attr('dominant-baseline', 'middle')
-        .attr('fill', '#4a4e60')
+        .attr('fill', N.n7)
         .attr('font-size', 10)
         .attr('font-family', 'JetBrains Mono, monospace')
         .text(lane.label)
@@ -181,8 +182,8 @@ export default function KernelTimeline({ events }: Props) {
         .attr('y', 0)
         .attr('width', innerW)
         .attr('height', LANE_H)
-        .attr('fill', '#0e1014')
-        .attr('rx', 3)
+        .attr('fill', N.n1)
+        .attr('rx', 2)
 
       // Clipped content group
       const clippedG = laneG.append('g').attr('clip-path', 'url(#tl-clip)')
@@ -210,14 +211,14 @@ export default function KernelTimeline({ events }: Props) {
               : '—'
           const memLine =
             d.memoryBytes != null
-              ? `<div style="color:#8b8fa8">Δmem: <span style="color:#60a5fa">${(d.memoryBytes / 1024).toFixed(1)} KB</span></div>`
+              ? `<div style="color:${N.n7}">Mem delta: <span style="color:${STEEL}">${(d.memoryBytes / 1024).toFixed(1)} KB</span></div>`
               : ''
           tooltip.style('display', 'block').html(
-            `<div style="color:#e8eaf0;margin-bottom:4px;word-break:break-all">${d.name}</div>` +
-              `<div style="color:#8b8fa8">CPU: <span style="color:#e8eaf0">${formatMicroseconds(d.cpuUs)}</span></div>` +
-              `<div style="color:#8b8fa8">CUDA: <span style="color:#f59e0b">${formatMicroseconds(d.cudaUs)}</span></div>` +
+            `<div style="color:${N.n9};margin-bottom:4px;word-break:break-all">${d.name}</div>` +
+              `<div style="color:${N.n7}">CPU: <span style="color:${STEEL}">${formatMicroseconds(d.cpuUs)}</span></div>` +
+              `<div style="color:${N.n7}">CUDA: <span style="color:${HEAT[4]}">${formatMicroseconds(d.cudaUs)}</span></div>` +
               memLine +
-              `<div style="color:#4a4e60;margin-top:3px;font-size:10px">shapes: ${shapes}</div>`,
+              `<div style="color:${N.n6};margin-top:3px;font-size:10px">shapes: ${shapes}</div>`,
           )
         })
         .on('mousemove', function (_ev: Event, d: BarDatum) {
@@ -250,7 +251,7 @@ export default function KernelTimeline({ events }: Props) {
         .attr('y', LANE_H / 2 + 1)
         .attr('text-anchor', 'middle')
         .attr('dominant-baseline', 'middle')
-        .attr('fill', 'rgba(0,0,0,0.72)')
+        .attr('fill', N.n0)
         .attr('font-size', 9)
         .attr('font-family', 'JetBrains Mono, monospace')
         .style('display', (d) => (xBase(d.x1) - xBase(d.x0) > 48 ? null : 'none'))
@@ -319,28 +320,23 @@ export default function KernelTimeline({ events }: Props) {
   return (
     <div
       ref={containerRef}
-      className="rounded-lg p-4"
-      style={{ backgroundColor: '#111318', border: '1px solid #252830', position: 'relative' }}
+      className="relative rounded-sm border border-py-border bg-py-surface p-3"
     >
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
-          Kernel Timeline
-        </span>
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-[13px] font-semibold text-py-text">Kernel timeline</span>
         <div className="flex items-center gap-3">
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
-            scroll to zoom · drag to pan · double-click to reset
+          <span className="text-[11px] text-py-faint">
+            Scroll to zoom, drag to pan, double-click to reset
           </span>
           <ExpandButton onClick={() => setIsExpanded(true)} />
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-x-4 gap-y-1.5 mb-3">
+      <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1.5">
         {LEGEND.map(({ color, label }) => (
           <div key={label} className="flex items-center gap-1.5">
-            <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: color }} />
-            <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
-              {label}
-            </span>
+            <div className="h-2 w-2 rounded-[1px]" style={{ backgroundColor: color }} />
+            <span className="text-[11px] text-py-muted">{label}</span>
           </div>
         ))}
       </div>
@@ -352,13 +348,13 @@ export default function KernelTimeline({ events }: Props) {
         style={{
           display: 'none',
           position: 'absolute',
-          background: '#1a1d24',
-          border: '1px solid #353840',
-          borderRadius: 6,
+          background: N.n2,
+          border: `1px solid ${N.n5}`,
+          borderRadius: 2,
           padding: '7px 10px',
           fontFamily: 'JetBrains Mono, monospace',
           fontSize: 11,
-          color: '#e8eaf0',
+          color: N.n9,
           zIndex: 50,
           width: TOOLTIP_W,
           lineHeight: 1.65,

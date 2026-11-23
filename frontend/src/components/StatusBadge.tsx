@@ -1,41 +1,44 @@
 import type { RunStatus } from '../api/types.ts'
 
-const CONFIG: Record<RunStatus, { color: string; label: string; pulse: boolean }> = {
-  running: { color: '#22c55e', label: 'Running', pulse: true },
-  completed: { color: '#60a5fa', label: 'Completed', pulse: false },
-  failed: { color: '#f97316', label: 'Failed', pulse: false },
-  crashed: { color: '#ef4444', label: 'Crashed', pulse: false },
-  killed: { color: '#eab308', label: 'Killed', pulse: false },
+const CONFIG: Record<RunStatus, { chip: string; label: string; pulse: boolean }> = {
+  running: { chip: 'bg-py-running', label: 'Running', pulse: true },
+  completed: { chip: 'bg-py-steel', label: 'Completed', pulse: false },
+  failed: { chip: 'bg-py-red', label: 'Failed', pulse: false },
+  crashed: { chip: 'bg-py-red', label: 'Crashed', pulse: false },
+  killed: { chip: 'bg-py-muted', label: 'Killed', pulse: false },
 }
 
 interface Props {
   status: RunStatus
   size?: 'sm' | 'md'
-  /** Show only the dot, no label text */
+  /** Show only the chip, no label text */
   compact?: boolean
 }
 
+/** Run status: a small square heat chip plus a sentence-case label. */
 export default function StatusBadge({ status, size = 'md', compact = false }: Props) {
-  const { color, label, pulse } = CONFIG[status]
-  const dotPx = size === 'sm' || compact ? 6 : 8
-
+  const { chip, label, pulse } = CONFIG[status]
+  const chipEl = (
+    <span
+      aria-hidden="true"
+      className={`inline-block h-2 w-2 shrink-0 rounded-[1px] ${chip}${pulse ? ' status-pulse' : ''}`}
+    />
+  )
+  if (compact) {
+    return (
+      <span className="inline-flex items-center" title={label} role="img" aria-label={label}>
+        {chipEl}
+      </span>
+    )
+  }
   return (
     <span
-      className={`inline-flex items-center gap-1.5 font-mono ${size === 'sm' ? 'text-xs' : 'text-sm'}`}
-      style={{ color }}
+      className={`inline-flex items-center gap-1.5 rounded-[2px] border bg-py-surface px-1.5 text-py-soft border-py-border ${
+        size === 'sm' ? 'py-px text-[11px]' : 'py-0.5 text-xs'
+      }`}
     >
-      <span
-        className={pulse ? 'status-pulse' : ''}
-        style={{
-          display: 'inline-block',
-          width: dotPx,
-          height: dotPx,
-          borderRadius: '50%',
-          backgroundColor: color,
-          flexShrink: 0,
-        }}
-      />
-      {!compact && label}
+      {chipEl}
+      {label}
     </span>
   )
 }

@@ -303,14 +303,18 @@ All filters are bound parameters and compose with each other, `include_archived`
       "group": "lr-sweep",
       "archived": false,
       "project_archived": false,
-      "pinned": false
+      "pinned": false,
+      "gpu_heat": 0.83
     }
   ],
   "error": null
 }
 ```
 
-`pinned` is the caller's own pin (always `false` for API keys). Offset paging is not a snapshot: a run that becomes active between
+`pinned` is the caller's own pin (always `false` for API keys). `gpu_heat` is each run's recent GPU load as a number in `0..1`: the mean of
+`COALESCE(attributed_utilization, gpu_utilization) / 100` over the run's system snapshots within 60 s of its newest snapshot (all GPUs), or
+`null` when the run has none. The dashboard sidebar colours a running run's chip with it. It is computed for the page in one query and is only
+present on list responses (`GET /runs`, `GET /pins`). Offset paging is not a snapshot: a run that becomes active between
 two page requests moves in the `updated` order, so a client paging live data may see a run twice or miss one. `GET /runs/{run_id}` returns the same extra fields
 (`updated_at`, `group`, `archived`, `pinned`) plus `notes` and the hardware fields.
 

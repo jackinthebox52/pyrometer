@@ -1,17 +1,19 @@
 export default function EmptyState() {
   return (
-    <div
-      className="flex flex-col items-center justify-center h-full gap-3"
-      style={{ color: '#4a4e60' }}
-    >
-      <span style={{ fontSize: 40, color: '#1e2128', lineHeight: 1 }}>◉</span>
-      <p className="text-sm font-mono">Select a run from the sidebar</p>
-      <p className="text-xs" style={{ color: '#353840' }}>
-        or start a training run with{' '}
-        <code className="font-mono" style={{ color: '#8b8fa8' }}>
-          pyrometer.init()
-        </code>
-      </p>
+    <div className="flex h-full flex-col items-center justify-center gap-4 p-6">
+      <div className="flex w-full max-w-[640px] flex-col gap-3">
+        <h1 className="text-[22px] font-semibold text-py-text">Pick a run, or start one</h1>
+        <p className="text-[13px] text-py-muted">Choose a run from the sidebar, or log a new one from your training script.</p>
+        <pre className="overflow-x-auto rounded border border-py-border bg-py-n0 p-3 font-mono text-xs leading-relaxed text-py-soft">
+{`import pyrometer
+
+with pyrometer.init(name="my-run", project="default") as run:
+    train()`}
+        </pre>
+        <p className="text-[13px] text-py-muted">
+          Or launch an existing script unchanged with <code className="font-mono text-py-soft">pyrometer run train.py</code>.
+        </p>
+      </div>
     </div>
   )
 }

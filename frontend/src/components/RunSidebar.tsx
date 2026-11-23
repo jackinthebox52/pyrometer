@@ -7,6 +7,8 @@ import { RUN_COLORS } from '../utils/runColors.ts'
 import { useWebSocket } from '../hooks/useWebSocket.ts'
 import { useSession } from '../hooks/useSession.ts'
 import ConfirmDialog from './ConfirmDialog.tsx'
+import Icon from './Icon.tsx'
+import { heatColor } from '../theme.ts'
 import {
   EMPTY_FILTERS,
   applyLiveRun,
@@ -24,12 +26,14 @@ import {
   type SidebarItem,
 } from '../utils/runList.ts'
 
-const STATUS_COLOR: Record<string, string> = {
-  running: '#22c55e',
-  completed: '#60a5fa',
-  failed: '#f97316',
-  crashed: '#ef4444',
-  killed: '#eab308',
+const STATUSES = ['running', 'completed', 'failed', 'crashed', 'killed']
+
+/** Chip colour class for a finished run; running runs are coloured by their GPU heat instead. */
+const CHIP_CLASS: Record<string, string> = {
+  completed: 'bg-py-steel',
+  failed: 'bg-py-red',
+  crashed: 'bg-py-red',
+  killed: 'bg-py-muted',
 }
 
 const PAGE_SIZE = 50
@@ -37,8 +41,11 @@ const ACTIVITY_REFRESH_MS = 2000 // run_activity events refresh the first page a
 const FACETS_REFRESH_MS = 3000
 const SEARCH_DEBOUNCE_MS = 300
 const field =
-  'w-full rounded border border-py-border bg-py-base px-2 py-1 text-xs text-py-text outline-none focus:border-py-border-hi'
-const smallBtn = 'rounded border border-py-border px-2 py-1 text-xs font-mono text-py-muted disabled:opacity-40'
+  'h-[30px] w-full rounded-[2px] border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text outline-none placeholder:text-py-faint'
+const smallBtn =
+  'h-7 rounded-[2px] border border-py-border-hi bg-py-surface px-2 text-xs text-py-soft transition-colors duration-150 hover:bg-py-elevated hover:text-py-text disabled:cursor-not-allowed disabled:opacity-50'
+const quietLink =
+  'flex items-center gap-1.5 text-xs text-py-muted transition-colors duration-150 hover:text-py-text'
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -80,6 +87,8 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(load<string[]>('pyro.sidebar.collapsed', [])))
   const [bulkOpen, setBulkOpen] = useState(false)
   const navigate = useNavigate()
+  const activeMatch = useMatch('/runs/:runId')
+  const activeRunId = activeMatch?.params.runId
 
   const offsetRef = useRef(0) // server rows consumed so far (not runs.length: dedupe and live inserts skew that)
   const genRef = useRef(0) // bumped on every reset so late responses from an old query are dropped
@@ -283,6 +292,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
   const selectedSet = new Set(selectedIds)
   const isComparing = selectedIds.length >= 2
   const hasMore = offsetRef.current < total
+  const activeFilterCount = [filters.status, filters.group, filters.tags.length, filters.from, filters.to, filters.includeArchived].filter(Boolean).length
   const activeFilters = filters.status || filters.project || filters.group || filters.tags.length || filters.from || filters.to || filters.includeArchived
 
   function setFilter(patch: Partial<RunFilters>) {
@@ -314,13 +324,18 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
 
   function renderRun(run: Run, nested: boolean) {
     const isSelected = selectedSet.has(run.run_id)
+    const isActive = run.run_id === activeRunId
     const idx = selectedIds.indexOf(run.run_id)
     const color = idx >= 0 ? RUN_COLORS[idx % RUN_COLORS.length] : undefined
+    const running = run.status === 'running'
+    const stale = !!run.archived || !!run.project_archived
+    const chipClass = stale ? 'bg-py-steel opacity-40' : running ? 'status-pulse' : (CHIP_CLASS[run.status] ?? 'bg-py-muted')
     return (
       <div
         key={run.run_id}
-        className="flex items-stretch mx-1 my-px rounded overflow-hidden"
-        style={{ backgroundColor: isSelected ? 'rgba(245,158,11,0.05)' : undefined, marginLeft: nested ? 14 : undefined, opacity: run.archived ? 0.6 : 1 }}
+        className={`mx-1 my-px flex min-h-[44px] items-stretch rounded-[2px] border transition-colors duration-150 ${
+          isActive ? 'border-py-border-hi bg-py-elevated' : 'border-transparent hover:bg-py-surface'
+        }${nested ? ' ml-4' : ''}`}
       >
         <button
           role="checkbox"
@@ -328,42 +343,38 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
           aria-label={`Select ${run.name}`}
           onClick={(e) => clickSelect(run.run_id, e.shiftKey)}
           title="Select (shift-click for a range)"
-          className="flex items-center justify-center flex-shrink-0 px-2 rounded-l"
-          style={{ width: 28, background: 'transparent', border: 'none', cursor: 'pointer' }}
+          className="flex w-7 flex-shrink-0 items-center justify-center"
         >
           <span
-            style={{
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 14, height: 14, borderRadius: 3,
-              border: `1.5px solid ${isSelected ? (color ?? '#f59e0b') : '#2d3140'}`,
-              backgroundColor: isSelected ? `${color ?? '#f59e0b'}22` : 'transparent',
-              fontSize: 9, color: color ?? '#f59e0b',
-            }}
+            className={`inline-flex h-3.5 w-3.5 items-center justify-center rounded-[2px] border text-py-n0 ${
+              isSelected ? 'border-py-soft bg-py-soft' : 'border-py-border-hi'
+            }`}
+            style={isSelected && color ? { backgroundColor: color, borderColor: color } : undefined}
           >
-            {isSelected && '✓'}
+            {isSelected && <Icon name="check" size={10} />}
           </span>
         </button>
-        <NavLink
-          to={`/runs/${run.run_id}`}
-          className={({ isActive }) => `run-nav-link flex-1${isActive ? ' active' : ''}`}
-          style={{ margin: 0, borderRadius: 0, minWidth: 0 }}
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <span
-              className={run.status === 'running' ? 'status-pulse' : ''}
-              style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', backgroundColor: STATUS_COLOR[run.status] ?? '#4a4e60', flexShrink: 0 }}
-            />
-            <span className="truncate text-sm font-medium leading-snug" style={{ color: '#e8eaf0' }}>{run.name}</span>
-            {run.pinned && <span aria-label="pinned" title="Pinned" style={{ color: '#f59e0b', fontSize: 10 }}>★</span>}
-          </div>
-          <div className="flex items-center gap-2 mt-0.5 pl-[14px] min-w-0">
-            <span className="text-xs font-mono whitespace-nowrap shrink-0" style={{ color: '#4a4e60' }}>
-              {timeAgo(sort === 'created' ? run.created_at : (run.updated_at ?? run.created_at))}
+        <NavLink to={`/runs/${run.run_id}`} className="flex min-w-0 flex-1 items-center gap-2 py-1.5 pr-2">
+          <span
+            aria-hidden="true"
+            className={`h-3.5 w-2 flex-shrink-0 rounded-[1px] ${chipClass}`}
+            style={running && !stale ? { backgroundColor: heatColor(run.gpu_heat ?? 0.5) } : undefined}
+          />
+          <span className="flex min-w-0 flex-1 flex-col">
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className={`truncate text-[13px] leading-snug ${running ? 'text-py-text' : 'text-py-soft'}`}>{run.name}</span>
+              {run.pinned && <Icon name="pin" size={11} className="flex-shrink-0 text-py-muted" />}
             </span>
-            {run.archived && <span className="text-xs font-mono text-py-killed shrink-0">archived</span>}
-            {run.tags.slice(0, 2).map((tag) => (
-              <span key={tag} className="text-xs truncate min-w-0" style={{ color: '#4a4e60' }}>#{tag}</span>
-            ))}
-          </div>
+            <span className="flex min-w-0 items-center gap-1.5 text-[11px] leading-snug text-py-muted">
+              <span className="num shrink-0 whitespace-nowrap">
+                {timeAgo(sort === 'created' ? run.created_at : (run.updated_at ?? run.created_at))}
+              </span>
+              {run.archived && <span className="shrink-0">archived</span>}
+              {run.tags.slice(0, 2).map((tag) => (
+                <span key={tag} className="min-w-0 truncate">#{tag}</span>
+              ))}
+            </span>
+          </span>
         </NavLink>
       </div>
     )
@@ -377,34 +388,32 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
     const allSel = ids.every((id) => selectedSet.has(id))
     return (
       <div key={it.key}>
-        <div className="flex items-center mx-1 my-px rounded" style={{ backgroundColor: '#15171d' }}>
+        <div className="mx-1 mt-1.5 flex items-center rounded-[2px]">
           <button
             role="checkbox"
             aria-checked={allSel}
             aria-label={`Select all runs in ${it.group}`}
             onClick={() => onSelectMany(ids, !allSel)}
-            className="flex items-center justify-center px-2"
-            style={{ width: 28, background: 'transparent', border: 'none', cursor: 'pointer', color: '#f59e0b', fontSize: 9 }}
+            className="flex w-7 items-center justify-center"
           >
-            <span style={{ width: 14, height: 14, borderRadius: 3, border: `1.5px solid ${allSel ? '#f59e0b' : '#2d3140'}`, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
-              {allSel && '✓'}
+            <span className={`inline-flex h-3.5 w-3.5 items-center justify-center rounded-[2px] border text-py-n0 ${allSel ? 'border-py-soft bg-py-soft' : 'border-py-border-hi'}`}>
+              {allSel && <Icon name="check" size={10} />}
             </span>
           </button>
           <button
             onClick={() => toggleCollapsed(it.key)}
             aria-expanded={open}
             title={`${it.group} (${it.project})`}
-            className="flex-1 min-w-0 text-left py-1.5 pr-2"
-            style={{ background: 'transparent', border: 'none', cursor: 'pointer' }}
+            className="min-w-0 flex-1 py-1.5 pr-2 text-left"
           >
-            <div className="flex items-center gap-1.5 min-w-0">
-              <span style={{ color: '#8b8fa8', fontSize: 9 }}>{open ? '▾' : '▸'}</span>
-              <span className="truncate text-xs font-semibold" style={{ color: '#e8eaf0' }}>{it.group}</span>
-              <span className="text-xs font-mono" style={{ color: '#4a4e60' }} title={gf && gf.runs > it.runs.length ? `${it.runs.length} of ${gf.runs} runs loaded` : undefined}>
+            <span className="flex min-w-0 items-center gap-1.5">
+              <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} className="flex-shrink-0 text-py-muted" />
+              <span className="log-label truncate">{it.group}</span>
+              <span className="num text-[11px] text-py-muted" title={gf && gf.runs > it.runs.length ? `${it.runs.length} of ${gf.runs} runs loaded` : undefined}>
                 {gf && gf.runs > it.runs.length ? `${it.runs.length}/${gf.runs}` : it.runs.length}
               </span>
-            </div>
-            <div className="pl-[15px] text-xs font-mono truncate" style={{ color: '#4a4e60' }}>{gf ? summarizeStatuses(gf.statuses) : it.summary}</div>
+            </span>
+            <span className="num block truncate pl-[18px] text-[11px] text-py-faint">{gf ? summarizeStatuses(gf.statuses) : it.summary}</span>
           </button>
         </div>
         {open && it.runs.map((r) => renderRun(r, true))}
@@ -412,27 +421,31 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
     )
   }
 
-  const sectionLabel = 'px-4 pt-2 pb-1 text-[10px] font-mono uppercase tracking-widest text-py-faint'
+  const sectionLabel = 'log-label px-4 pt-3 pb-1'
 
   return (
-    <aside className="flex flex-col border-r" style={{ width: 288, minWidth: 288, backgroundColor: '#111318', borderColor: '#252830' }}>
-      <div className="flex items-center gap-2.5 px-4 py-[14px] border-b" style={{ borderColor: '#252830' }}>
-        <span style={{ color: '#f59e0b', fontSize: 17, lineHeight: 1 }}>◉</span>
-        <span className="font-semibold tracking-widest text-xs uppercase" style={{ color: '#e8eaf0', letterSpacing: '0.18em' }}>Pyrometer</span>
-      </div>
-
-      {/* Search + sort + filter toggle */}
-      <div className="px-3 py-2.5 border-b flex flex-col gap-2" style={{ borderColor: '#252830' }}>
-        <input
-          type="search"
-          aria-label="Filter runs by name, group or tag"
-          placeholder="Filter by name, group or tag…"
-          value={filters.query}
-          onChange={(e) => setFilter({ query: e.target.value })}
-          className={`${field} px-3 py-1.5`}
-        />
+    <aside className="flex w-72 min-w-[18rem] flex-col border-r border-py-border bg-py-n0">
+      <div className="flex flex-col gap-2 border-b border-py-border px-3 pb-3 pt-4">
+        <span className="px-1 text-[15px] font-semibold text-py-text">Pyrometer</span>
+        <select aria-label="Project" value={filters.project} onChange={(e) => setFilter({ project: e.target.value })} className={field}>
+          <option value="">All projects</option>
+          {projects.map((p) => (
+            <option key={p.name} value={p.name}>{p.name}{p.archived ? ' (archived)' : ''}</option>
+          ))}
+        </select>
+        <div className="relative">
+          <Icon name="search" size={14} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-py-muted" />
+          <input
+            type="search"
+            aria-label="Filter runs by name, group or tag"
+            placeholder="Filter by name, group or tag"
+            value={filters.query}
+            onChange={(e) => setFilter({ query: e.target.value })}
+            className={`${field} pl-7`}
+          />
+        </div>
         <div className="flex items-center gap-2">
-          <label className="flex items-center gap-1 text-xs text-py-faint">
+          <label className="flex min-w-0 flex-1 items-center gap-2 text-xs text-py-muted">
             Sort
             <select
               aria-label="Sort runs"
@@ -442,7 +455,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
                 setSort(s)
                 save('pyro.sidebar.sort', s)
               }}
-              className={field}
+              className={`${field} h-7 min-w-0 flex-1 text-xs`}
             >
               <option value="updated">Last updated</option>
               <option value="created">Created</option>
@@ -452,23 +465,17 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
           <button
             onClick={() => setShowFilters((v) => !v)}
             aria-expanded={showFilters}
-            className={smallBtn}
-            style={activeFilters ? { color: '#f59e0b', borderColor: '#f59e0b66' } : undefined}
+            className={`${smallBtn} flex items-center gap-1.5 ${activeFilterCount ? 'border-py-soft text-py-text' : ''}`}
           >
-            Filters{activeFilters ? ' •' : ''}
+            <Icon name="filter" size={12} />
+            Filters{activeFilterCount ? <span className="num"> {activeFilterCount}</span> : null}
           </button>
         </div>
         {showFilters && (
           <div className="flex max-h-[45vh] flex-col gap-2 overflow-y-auto" role="group" aria-label="Run filters">
-            <select aria-label="Project" value={filters.project} onChange={(e) => setFilter({ project: e.target.value })} className={field}>
-              <option value="">All projects</option>
-              {projects.map((p) => (
-                <option key={p.name} value={p.name}>{p.name}{p.archived ? ' (archived)' : ''}</option>
-              ))}
-            </select>
             <select aria-label="Status" value={filters.status} onChange={(e) => setFilter({ status: e.target.value })} className={field}>
               <option value="">Any status</option>
-              {Object.keys(STATUS_COLOR).map((s) => <option key={s} value={s}>{s}{facets?.statuses[s] ? ` (${facets.statuses[s]})` : ''}</option>)}
+              {STATUSES.map((s) => <option key={s} value={s}>{s}{facets?.statuses[s] ? ` (${facets.statuses[s]})` : ''}</option>)}
             </select>
             <select aria-label="Group" value={filters.group} onChange={(e) => setFilter({ group: e.target.value })} className={field}>
               <option value="">Any group</option>
@@ -476,7 +483,7 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
             </select>
             <div className="flex items-center gap-1">
               <input type="date" aria-label="Created from" value={filters.from} onChange={(e) => setFilter({ from: e.target.value })} className={`${field} min-w-0 flex-1`} />
-              <span className="text-py-faint text-xs">–</span>
+              <span className="text-xs text-py-faint">to</span>
               <input type="date" aria-label="Created to" value={filters.to} onChange={(e) => setFilter({ to: e.target.value })} className={`${field} min-w-0 flex-1`} />
             </div>
             {tagChoices.length > 0 && (
@@ -488,8 +495,9 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
                       key={t}
                       aria-pressed={on}
                       onClick={() => setFilter({ tags: on ? filters.tags.filter((x) => x !== t) : [...filters.tags, t] })}
-                      className="rounded px-1.5 py-0.5 text-xs font-mono"
-                      style={{ border: `1px solid ${on ? '#f59e0b' : '#252830'}`, color: on ? '#f59e0b' : '#8b8fa8', background: 'transparent', cursor: 'pointer' }}
+                      className={`rounded-[2px] border px-1.5 py-0.5 text-xs transition-colors duration-150 ${
+                        on ? 'border-py-border-hi bg-py-elevated text-py-text' : 'border-py-border text-py-muted hover:bg-py-surface hover:text-py-text'
+                      }`}
                     >
                       #{t}
                     </button>
@@ -510,10 +518,10 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
 
       {/* Run list */}
       <div className="flex-1 overflow-y-auto py-1" onScroll={onScroll}>
-        {serverDown && <div className="px-4 py-3 text-xs font-mono" style={{ color: '#4a4e60' }}>⚠ Server unreachable</div>}
+        {serverDown && <div className="px-4 py-3 text-xs text-py-red">Server unreachable</div>}
         {!serverDown && !loading && visible.length === 0 && visiblePins.length === 0 && (
-          <div className="px-4 py-4 text-xs" style={{ color: '#4a4e60' }}>
-            {filters.query || activeFilters ? 'No matching runs' : 'No runs yet'}
+          <div className="px-4 py-4 text-xs text-py-muted">
+            {filters.query || activeFilters ? 'No matching runs' : <>No runs yet. Start one with <code className="num text-py-soft">pyrometer.init()</code>.</>}
           </div>
         )}
         {visiblePins.length > 0 && (
@@ -527,14 +535,14 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
         {hasMore && !serverDown && (
           <div className="px-3 py-2">
             <button className={`${smallBtn} w-full`} disabled={loading} onClick={() => fetchPage(false)}>
-              {loading ? 'Loading…' : `Load more (${Math.max(total - offsetRef.current, 0)} left)`}
+              {loading ? 'Loading' : <>Load more (<span className="num">{Math.max(total - offsetRef.current, 0)}</span> left)</>}
             </button>
           </div>
         )}
       </div>
 
       {/* Footer: selection / bulk bar */}
-      <div className="border-t" style={{ borderColor: '#252830' }}>
+      <div className="border-t border-py-border">
         {selectedIds.length > 0 ? (
           <>
             {isAdmin && bulkOpen && (
@@ -549,46 +557,39 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
                 }}
               />
             )}
-            <div className="flex">
+            <div className="flex items-center gap-1.5 p-2">
               <button
                 onClick={() => navigate(`/compare?ids=${selectedIds.join(',')}`)}
                 disabled={!isComparing}
-                className="flex-1 px-4 py-2.5 text-xs font-mono text-left disabled:opacity-50"
-                style={{ backgroundColor: 'rgba(245, 158, 11, 0.1)', color: '#f59e0b', border: 'none', cursor: isComparing ? 'pointer' : 'default' }}
+                className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-[2px] bg-py-n8 px-3 text-[13px] font-medium text-py-base transition-colors duration-150 hover:bg-py-text disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isComparing ? `Compare ${selectedIds.length} runs →` : '1 selected'}
+                <Icon name="compare" size={14} />
+                {isComparing ? <>Compare (<span className="num">{selectedIds.length}</span>)</> : <>Select one more</>}
               </button>
               {isAdmin && (
-                <button
-                  onClick={() => setBulkOpen((v) => !v)}
-                  aria-expanded={bulkOpen}
-                  className="px-3 py-2.5 text-xs font-mono"
-                  style={{ background: 'transparent', color: '#8b8fa8', border: 'none', borderLeft: '1px solid #252830', cursor: 'pointer' }}
-                >
+                <button onClick={() => setBulkOpen((v) => !v)} aria-expanded={bulkOpen} className={`${smallBtn} h-8`}>
                   Bulk
                 </button>
               )}
-              <button
-                onClick={onClearSelection}
-                title="Clear selection"
-                aria-label="Clear selection"
-                className="px-3 py-2.5 text-xs font-mono"
-                style={{ background: 'transparent', color: '#4a4e60', border: 'none', borderLeft: '1px solid #252830', cursor: 'pointer' }}
-              >
-                ✕
+              <button onClick={onClearSelection} title="Clear selection" aria-label="Clear selection" className={`${smallBtn} flex h-8 items-center px-2`}>
+                <Icon name="x" size={14} />
               </button>
             </div>
           </>
         ) : (
-          <div className="px-4 py-2 text-xs font-mono" style={{ color: '#4a4e60' }}>
+          <div className="num px-4 py-2 text-[11px] text-py-muted">
             {total} run{total !== 1 ? 's' : ''}{runs.length < total && ` · ${runs.length} loaded`}
           </div>
         )}
       </div>
 
-      <div className="flex items-center justify-between px-4 py-2 border-t text-xs font-mono" style={{ borderColor: '#252830', color: '#4a4e60' }}>
-        <NavLink to="/settings" style={{ color: '#8b8fa8' }}>Settings</NavLink>
-        <button onClick={() => api.logout().finally(() => window.location.reload())} style={{ background: 'none', border: 'none', color: '#8b8fa8', cursor: 'pointer' }}>
+      <div className="flex items-center justify-between border-t border-py-border px-4 py-2.5">
+        <NavLink to="/settings" className={quietLink}>
+          <Icon name="settings" size={14} />
+          Settings
+        </NavLink>
+        <button onClick={() => api.logout().finally(() => window.location.reload())} className={quietLink}>
+          <Icon name="x" size={14} />
           Sign out
         </button>
       </div>
@@ -643,7 +644,7 @@ function BulkPanel({
   const act = (action: BulkAction, label: string) => run({ run_ids: selectedIds, action }, label)
 
   return (
-    <div className="flex flex-col gap-2 border-b p-3" style={{ borderColor: '#252830' }} role="group" aria-label="Bulk actions">
+    <div className="flex flex-col gap-2 border-b border-py-border p-3" role="group" aria-label="Bulk actions">
       <div className="flex gap-1">
         <input aria-label="Tags to add" placeholder="add tags: a, b" value={add} onChange={(e) => setAdd(e.target.value)} className={field} />
         <input aria-label="Tags to remove" placeholder="remove tags" value={remove} onChange={(e) => setRemove(e.target.value)} className={field} />
@@ -658,14 +659,14 @@ function BulkPanel({
       <div className="flex gap-1">
         <button className={smallBtn} disabled={busy} onClick={() => act('archive', 'Archive')}>Archive</button>
         <button className={smallBtn} disabled={busy} onClick={() => act('unarchive', 'Unarchive')}>Unarchive</button>
-        <button className={`${smallBtn} ml-auto`} style={{ color: '#ef4444' }} disabled={busy} onClick={() => setConfirmDelete(true)}>Delete…</button>
+        <button className={`${smallBtn} ml-auto border-py-red text-py-red hover:text-py-red`} disabled={busy} onClick={() => setConfirmDelete(true)}>Delete…</button>
       </div>
       <div className="flex items-center gap-1">
         <select aria-label="Move to project" value={target} onChange={(e) => setTarget(e.target.value)} className={field}>
           <option value="">Move to…</option>
           {projects.filter((p) => !p.archived).map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
         </select>
-        <label className="flex items-center gap-1 text-xs text-py-faint whitespace-nowrap" title="Needed for runs that are still running">
+        <label className="flex items-center gap-1 text-xs text-py-muted whitespace-nowrap" title="Needed for runs that are still running">
           <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} /> force
         </label>
         <button className={smallBtn} disabled={busy || !target} onClick={() => run({ run_ids: selectedIds, action: 'move', project: target, force }, 'Move')}>Move</button>

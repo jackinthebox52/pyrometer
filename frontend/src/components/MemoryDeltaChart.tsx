@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import type { ProfileEvent } from '../api/types.ts'
 import { formatBytesSigned } from '../utils/format.ts'
+import { CHART, HEAT, N, STEEL } from '../theme.ts'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 interface Props {
@@ -33,10 +34,10 @@ export default function MemoryDeltaChart({ events, expanded = false }: Props) {
   if (withMem.length === 0) {
     return (
       <div
-        className="flex items-center justify-center text-xs font-mono rounded-lg"
-        style={{ height: 120, backgroundColor: '#111318', border: '1px solid #252830', color: '#4a4e60' }}
+        className="flex items-center justify-center rounded-sm border border-py-border bg-py-surface text-xs text-py-faint"
+        style={{ height: 120 }}
       >
-        no memory data
+        No memory data for this step
       </div>
     )
   }
@@ -45,14 +46,12 @@ export default function MemoryDeltaChart({ events, expanded = false }: Props) {
 
   return (
     <>
-    <div className="rounded-lg p-4" style={{ backgroundColor: '#111318', border: '1px solid #252830' }}>
+    <div className="rounded-sm border border-py-border bg-py-surface p-3">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
-          Memory Delta by Operator
-        </span>
+        <span className="text-[13px] font-semibold text-py-text">Memory delta by operator</span>
         <div className="flex items-center gap-3">
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
-            net VRAM Δ per op
+          <span className="text-[11px] text-py-muted">
+            Net VRAM change per op
           </span>
           {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
         </div>
@@ -60,50 +59,41 @@ export default function MemoryDeltaChart({ events, expanded = false }: Props) {
 
       <div className="flex gap-4 mb-3">
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: '#22c55e' }} />
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>Alloc</span>
+          <div className="h-2 w-2 rounded-[1px]" style={{ backgroundColor: HEAT[3] }} />
+          <span className="text-[11px] text-py-muted">Alloc</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: '#ef4444' }} />
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>Free</span>
+          <div className="h-2 w-2 rounded-[1px]" style={{ backgroundColor: STEEL }} />
+          <span className="text-[11px] text-py-muted">Free</span>
         </div>
       </div>
 
       <ResponsiveContainer width="100%" height={height}>
         <BarChart data={withMem} layout="vertical" margin={{ top: 0, right: 56, left: 16, bottom: 0 }} barSize={13}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" horizontal={false} />
+          <CartesianGrid strokeDasharray="2 4" stroke={CHART.grid} horizontal={false} />
           <XAxis
             type="number"
-            tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
+            tick={CHART.tick}
             tickLine={false}
-            axisLine={false}
+            axisLine={{ stroke: CHART.axis }}
             tickFormatter={fmtBytesAbs}
           />
           <YAxis
             type="category"
             dataKey="name"
             width={140}
-            tick={{ fontSize: 10, fill: '#8b8fa8', fontFamily: 'JetBrains Mono' }}
+            tick={{ ...CHART.tick, fill: N.n8 }}
             tickLine={false}
             axisLine={false}
           />
           <Tooltip
-            contentStyle={{
-              backgroundColor: '#1a1d24',
-              border: '1px solid #353840',
-              borderRadius: 6,
-              fontSize: 12,
-              fontFamily: 'JetBrains Mono',
-              padding: '6px 10px',
-            }}
-            labelStyle={{ color: '#e8eaf0', marginBottom: 4 }}
-            itemStyle={{ color: '#e8eaf0' }}
-            formatter={(value: number) => [formatBytesSigned(value), 'Memory Δ']}
-            cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+            {...CHART.tooltip}
+            formatter={(value: number) => [formatBytesSigned(value), 'Memory delta']}
+            cursor={{ fill: N.n3, fillOpacity: 0.5 }}
           />
           <Bar dataKey="bytes" isAnimationActive={false} radius={[0, 2, 2, 0]}>
             {withMem.map((entry, i) => (
-              <Cell key={i} fill={entry.bytes >= 0 ? '#22c55e' : '#ef4444'} />
+              <Cell key={i} fill={entry.bytes >= 0 ? HEAT[3] : STEEL} />
             ))}
           </Bar>
         </BarChart>

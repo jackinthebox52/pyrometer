@@ -10,6 +10,7 @@ import {
 } from 'recharts'
 import { api } from '../api/client.ts'
 import type { MediaItem } from '../api/types.ts'
+import { CHART, C } from '../theme.ts'
 import ExpandModal from './ExpandModal.tsx'
 
 interface Props {
@@ -39,34 +40,15 @@ function HistogramChart({ data }: { data: string }) {
   return (
     <ResponsiveContainer width="100%" height={160}>
       <BarChart data={parsed} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" vertical={false} />
-        <XAxis
-          dataKey="mid"
-          tick={{ fontSize: 9, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
-          tickLine={false}
-          axisLine={false}
-          interval="preserveStartEnd"
-        />
-        <YAxis
-          tick={{ fontSize: 9, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
-          tickLine={false}
-          axisLine={false}
-          width={32}
-        />
+        <CartesianGrid strokeDasharray="3 3" stroke={CHART.grid} vertical={false} />
+        <XAxis dataKey="mid" tick={CHART.tick} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+        <YAxis tick={CHART.tick} tickLine={false} axisLine={false} width={32} />
         <Tooltip
-          contentStyle={{
-            backgroundColor: '#1a1d24',
-            border: '1px solid #353840',
-            borderRadius: 6,
-            fontSize: 11,
-            fontFamily: 'JetBrains Mono',
-            padding: '4px 8px',
-          }}
-          labelStyle={{ color: '#8b8fa8' }}
-          itemStyle={{ color: '#f59e0b' }}
-          cursor={{ fill: 'rgba(255,255,255,0.04)' }}
+          {...CHART.tooltip}
+          itemStyle={{ color: C.series }}
+          cursor={{ fill: C.line, fillOpacity: 0.4 }}
         />
-        <Bar dataKey="count" fill="#f59e0b" radius={[2, 2, 0, 0]} isAnimationActive={false} />
+        <Bar dataKey="count" fill={C.series} radius={[2, 2, 0, 0]} isAnimationActive={false} />
       </BarChart>
     </ResponsiveContainer>
   )
@@ -88,7 +70,7 @@ function PreviewImage({ item, target = 240, maxHeight = 280 }: { item: MediaItem
         maxWidth: '100%',
         maxHeight,
         objectFit: 'contain',
-        borderRadius: 4,
+        borderRadius: 2,
         imageRendering: small ? 'pixelated' : 'auto',
         ...(small && natural ? { width: natural.w * scale, height: natural.h * scale } : {}),
       }}
@@ -127,50 +109,37 @@ export default function MediaGallery({ runId }: Props) {
 
   return (
     <div className="mb-6">
-      <h2 className="text-xs font-mono uppercase mb-3" style={{ color: '#c8cad6', letterSpacing: '0.12em' }}>
-        Media
-      </h2>
-      <div className="rounded-lg p-4" style={{ backgroundColor: '#111318', border: '1px solid #252830' }}>
+      <h2 className="mb-3 text-[15px] font-semibold text-py-text">Media</h2>
+      <div className="rounded border border-py-border bg-py-surface p-4">
         {/* Name selector */}
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex gap-1 flex-wrap">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex flex-wrap" role="group" aria-label="Media name">
             {names.map((n) => (
               <button
                 key={n}
                 onClick={() => setSelectedName(n)}
-                className="text-xs font-mono px-2 py-0.5 rounded transition-colors"
-                style={{
-                  backgroundColor: selectedName === n ? '#1e2128' : 'transparent',
-                  color: selectedName === n ? '#c8cad6' : '#4a4e60',
-                  border: `1px solid ${selectedName === n ? '#353840' : 'transparent'}`,
-                  cursor: 'pointer',
-                }}
+                aria-pressed={selectedName === n}
+                className={`-ml-px h-7 border px-3 font-mono text-xs transition-colors first:ml-0 first:rounded-l last:rounded-r ${
+                  selectedName === n
+                    ? 'border-py-border-hi bg-py-elevated text-py-text'
+                    : 'border-py-border-hi bg-py-surface text-py-soft hover:bg-py-elevated hover:text-py-text'
+                }`}
               >
                 {n}
               </button>
             ))}
           </div>
-          {currentItem && (
-            <span className="text-xs font-mono flex-shrink-0" style={{ color: '#4a4e60' }}>
-              step {currentItem.step}
-            </span>
-          )}
+          {currentItem && <span className="num flex-shrink-0 text-xs text-py-muted">step {currentItem.step}</span>}
         </div>
 
         {/* Content */}
         {loading ? (
-          <div
-            className="flex items-center justify-center text-xs font-mono"
-            style={{ height: 160, color: '#4a4e60' }}
-          >
-            loading…
+          <div className="flex h-40 items-center justify-center text-[13px] text-py-muted">
+            Loading…
           </div>
         ) : !currentItem ? (
-          <div
-            className="flex items-center justify-center text-xs font-mono"
-            style={{ height: 160, color: '#4a4e60' }}
-          >
-            no data
+          <div className="flex h-40 items-center justify-center text-[13px] text-py-muted">
+            No data
           </div>
         ) : mediaType === 'histogram' ? (
           <HistogramChart data={currentItem.data ?? ''} />
@@ -187,18 +156,16 @@ export default function MediaGallery({ runId }: Props) {
         {/* Step slider */}
         {items.length > 1 && (
           <div className="mt-3 flex items-center gap-2">
-            <span className="text-xs font-mono flex-shrink-0" style={{ color: '#4a4e60' }}>
-              step
-            </span>
+            <span className="flex-shrink-0 text-xs text-py-muted">Step</span>
             <input
               type="range"
               min={0}
               max={items.length - 1}
               value={stepIdx}
               onChange={(e) => setStepIdx(Number(e.target.value))}
-              style={{ flex: 1, accentColor: '#f59e0b' }}
+              className="flex-1"
             />
-            <span className="text-xs font-mono flex-shrink-0" style={{ color: '#4a4e60', minWidth: 40, textAlign: 'right' }}>
+            <span className="num min-w-[40px] flex-shrink-0 text-right text-xs text-py-muted">
               {stepIdx + 1}/{items.length}
             </span>
           </div>
@@ -210,7 +177,7 @@ export default function MediaGallery({ runId }: Props) {
           <div className="flex items-center justify-center p-4">
             <PreviewImage item={expandedItem} target={640} maxHeight="80vh" />
           </div>
-          <div className="text-center mt-2 text-xs font-mono" style={{ color: '#4a4e60' }}>
+          <div className="num mt-2 text-center text-xs text-py-muted">
             {expandedItem.name} — step {expandedItem.step}
           </div>
         </ExpandModal>

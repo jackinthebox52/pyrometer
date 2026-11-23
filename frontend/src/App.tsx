@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { HashRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { decodeIds } from './utils/compareState.ts'
 import LoginGate from './components/LoginGate.tsx'
+import Icon from './components/Icon.tsx'
 import RunSidebar from './components/RunSidebar.tsx'
 import CompareView from './pages/CompareView.tsx'
 import EmptyState from './pages/EmptyState.tsx'
@@ -79,7 +80,7 @@ function Shell({ selectedIds, onToggleSelect, onSelectMany, onClearSelection }: 
 
   return (
     <div className="flex h-screen overflow-hidden bg-py-base">
-      {navOpen && <div className="fixed inset-0 z-30 bg-black/60 md:hidden" onClick={() => setNavOpen(false)} aria-hidden="true" />}
+      {navOpen && <div className="fixed inset-0 z-30 bg-py-n0/80 md:hidden" onClick={() => setNavOpen(false)} aria-hidden="true" />}
       <div
         id="run-nav"
         className={`z-40 flex max-md:fixed max-md:inset-y-0 max-md:left-0 ${navOpen ? '' : 'max-md:hidden'}`}
@@ -92,17 +93,18 @@ function Shell({ selectedIds, onToggleSelect, onSelectMany, onClearSelection }: 
         />
       </div>
       <main className="min-w-0 flex-1 overflow-y-auto">
-        <div className="sticky top-0 z-20 flex items-center gap-3 border-b border-py-border bg-py-surface px-4 py-2 md:hidden">
+        <div className="sticky top-0 z-20 flex items-center gap-3 border-b border-py-border bg-py-n0 px-4 py-2 md:hidden">
           <button
             onClick={() => setNavOpen(true)}
             aria-label="Open runs menu"
             aria-expanded={navOpen}
             aria-controls="run-nav"
-            className="rounded border border-py-border px-2.5 py-1 text-xs font-mono text-py-muted"
+            className="flex h-8 items-center gap-1.5 rounded-[2px] border border-py-border-hi bg-py-surface px-2.5 text-xs text-py-soft transition-colors duration-150 hover:bg-py-elevated hover:text-py-text"
           >
-            Runs{selectedIds.length > 0 ? ` (${selectedIds.length})` : ''}
+            <Icon name="menu" size={14} />
+            Runs{selectedIds.length > 0 && <span className="num"> ({selectedIds.length})</span>}
           </button>
-          <span className="text-xs font-semibold uppercase tracking-widest text-py-text">Pyrometer</span>
+          <span className="text-[15px] font-semibold text-py-text">Pyrometer</span>
         </div>
         <Routes>
           <Route path="/" element={<EmptyState />} />

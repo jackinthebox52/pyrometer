@@ -45,6 +45,9 @@ TODO.md
 SPEC.md
 scratch/
 local/
+# Impeccable design working files (mocks, briefs, reviews); only the design-system sidecar is tracked
+.impeccable/*
+!.impeccable/design.json
 
 # API key stores
 auth.json

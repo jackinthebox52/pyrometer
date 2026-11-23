@@ -12,31 +12,23 @@ export default function HyperparamDiff({ runs, colors }: Props) {
 
   if (allKeys.length === 0) {
     return (
-      <div
-        className="text-xs font-mono text-center py-8 rounded-lg"
-        style={{ color: '#4a4e60', backgroundColor: '#111318', border: '1px solid #252830' }}
-      >
+      <div className="rounded border border-py-border bg-py-surface py-8 text-center text-[13px] text-py-muted">
         No hyperparameters logged
       </div>
     )
   }
 
   return (
-    <div className="overflow-x-auto rounded-lg" style={{ border: '1px solid #252830' }}>
-      <table className="w-full text-xs font-mono border-collapse">
+    <div className="overflow-x-auto rounded border border-py-border bg-py-surface">
+      <table className="w-full border-collapse text-xs">
         <thead>
-          <tr style={{ backgroundColor: '#0d0f13', borderBottom: '1px solid #252830' }}>
-            <th
-              className="text-left px-4 py-2.5 font-normal"
-              style={{ color: '#4a4e60', minWidth: 160 }}
-            >
-              Parameter
-            </th>
+          <tr className="border-b border-py-border">
+            <th className="min-w-[160px] px-4 py-2.5 text-left text-xs font-medium text-py-muted">Parameter</th>
             {runs.map((r, i) => (
               <th
                 key={r.run_id}
-                className="text-left px-4 py-2.5 font-normal"
-                style={{ color: colors[i], minWidth: 140 }}
+                className="min-w-[140px] px-4 py-2.5 text-left text-xs font-medium"
+                style={{ color: colors[i] }}
               >
                 {r.name}
               </th>
@@ -44,7 +36,7 @@ export default function HyperparamDiff({ runs, colors }: Props) {
           </tr>
         </thead>
         <tbody>
-          {allKeys.map((key, rowIdx) => {
+          {allKeys.map((key) => {
             const values = runs.map((r) => r.hyperparams[key])
             const serialized = values.map((v) => JSON.stringify(v))
             const isDiff = new Set(serialized).size > 1
@@ -52,38 +44,19 @@ export default function HyperparamDiff({ runs, colors }: Props) {
             return (
               <tr
                 key={key}
-                style={{
-                  backgroundColor: isDiff
-                    ? 'rgba(245, 158, 11, 0.05)'
-                    : rowIdx % 2 === 0
-                      ? '#0d0f13'
-                      : '#111318',
-                  borderTop: rowIdx > 0 ? '1px solid #1a1d24' : undefined,
-                }}
+                className={`border-b border-py-border last:border-b-0 hover:bg-py-elevated ${isDiff ? 'bg-py-elevated' : ''}`}
               >
-                <td
-                  className="px-4 py-2"
-                  style={{ color: '#8b8fa8', whiteSpace: 'nowrap' }}
-                >
-                  {isDiff && (
-                    <span style={{ color: '#f59e0b', marginRight: 6 }}>◆</span>
-                  )}
+                <td className="whitespace-nowrap px-4 py-2 font-mono text-py-muted">
                   {key}
+                  {isDiff && <span className="ml-2 text-[11px] font-sans text-py-soft">differs</span>}
                 </td>
                 {values.map((v, i) => (
                   <td
                     key={i}
-                    className="px-4 py-2"
-                    style={{
-                      color: isDiff ? colors[i] : '#e8eaf0',
-                      fontWeight: isDiff ? 500 : 400,
-                    }}
+                    className={`px-4 py-2 font-mono ${isDiff ? 'font-medium' : 'text-py-text'}`}
+                    style={isDiff ? { color: colors[i] } : undefined}
                   >
-                    {v === undefined ? (
-                      <span style={{ color: '#4a4e60' }}>—</span>
-                    ) : (
-                      JSON.stringify(v)
-                    )}
+                    {v === undefined ? <span className="text-py-faint">—</span> : JSON.stringify(v)}
                   </td>
                 ))}
               </tr>

@@ -254,6 +254,10 @@ The script uses the `with` style and the `llm-pretrain` preset: autolog records 
 `lr_sweep.py` and `optimizer_compare.py` run 9 runs each (3 settings x 3 seeds) for the compare view. The same script
 works through the launcher: `uv run pyrometer run examples/synthetic_train.py`.
 
+To see every dashboard feature without a GPU or torch, `python examples/demo_live.py` feeds about ten fake jobs
+(multi-GPU pretraining with an anomaly, an LR sweep that diverges, RLHF with samples, a vision run with media, a crashed
+benchmark and a killed run) into a running server over 10 minutes (`--minutes`, `--speed` to shorten).
+
 ---
 
 ## Storage

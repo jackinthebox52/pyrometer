@@ -8,6 +8,7 @@ import ChartDefaults from '../components/ChartDefaults.tsx'
 import CompareChart from '../components/CompareChart.tsx'
 import CompareOperatorBreakdown from '../components/CompareOperatorBreakdown.tsx'
 import HyperparamDiff from '../components/HyperparamDiff.tsx'
+import Icon from '../components/Icon.tsx'
 import KernelTimeline from '../components/KernelTimeline.tsx'
 import SamplesViewer from '../components/SamplesViewer.tsx'
 import StatusBadge from '../components/StatusBadge.tsx'
@@ -28,15 +29,12 @@ import type { BandKind, GroupMode } from '../utils/grouping.ts'
 import { duration, timeAgo } from '../utils/format.ts'
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <h2
-      className="text-xs font-mono uppercase mb-3"
-      style={{ color: '#c8cad6', letterSpacing: '0.12em' }}
-    >
-      {children}
-    </h2>
-  )
+  return <h2 className="mb-3 text-[15px] font-semibold text-py-text">{children}</h2>
 }
+
+const fieldCls = 'h-8 rounded border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text placeholder:text-py-faint'
+const chipCls =
+  'flex cursor-pointer select-none items-center gap-2 rounded border border-py-border-hi bg-py-surface px-3 py-1.5 text-[13px] text-py-text transition-colors hover:bg-py-elevated'
 
 export default function CompareView() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -184,30 +182,24 @@ export default function CompareView() {
 
   if (runIds.length < 2) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <span className="text-sm font-mono" style={{ color: '#4a4e60' }}>
-          Select at least 2 runs in the sidebar to compare
-        </span>
+      <div className="flex h-full items-center justify-center">
+        <span className="text-[13px] text-py-muted">Select at least 2 runs in the sidebar to compare</span>
       </div>
     )
   }
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <span className="text-sm font-mono" style={{ color: '#4a4e60' }}>
-          Loading comparison…
-        </span>
+      <div className="flex h-full items-center justify-center">
+        <span className="text-[13px] text-py-muted">Loading comparison…</span>
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <span className="text-sm font-mono" style={{ color: '#ef4444' }}>
-          {error}
-        </span>
+      <div className="flex h-full items-center justify-center">
+        <span className="text-[13px] text-py-red">{error}</span>
       </div>
     )
   }
@@ -215,56 +207,37 @@ export default function CompareView() {
   return (
     <div className="p-6 max-w-6xl mx-auto">
       {/* ── Header ── */}
-      <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
-        <div>
-          <div
-            className="text-xs font-mono uppercase mb-3"
-            style={{ color: '#c8cad6', letterSpacing: '0.12em' }}
-          >
-            Run Comparison
-          </div>
-          {/* Run pills */}
-          <div className="flex flex-wrap gap-2">
-            {grouped && groups.map((g, i) => {
-              const hidden = globalHiddenIds.has(g.id)
-              return (
-                <div
-                  key={g.id}
-                  className="flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded cursor-pointer select-none"
-                  style={{
-                    backgroundColor: '#111318',
-                    border: `1px solid ${groupColor(i)}33`,
-                    color: groupColor(i),
-                    opacity: hidden ? 0.35 : 1,
-                  }}
-                  onClick={() => setGlobalHiddenIds((prev) => {
-                    const next = new Set(prev)
-                    if (next.has(g.id)) next.delete(g.id)
-                    else next.add(g.id)
-                    return next
-                  })}
-                  title={hidden ? 'Click to show' : 'Click to hide'}
-                >
-                  <span style={{ display: 'inline-block', width: 20, height: 2, backgroundColor: groupColor(i), borderRadius: 1 }} />
-                  <span>{g.label}</span>
-                  <span style={{ color: '#4a4e60' }}>
-                    {g.runIds.length} run{g.runIds.length === 1 ? '' : 's'}
-                  </span>
-                </div>
-              )
-            })}
-            {!grouped && runs.map((run, i) => {
-              const hidden = globalHiddenIds.has(run.run_id)
-              return (
+      <div className="mb-4">
+        <h1 className="mb-3 text-[22px] font-semibold text-py-text">Compare runs</h1>
+        <div className="flex flex-wrap gap-2">
+          {grouped && groups.map((g, i) => {
+            const hidden = globalHiddenIds.has(g.id)
+            return (
+              <div
+                key={g.id}
+                className={`${chipCls} ${hidden ? 'opacity-40' : ''}`}
+                onClick={() => setGlobalHiddenIds((prev) => {
+                  const next = new Set(prev)
+                  if (next.has(g.id)) next.delete(g.id)
+                  else next.add(g.id)
+                  return next
+                })}
+                title={hidden ? 'Click to show' : 'Click to hide'}
+              >
+                <span className="inline-block h-2.5 w-2.5" style={{ backgroundColor: groupColor(i) }} />
+                <span>{g.label}</span>
+                <span className="text-xs text-py-muted">
+                  {g.runIds.length} run{g.runIds.length === 1 ? '' : 's'}
+                </span>
+              </div>
+            )
+          })}
+          {!grouped && runs.map((run, i) => {
+            const hidden = globalHiddenIds.has(run.run_id)
+            return (
               <div
                 key={run.run_id}
-                className="flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded cursor-pointer select-none"
-                style={{
-                  backgroundColor: '#111318',
-                  border: `1px solid ${RUN_COLORS[i % RUN_COLORS.length]}33`,
-                  color: RUN_COLORS[i % RUN_COLORS.length],
-                  opacity: hidden ? 0.35 : 1,
-                }}
+                className={`${chipCls} ${hidden ? 'opacity-40' : ''}`}
                 onClick={() => setGlobalHiddenIds((prev) => {
                   const next = new Set(prev)
                   if (next.has(run.run_id)) next.delete(run.run_id)
@@ -273,39 +246,28 @@ export default function CompareView() {
                 })}
                 title={hidden ? 'Click to show' : 'Click to hide'}
               >
-                <span
-                  style={{
-                    display: 'inline-block',
-                    width: 20,
-                    height: 2,
-                    backgroundColor: RUN_COLORS[i % RUN_COLORS.length],
-                    borderRadius: 1,
-                  }}
-                />
+                <span className="inline-block h-2.5 w-2.5" style={{ backgroundColor: RUN_COLORS[i % RUN_COLORS.length] }} />
                 <span>{run.name}</span>
-                <span style={{ opacity: 0.5 }}>·</span>
                 <StatusBadge status={run.status} compact />
-                <span style={{ color: '#4a4e60' }}>
+                <span className="num text-xs text-py-muted">
                   {timeAgo(run.created_at)}
                   {run.finished_at && <> · {duration(run.created_at, run.finished_at)}</>}
                 </span>
               </div>
-              )
-            })}
-          </div>
+            )
+          })}
         </div>
+      </div>
 
-        <div className="flex items-center gap-3 flex-wrap">
-        {/* Grouping */}
-        <div
-          className="flex items-center gap-2 px-3 py-2 rounded text-xs font-mono"
-          style={{ backgroundColor: '#111318', border: '1px solid #252830', color: '#4a4e60' }}
-        >
-          <span>Group</span>
+      {/* ── Toolbar ── */}
+      <div className="mb-6 flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2 rounded border border-py-border bg-py-surface px-3 py-1.5">
+          <span className="log-label">Group</span>
           <select
             value={groupMode}
+            aria-label="Group runs by"
             onChange={(e) => changeGrouping(() => setCompareState({ groupMode: e.target.value as GroupMode }))}
-            style={{ backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4 }}
+            className={fieldCls}
           >
             <option value="none">none</option>
             <option value="hyperparams">hyperparams</option>
@@ -313,22 +275,24 @@ export default function CompareView() {
           </select>
           {groupMode === 'hyperparams' && (
             <>
-              <span>ignore</span>
+              <span className="log-label">Ignore</span>
               <input
                 value={ignoreText}
                 onChange={(e) => changeGrouping(() => setCompareState({ ignoreText: e.target.value }, true))}
                 placeholder="seed"
+                aria-label="Hyperparam keys to ignore"
                 title="Comma-separated hyperparam keys to ignore when matching runs"
-                style={{ width: 90, backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4, padding: '0 4px' }}
+                className={`${fieldCls} w-24 font-mono`}
               />
             </>
           )}
           {grouped && (
             <select
               value={band}
+              aria-label="Band"
               onChange={(e) => setCompareState({ band: e.target.value as BandKind })}
               title="Band around the group mean"
-              style={{ backgroundColor: '#1a1d24', color: '#c8cad6', border: '1px solid #353840', borderRadius: 4 }}
+              className={fieldCls}
             >
               <option value="std">mean ± std</option>
               <option value="minmax">mean, min/max</option>
@@ -337,8 +301,7 @@ export default function CompareView() {
         </div>
 
         <label
-          className="flex items-center gap-2 px-3 py-2 rounded text-xs font-mono cursor-pointer"
-          style={{ backgroundColor: '#111318', border: '1px solid #252830', color: linkZoom ? '#22c55e' : '#4a4e60' }}
+          className={`flex h-[42px] cursor-pointer items-center gap-2 rounded border border-py-border bg-py-surface px-3 text-[13px] ${linkZoom ? 'text-py-text' : 'text-py-muted'}`}
           title="When on, zooming one chart zooms every chart to the same x range"
         >
           <input
@@ -349,11 +312,10 @@ export default function CompareView() {
               setSharedZoom(null)
             }}
           />
-          link zoom
+          Link zoom
         </label>
 
         <ChartDefaults axisMetrics={allMetricNames} />
-        </div>
       </div>
 
       {/* ── Metric overlay charts ── */}
@@ -408,30 +370,19 @@ export default function CompareView() {
       )}
 
       {allMetricNames.length === 0 && (
-        <div
-          className="text-center py-10 text-sm font-mono mb-8"
-          style={{ color: '#4a4e60' }}
-        >
-          No metrics logged for these runs
-        </div>
+        <div className="mb-8 py-10 text-center text-[13px] text-py-muted">No metrics logged for these runs</div>
       )}
 
       {/* ── Profiler ── */}
       {runs.some((r) => (profileMap.get(r.run_id) ?? []).length > 0) && (
         <div className="mb-8">
           <button
-            className="flex items-center gap-2 mb-3 w-full text-left"
+            className="mb-3 flex w-full items-center gap-2 text-left text-py-text hover:text-py-text"
+            aria-expanded={profilerOpen}
             onClick={() => setProfilerOpen((o) => !o)}
           >
-            <h2
-              className="text-xs font-mono uppercase"
-              style={{ color: '#c8cad6', letterSpacing: '0.12em' }}
-            >
-              Profiler
-            </h2>
-            <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
-              {profilerOpen ? '▲' : '▼'}
-            </span>
+            <h2 className="text-[15px] font-semibold">Profiler</h2>
+            <Icon name="chevron-down" size={14} className={`text-py-muted ${profilerOpen ? 'rotate-180' : ''}`} />
           </button>
           {profilerOpen && (
             <div className="flex flex-col gap-6">
@@ -440,10 +391,8 @@ export default function CompareView() {
                 if (events.length === 0) return null
                 return (
                   <div key={run.run_id}>
-                    <div
-                      className="text-xs font-mono mb-2"
-                      style={{ color: RUN_COLORS[i % RUN_COLORS.length] }}
-                    >
+                    <div className="mb-2 flex items-center gap-2 text-[13px] text-py-soft">
+                      <span className="inline-block h-2.5 w-2.5" style={{ backgroundColor: RUN_COLORS[i % RUN_COLORS.length] }} />
                       {run.name}
                     </div>
                     <KernelTimeline events={events} />
@@ -468,15 +417,7 @@ export default function CompareView() {
 
       {/* ── Hyperparameter diff ── */}
       <div>
-        <div className="flex items-center gap-3 mb-3">
-          <SectionLabel>Hyperparameter Diff</SectionLabel>
-          <span
-            className="text-xs font-mono -mt-3"
-            style={{ color: '#f59e0b' }}
-          >
-            ◆ differs
-          </span>
-        </div>
+        <SectionLabel>Hyperparameter diff</SectionLabel>
         <HyperparamDiff
           runs={runs}
           colors={runs.map((_, i) => RUN_COLORS[i % RUN_COLORS.length])}

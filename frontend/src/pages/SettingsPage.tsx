@@ -1,16 +1,29 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api } from '../api/client.ts'
 import ConfirmDialog from '../components/ConfirmDialog.tsx'
+import Icon from '../components/Icon.tsx'
 import { useWebSocket } from '../hooks/useWebSocket.ts'
 import { timeAgo } from '../utils/format.ts'
 import type { AlertFormat, AlertKind, AlertRule, AlertTrigger, ApiKey, CreatedApiKey, Project, Session, UserAccount } from '../api/types.ts'
 
-const input =
-  'rounded border border-py-border bg-py-elevated px-2 py-1.5 text-xs font-mono text-py-text outline-none focus:border-py-border-hi'
-const btn = 'rounded bg-py-amber px-3 py-1.5 text-xs font-mono text-black disabled:opacity-40'
-const ghost = 'rounded border border-py-border px-2 py-1 text-xs font-mono text-py-muted'
-const section = 'flex flex-col gap-3'
-const h2 = 'text-xs font-mono uppercase tracking-widest text-py-muted'
+const input = 'h-8 rounded border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text placeholder:text-py-faint'
+const btnBase =
+  'inline-flex h-8 items-center justify-center rounded border px-3 text-[13px] transition-colors disabled:cursor-not-allowed disabled:opacity-50'
+const btn = `${btnBase} border-py-border-hi bg-py-surface text-py-soft hover:bg-py-elevated hover:text-py-text`
+const ghost = `${btn} !h-7`
+const danger = `${btnBase} !h-7 border-py-red/60 bg-py-surface text-py-red hover:bg-py-elevated`
+const section = 'flex scroll-mt-6 flex-col gap-3'
+const h2 = 'text-[15px] font-semibold text-py-text'
+const list = 'rounded border border-py-border bg-py-surface'
+const secretCls = 'select-all break-all rounded border border-py-border-hi bg-py-elevated p-2 font-mono text-xs text-py-text'
+
+const NAV = [
+  ['account', 'Account'],
+  ['projects', 'Projects'],
+  ['users', 'Users'],
+  ['keys', 'API keys'],
+  ['alerts', 'Alerts'],
+] as const
 
 const RETENTION_TABLES = ['system_snapshots', 'logs', 'profile_events', 'param_stats', 'events', 'artifacts', 'media', 'samples', 'metrics'] as const
 
@@ -27,14 +40,16 @@ function msg(e: unknown, fallback: string): string {
 function OneTimeSecret({ label, secret, onDone }: { label: string; secret: string; onDone: () => void }) {
   const [copied, setCopied] = useState(false)
   return (
-    <div className="rounded border border-py-amber/60 bg-py-surface p-4 flex flex-col gap-2">
-      <p className="text-xs text-py-text">{label} This is the only time it is shown.</p>
-      <code className="select-all break-all rounded bg-py-elevated p-2 text-xs font-mono text-py-amber">{secret}</code>
+    <div className="flex flex-col gap-2 rounded border border-py-border-hi bg-py-surface p-4">
+      <p className="text-[13px] text-py-text">{label} This is the only time it is shown.</p>
+      <code className={secretCls}>{secret}</code>
       <div className="flex gap-2">
         <button
-          className={ghost}
+          className={`${ghost} gap-1.5`}
           onClick={() => navigator.clipboard.writeText(secret).then(() => setCopied(true)).catch(() => {})}
         >
+          <Icon name={copied ? 'check' : 'copy'} size={14} />
+          <Icon name={copied ? 'check' : 'copy'} size={14} />
           {copied ? 'Copied' : 'Copy'}
         </button>
         <button className={ghost} onClick={onDone}>
@@ -87,20 +102,20 @@ function RetentionEditor({ project, onError }: { project: string; onError: (m: s
   })
 
   return (
-    <div className="text-xs font-mono">
-      <button className="text-py-muted" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
-        {open ? '▾' : '▸'} retention policy
+    <div className="text-[13px]">
+      <button className="inline-flex items-center gap-1 text-py-soft transition-colors hover:text-py-text" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={14} /> Retention policy
       </button>
       {open && (
-        <div className="mt-2 flex flex-col gap-2 rounded border border-py-border p-3">
-          <p className="text-py-faint">
+        <div className="mt-2 flex flex-col gap-2 rounded border border-py-border bg-py-base p-3">
+          <p className="text-py-muted">
             Delete rows older than N days, per table. Leave a field empty to keep that table forever. Runs themselves are never
             deleted. <span className="text-py-killed">Deleting metrics is permanent and thins the training curves.</span>
           </p>
           <div className="grid grid-cols-3 gap-2">
             {RETENTION_TABLES.map((t) => (
               <label key={t} className="flex items-center justify-between gap-2 text-py-muted">
-                {t}
+                <span className="font-mono text-xs">{t}</span>
                 <input
                   type="number" min={1} max={36500} placeholder="keep" aria-label={`${t}: delete rows older than days`}
                   value={days[t] ?? ''} onChange={(e) => setDays((d) => ({ ...d, [t]: e.target.value }))}
@@ -114,8 +129,8 @@ function RetentionEditor({ project, onError }: { project: string; onError: (m: s
             <button className={ghost} disabled={busy} onClick={() => setConfirmRun(true)}>
               Run now
             </button>
-            {invalid && <span className="text-py-crashed">Days must be between 1 and 36500.</span>}
-            {note && <span role="status" className="text-py-running">{note}</span>}
+            {invalid && <span className="text-py-red">Days must be between 1 and 36500.</span>}
+            {note && <span role="status" className="text-py-green">{note}</span>}
           </div>
         </div>
       )}
@@ -298,55 +313,76 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="mx-auto max-w-3xl p-8 flex flex-col gap-8">
-      <h1 className="text-sm font-mono text-py-text">
-        Settings <span className="text-py-faint">· {session?.user ?? '…'} ({session?.role ?? '…'})</span>
+    <div className="mx-auto max-w-5xl p-8">
+      <h1 className="mb-6 text-[22px] font-semibold text-py-text">
+        Settings
       </h1>
-
-      {error && <p role="alert" className="text-xs text-py-crashed">{error}</p>}
-      {notice && <p role="status" className="text-xs text-py-running">{notice}</p>}
+      <div className="lg:grid lg:grid-cols-[160px_minmax(0,1fr)] lg:gap-10">
+      <nav aria-label="Settings sections" className="mb-6 hidden lg:sticky lg:top-6 lg:mb-0 lg:flex lg:flex-col lg:gap-1 lg:self-start">
+        {NAV.filter(([id]) => id === 'account' || id === 'projects' || isAdmin).map(([id, label]) => (
+          <a key={id} href={`#${id}`} className="rounded px-2 py-1 text-[13px] text-py-muted transition-colors hover:bg-py-surface hover:text-py-text"
+            onClick={(e) => { e.preventDefault(); document.getElementById(id)?.scrollIntoView({ block: 'start' }) }}>
+            {label}
+          </a>
+        ))}
+      </nav>
+      <div className="flex min-w-0 flex-col gap-8">
+      {error && <p role="alert" className="text-[13px] text-py-red">{error}</p>}
+      {notice && <p role="status" className="text-[13px] text-py-green">{notice}</p>}
       {secret && <OneTimeSecret label={secret.label} secret={secret.value} onDone={() => setSecret(null)} />}
 
+      <section id="account" className={section}>
+        <h2 className={h2}>Account</h2>
+        <p className="text-[13px] text-py-muted">
+          {session?.auth === 'off' ? (
+            'Local mode: authentication is off.'
+          ) : session?.user ? (
+            <>Signed in as <span className="font-mono text-xs text-py-soft">{session.user}</span>{session.role ? ` (${session.role})` : ''}.</>
+          ) : (
+            'Signed in with an API key.'
+          )}
+        </p>
       {session?.auth === 'required' && session.role !== 'global' && session.role !== 'project' && (
-        <section className={section}>
-          <h2 className={h2}>Change password</h2>
+        <>
+          <h3 className="text-[13px] font-semibold text-py-soft">Change password</h3>
           <form onSubmit={changePassword} className="flex flex-wrap gap-2">
             <input type="password" autoComplete="current-password" value={curPw} onChange={(e) => setCurPw(e.target.value)} placeholder="Current password" className={`${input} flex-1`} />
             <input type="password" autoComplete="new-password" value={newPw} onChange={(e) => setNewPw(e.target.value)} placeholder="New password" className={`${input} flex-1`} />
             <button type="submit" disabled={!curPw || !newPw} className={btn}>Change</button>
           </form>
-          {pwDone && <p className="text-xs text-py-running">Password changed.</p>}
-        </section>
+          {pwDone && <p className="text-[13px] text-py-green">Password changed.</p>}
+        </>
       )}
+      </section>
 
-      <section className={section}>
+      <section id="projects" className={section}>
         <h2 className={h2}>Projects</h2>
-        <label className="flex items-center gap-2 text-xs font-mono text-py-muted">
+        <label className="flex items-center gap-2 text-[13px] text-py-muted">
           <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
           Show archived projects
         </label>
-        <div className="rounded border border-py-border">
+        <div className={list}>
           {projects.map((p) => (
-            <div key={p.name} className="border-b border-py-border px-4 py-2 last:border-b-0 flex flex-col gap-2" style={{ opacity: p.archived ? 0.65 : 1 }}>
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+            <div key={p.name} className={`border-b border-py-border px-4 py-2 last:border-b-0 flex flex-col gap-2 ${p.archived ? 'opacity-65' : ''}`}>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[13px]">
                 <span>
-                  <span className="text-py-text">{p.name}</span>
+                  <span className="font-mono text-xs text-py-text">{p.name}</span>
                   {p.archived && <span className="ml-2 text-py-killed">archived</span>}
-                  <span className="ml-3 text-py-faint">
+                  <span className="num ml-3 text-xs text-py-muted">
                     {p.runs ?? 0} runs{p.archived_runs ? ` (${p.archived_runs} archived)` : ''} · by {p.created_by} ·{' '}
                     {p.last_activity ? `active ${timeAgo(p.last_activity)}` : 'no activity'}
                   </span>
                 </span>
                 <span className="flex items-center gap-3">
-                  <a href={api.projectExportUrl(p.name)} download className="text-py-muted" title="Download every run of this project as Parquet files in a zip">
+                  <a href={api.projectExportUrl(p.name)} download className={ghost} title="Download every run of this project as Parquet files in a zip">
                     Export
                   </a>
                   {isAdmin && p.name !== 'default' && (
                     <>
-                      <button className="text-py-muted" onClick={() => act(async () => { await api.archiveProject(p.name, !p.archived) }, 'Failed to update project')}>
+                      <button className={ghost} onClick={() => act(async () => { await api.archiveProject(p.name, !p.archived) }, 'Failed to update project')}>
                         {p.archived ? 'Unarchive' : 'Archive'}
                       </button>
-                      <button className="text-py-crashed" onClick={() => { setCascade(false); setDeleting(p) }}>Delete…</button>
+                      <button className={danger} onClick={() => { setCascade(false); setDeleting(p) }}>Delete…</button>
                     </>
                   )}
                   {isAdmin ? (
@@ -360,13 +396,13 @@ export default function SettingsPage() {
                       <option value="private">private</option>
                     </select>
                   ) : (
-                    <span className="text-py-muted">{p.visibility}</span>
+                    <span className="text-py-soft">{p.visibility}</span>
                   )}
                 </span>
               </div>
               {isAdmin && (
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs font-mono text-py-muted">
-                  <span className="text-py-faint">members:</span>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[13px] text-py-muted">
+                  <span className="text-py-muted">Members:</span>
                   {users.filter((u) => u.role === 'user').length === 0 && <span className="text-py-faint">no regular users yet</span>}
                   {users.filter((u) => u.role === 'user').map((u) => (
                     <label key={u.username} className="flex items-center gap-1">
@@ -424,12 +460,12 @@ export default function SettingsPage() {
       )}
 
       {isAdmin && (
-        <section className={section}>
+        <section id="users" className={section}>
           <h2 className={h2}>Users</h2>
-          <div className="rounded border border-py-border">
+          <div className={list}>
             {users.map((u) => (
-              <div key={u.username} className="flex items-center justify-between border-b border-py-border px-4 py-2 last:border-b-0 text-xs font-mono">
-                <span className="text-py-text">{u.username}</span>
+              <div key={u.username} className="flex items-center justify-between border-b border-py-border px-4 py-2 text-[13px] last:border-b-0">
+                <span className="font-mono text-xs text-py-text">{u.username}</span>
                 <span className="flex items-center gap-3">
                   <select
                     value={u.role}
@@ -440,7 +476,7 @@ export default function SettingsPage() {
                     <option value="admin">admin</option>
                   </select>
                   <button
-                    className="text-py-muted"
+                    className={ghost}
                     onClick={() => {
                       const pw = window.prompt(`New password for ${u.username}:`)
                       if (pw) act(async () => { await api.updateUser(u.username, { password: pw }) }, 'Failed to reset password')
@@ -449,7 +485,7 @@ export default function SettingsPage() {
                     Reset password
                   </button>
                   <button
-                    className="text-py-crashed"
+                    className={danger}
                     onClick={() => window.confirm(`Delete ${u.username}?`) && act(async () => { await api.deleteUser(u.username) }, 'Failed to delete user')}
                   >
                     Delete
@@ -471,30 +507,30 @@ export default function SettingsPage() {
       )}
 
       {isAdmin && (
-        <section className={section}>
+        <section id="keys" className={section}>
           <h2 className={h2}>API keys</h2>
-          <p className="text-xs text-py-muted">
+          <p className="text-[13px] text-py-muted">
             A global key reads and writes every project and can register new ones. A project key is limited to
             one project. Neither can manage users, projects' settings or keys. Scripts use{' '}
-            <code className="font-mono">PYROMETER_API_KEY</code>.
+            <code className="font-mono text-xs text-py-soft">PYROMETER_API_KEY</code>.
           </p>
-          <div className="rounded border border-py-border">
+          <div className={list}>
             {keys.length === 0 ? (
-              <p className="p-4 text-xs text-py-faint font-mono">No API keys yet.</p>
+              <p className="p-4 text-[13px] text-py-muted">No API keys yet. Create one below, then set it as <code className="font-mono text-xs">PYROMETER_API_KEY</code> in your training environment.</p>
             ) : (
               keys.map((k) => (
                 <div key={k.id} className="flex items-center justify-between border-b border-py-border px-4 py-2 last:border-b-0">
-                  <div className="text-xs font-mono">
+                  <div className="text-[13px]">
                     <span className="text-py-text">{k.name}</span>
-                    <span className="ml-3 text-py-amber">{k.project ?? 'global'}</span>
-                    <span className="ml-3 text-py-faint">
-                      {k.id} · created {new Date(k.created_at * 1000).toLocaleDateString()} ·{' '}
+                    <span className="ml-3 rounded border border-py-border-hi px-1.5 py-0.5 text-xs text-py-soft">{k.project ?? 'global'}</span>
+                    <span className="ml-3 text-xs text-py-muted">
+                      <span className="font-mono">{k.id}</span> · created {new Date(k.created_at * 1000).toLocaleDateString()} ·{' '}
                       {agoEpoch(k.last_used_at) ? `last used ${agoEpoch(k.last_used_at)}` : 'never used'}
                     </span>
                   </div>
                   <button
                     onClick={() => window.confirm(`Revoke "${k.name}"? Anything using it will stop working.`) && act(async () => { await api.revokeKey(k.id) }, 'Failed to revoke key')}
-                    className="text-xs font-mono text-py-crashed"
+                    className={danger}
                   >
                     Revoke
                   </button>
@@ -515,34 +551,34 @@ export default function SettingsPage() {
         </section>
       )}
       {isAdmin && (
-        <section className={section}>
+        <section id="alerts" className={section}>
           <h2 className={h2}>Alerts</h2>
-          <p className="text-xs text-py-muted">
+          <p className="text-[13px] text-py-muted">
             Send a webhook when a run crashes or fails, an event or anomaly is logged, or a metric crosses a
             threshold. Webhook URLs are secrets: after saving, only the host is shown. Set{' '}
-            <code className="font-mono">PYROMETER_PUBLIC_URL</code> on the server to include dashboard links.
+            <code className="font-mono text-xs text-py-soft">PYROMETER_PUBLIC_URL</code> on the server to include dashboard links.
           </p>
-          {alertNote && <p className="text-xs text-py-running">{alertNote}</p>}
-          <div className="rounded border border-py-border">
+          {alertNote && <p className="text-[13px] text-py-green">{alertNote}</p>}
+          <div className={list}>
             {alertRules.length === 0 ? (
-              <p className="p-4 text-xs text-py-faint font-mono">No alert rules yet.</p>
+              <p className="p-4 text-[13px] text-py-muted">No alert rules yet. Add one below to get a webhook when a run crashes.</p>
             ) : (
               alertRules.map((r) => (
                 <div key={r.id} className="flex items-center justify-between gap-4 border-b border-py-border px-4 py-2 last:border-b-0">
-                  <div className="min-w-0 break-words text-xs font-mono">
+                  <div className="min-w-0 break-words text-[13px]">
                     <span className={r.enabled ? 'text-py-text' : 'text-py-faint'}>{r.name}</span>
-                    <span className="ml-3 text-py-amber">{describeRule(r)}</span>
-                    <span className="ml-3 text-py-faint">
+                    <span className="ml-3 font-mono text-xs text-py-soft">{describeRule(r)}</span>
+                    <span className="ml-3 font-mono text-xs text-py-muted">
                       {r.project ?? 'all projects'} · {r.format} · {r.url}
                       {agoEpoch(r.updated_at) ? ` · updated ${agoEpoch(r.updated_at)}` : ''}
                     </span>
                   </div>
-                  <span className="flex shrink-0 items-center gap-3 whitespace-nowrap text-xs font-mono">
-                    <button className="text-py-muted" onClick={() => testAlert(r.id)}>Send test</button>
-                    <button className="text-py-muted" onClick={() => act(async () => { await api.updateAlert(r.id, { enabled: !r.enabled }) }, 'Failed to update alert')}>
+                  <span className="flex shrink-0 items-center gap-3 whitespace-nowrap">
+                    <button className={ghost} onClick={() => testAlert(r.id)}>Send test</button>
+                    <button className={ghost} onClick={() => act(async () => { await api.updateAlert(r.id, { enabled: !r.enabled }) }, 'Failed to update alert')}>
                       {r.enabled ? 'Disable' : 'Enable'}
                     </button>
-                    <button className="text-py-crashed" onClick={() => window.confirm(`Delete "${r.name}"?`) && act(async () => { await api.deleteAlert(r.id) }, 'Failed to delete alert')}>
+                    <button className={danger} onClick={() => window.confirm(`Delete "${r.name}"?`) && act(async () => { await api.deleteAlert(r.id) }, 'Failed to delete alert')}>
                       Delete
                     </button>
                   </span>
@@ -590,7 +626,7 @@ export default function SettingsPage() {
                 Add trigger
               </button>
             </div>
-            <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+            <div className="flex flex-wrap items-center gap-2 text-[13px]">
               <span className="text-py-muted">Triggers (any match fires):</span>
               {aTriggers.length === 0 && <span className="text-py-faint">none yet</span>}
               {aTriggers.map((t, i) => (
@@ -598,10 +634,12 @@ export default function SettingsPage() {
                   key={i}
                   type="button"
                   title="Remove"
-                  className="rounded border border-py-border px-2 py-0.5 text-py-amber"
+                  className="inline-flex items-center gap-1 rounded border border-py-border-hi px-2 py-0.5 font-mono text-xs text-py-soft transition-colors hover:bg-py-elevated hover:text-py-text"
+                  aria-label={`Remove trigger ${describeTrigger(t)}`}
                   onClick={() => setATriggers((ts) => ts.filter((_, j) => j !== i))}
                 >
-                  {describeTrigger(t)} x
+                  {describeTrigger(t)}
+                  <Icon name="x" size={12} />
                 </button>
               ))}
             </div>
@@ -617,6 +655,8 @@ export default function SettingsPage() {
           </form>
         </section>
       )}
+      </div>
+      </div>
     </div>
   )
 }

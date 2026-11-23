@@ -8,6 +8,8 @@ import { useZoomFetch } from '../hooks/useZoomFetch.ts'
 import type { XZoom } from '../utils/series.ts'
 import type { XSource } from '../utils/xAxis.ts'
 import type { RangeQuery } from '../utils/series.ts'
+import { HEAT, HEAT_GRADIENT, N, STEEL, heatColor } from '../theme.ts'
+import Icon from './Icon.tsx'
 import MetricChart from './MetricChart.tsx'
 
 interface Props {
@@ -27,16 +29,6 @@ const TOP_AXIS_H = 28
 const LEFT_PAD = 4
 const CELL_GAP = 1
 const MIN_CELL_W = 3
-
-// Dark → amber → red gradient on log scale
-function normColor(t: number): string {
-  if (t < 0.5) {
-    const u = t * 2
-    return `rgb(${Math.round(30 + u * 215)},${Math.round(20 + u * 138)},${Math.round(40 - u * 29)})`
-  }
-  const u = (t - 0.5) * 2
-  return `rgb(${Math.round(245 - u * 6)},${Math.round(158 - u * 90)},${Math.round(11 + u * 57)})`
-}
 
 export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -153,9 +145,9 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
     const logRange = logMax - logMin || 1
 
     function cellColor(norm: number): string {
-      if (!norm || norm <= 0) return '#1a1d24'
+      if (!norm || norm <= 0) return N.n3
       const logVal = (Math.log10(Math.max(norm, 1e-10)) - logMin) / logRange
-      return normColor(Math.max(0, Math.min(1, logVal)))
+      return heatColor(Math.max(0, Math.min(1, logVal)))
     }
 
     const availW = containerWidth - NAME_COL_W - LEFT_PAD
@@ -184,7 +176,7 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
       .attr('text-anchor', 'middle')
       .attr('font-family', 'JetBrains Mono, monospace')
       .attr('font-size', 9)
-      .attr('fill', '#4a4e60')
+      .attr('fill', N.n7)
       .text((d) => String(d))
 
     // Rows
@@ -203,7 +195,7 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
         .attr('text-anchor', 'end')
         .attr('font-family', 'JetBrains Mono, monospace')
         .attr('font-size', 9)
-        .attr('fill', isSelected ? '#f59e0b' : '#4a4e60')
+        .attr('fill', isSelected ? N.n9 : N.n7)
         .style('cursor', 'pointer')
         .text(displayName)
         .on('click', () => setSelectedParam((prev) => (prev === pname ? null : pname)))
@@ -230,9 +222,9 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
             tooltip.style.top = `${event.clientY - rect.top - 28}px`
             tooltip.style.display = 'block'
             tooltip.innerHTML =
-              `<span style="color:#8b8fa8">${displayName}</span><br/>` +
-              `step <span style="color:#f59e0b">${ends[colIdx] !== step ? `${step}–${ends[colIdx]}` : step}</span>&nbsp;&nbsp;` +
-              `grad_norm <span style="color:#f59e0b">${norm > 0 ? norm.toExponential(3) : '—'}</span>`
+              `<span style="color:${N.n7}">${displayName}</span><br/>` +
+              `step <span style="color:${N.n9}">${ends[colIdx] !== step ? `${step}–${ends[colIdx]}` : step}</span>&nbsp;&nbsp;` +
+              `grad_norm <span style="color:${HEAT[4]}">${norm > 0 ? norm.toExponential(3) : '—'}</span>`
           })
           .on('mouseleave', () => {
             if (tooltipRef.current) tooltipRef.current.style.display = 'none'
@@ -268,45 +260,31 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
   if (stats.length === 0) return null
 
   return (
-    <div className="rounded-lg" style={{ backgroundColor: '#111318', border: '1px solid #252830' }}>
+    <div className="rounded-sm border border-py-border bg-py-surface">
       {/* Header + legend */}
-      <div
-        className="flex items-center justify-between px-4 pt-3 pb-2"
-        style={{ borderBottom: '1px solid #252830' }}
-      >
-        <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
-          Gradient Norm Heatmap
-          {runId && !zoomFetch.zoom && <span style={{ color: '#4a4e60' }}> · drag across columns to zoom</span>}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-py-border px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[13px] font-semibold text-py-text">Gradient norm heatmap</span>
+          {runId && !zoomFetch.zoom && <span className="text-[11px] text-py-faint">Drag across columns to zoom</span>}
           {zoomFetch.zoom && (
             <>
-              <span style={{ color: '#f59e0b' }}>
-                {' '}· steps {Math.floor(zoomFetch.zoom.x0)}–{Math.ceil(zoomFetch.zoom.x1)}{zoomFetch.loading ? ' …' : ''}
+              <span className="num text-[11px] text-py-soft">
+                steps {Math.floor(zoomFetch.zoom.x0)}-{Math.ceil(zoomFetch.zoom.x1)}{zoomFetch.loading ? '…' : ''}
               </span>
               <button
+                type="button"
                 onClick={zoomFetch.reset}
-                className="ml-2 px-1.5 rounded"
-                style={{ background: 'none', border: '1px solid #252830', color: '#8b8fa8', cursor: 'pointer' }}
+                className="h-6 rounded-sm border border-py-border-hi bg-py-surface px-2 text-xs text-py-soft transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text"
               >
-                reset zoom
+                Reset zoom
               </button>
             </>
           )}
-        </span>
+        </div>
         <div className="flex items-center gap-2">
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
-            low
-          </span>
-          <div
-            style={{
-              width: 72,
-              height: 8,
-              borderRadius: 2,
-              background: 'linear-gradient(to right, #1e1428, #f59e0b, #ef4444)',
-            }}
-          />
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
-            high (log)
-          </span>
+          <span className="num text-[10px] text-py-muted">low</span>
+          <div className="h-2 w-28 rounded-[1px]" style={{ background: HEAT_GRADIENT }} />
+          <span className="num text-[10px] text-py-muted">high (log)</span>
         </div>
       </div>
 
@@ -320,7 +298,7 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
           <div
             style={{
               position: 'absolute', top: 0, bottom: 0, left: selBox.left, width: selBox.width,
-              background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.6)', pointerEvents: 'none',
+              backgroundColor: `${N.n8}14`, border: `1px solid ${N.n7}`, pointerEvents: 'none',
             }}
           />
         )}
@@ -330,13 +308,13 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
             display: 'none',
             position: 'absolute',
             pointerEvents: 'none',
-            backgroundColor: '#1a1d24',
-            border: '1px solid #252830',
-            borderRadius: 4,
+            backgroundColor: N.n2,
+            border: `1px solid ${N.n5}`,
+            borderRadius: 2,
             padding: '4px 8px',
             fontSize: 11,
             fontFamily: 'JetBrains Mono, monospace',
-            color: '#e8eaf0',
+            color: N.n9,
             whiteSpace: 'nowrap',
             zIndex: 10,
           }}
@@ -345,43 +323,30 @@ export default function GradientHeatmap({ stats: allStats, runId, refreshKey }: 
 
       {/* Detail panel for selected param */}
       {selectedParam && selectedStats.length > 0 && (
-        <div style={{ borderTop: '1px solid #252830' }}>
-          <div
-            className="flex items-center justify-between px-4 py-2"
-            style={{ borderBottom: '1px solid #1a1d24' }}
-          >
-            <span
-              className="text-xs font-mono truncate"
-              style={{ color: '#f59e0b', maxWidth: 420 }}
-              title={selectedParam}
-            >
+        <div className="border-t border-py-border">
+          <div className="flex items-center justify-between border-b border-py-border px-3 py-2">
+            <span className="num max-w-[420px] truncate text-xs text-py-text" title={selectedParam}>
               {selectedParam}
             </span>
             <button
+              type="button"
               onClick={() => setSelectedParam(null)}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: '#4a4e60',
-                cursor: 'pointer',
-                fontSize: 14,
-                lineHeight: 1,
-                flexShrink: 0,
-                marginLeft: 8,
-              }}
+              aria-label="Close parameter detail"
+              title="Close"
+              className="ml-2 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-py-muted transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text"
             >
-              ✕
+              <Icon name="x" size={14} />
             </button>
           </div>
           <div
-            className="grid gap-4 p-4"
+            className="grid gap-3 p-3"
             style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 280px), 1fr))' }}
           >
             {gradNormSeries.length > 0 && (
-              <MetricChart key={`g${selectedParam}`} name="grad_norm" data={gradNormSeries} lineColor="#f59e0b" source={DETAIL_SOURCE} fetchRange={fetchRange} refreshKey={refreshKey} />
+              <MetricChart key={`g${selectedParam}`} name="grad_norm" data={gradNormSeries} lineColor={HEAT[4]} source={DETAIL_SOURCE} fetchRange={fetchRange} refreshKey={refreshKey} />
             )}
             {weightNormSeries.length > 0 && (
-              <MetricChart key={`w${selectedParam}`} name="weight_norm" data={weightNormSeries} lineColor="#60a5fa" source={DETAIL_SOURCE} fetchRange={fetchRange} refreshKey={refreshKey} />
+              <MetricChart key={`w${selectedParam}`} name="weight_norm" data={weightNormSeries} lineColor={STEEL} source={DETAIL_SOURCE} fetchRange={fetchRange} refreshKey={refreshKey} />
             )}
           </div>
         </div>

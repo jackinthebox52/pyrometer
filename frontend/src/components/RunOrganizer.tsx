@@ -4,10 +4,14 @@ import { api, PINS_CHANGED } from '../api/client.ts'
 import type { Project, Run } from '../api/types.ts'
 import { parseTags } from '../utils/runList.ts'
 import ConfirmDialog from './ConfirmDialog.tsx'
+import Icon from './Icon.tsx'
 
-const input =
-  'rounded border border-py-border bg-py-elevated px-2 py-1 text-xs font-mono text-py-text outline-none focus:border-py-border-hi'
-const ghost = 'rounded border border-py-border bg-py-elevated px-2 py-1 text-xs font-mono text-py-muted disabled:opacity-40'
+const input = 'h-8 rounded border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text placeholder:text-py-faint'
+const ghost =
+  'inline-flex h-7 items-center gap-1.5 rounded border border-py-border-hi bg-py-surface px-3 text-[13px] text-py-soft transition-colors hover:bg-py-elevated hover:text-py-text disabled:cursor-not-allowed disabled:opacity-50 max-sm:gap-1 max-sm:px-2'
+const editBtn =
+  'inline-flex h-6 w-6 items-center justify-center rounded-sm text-py-muted transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text opacity-0 group-hover/title:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100'
+const linkBtn = 'text-xs text-py-muted underline transition-colors hover:text-py-text'
 
 interface CommonProps {
   run: Run
@@ -84,31 +88,33 @@ export function RunTitle({ run, isAdmin, onChanged }: CommonProps) {
   )
 
   return (
-    <div>
+    <div className="group/title">
       {editing === 'name' ? (
-        <div className="mb-1.5">{editForm('Run name', 200, 'w-80 text-base')}</div>
+        <div className="mb-1.5">{editForm('Run name', 200, 'w-80')}</div>
       ) : (
-        <h1 className="text-lg font-semibold mb-1.5 flex items-center gap-2" style={{ color: '#e8eaf0' }}>
+        <h1 className="mb-1.5 flex items-center gap-2 text-[22px] font-semibold text-py-text">
           {run.name}
-          {run.archived && <span className="rounded border border-py-killed/60 px-1.5 py-0.5 text-xs font-mono font-normal text-py-killed">archived</span>}
+          {run.archived && <span className="rounded border border-py-killed/60 px-1.5 py-0.5 text-xs font-normal text-py-killed">archived</span>}
           {isAdmin && (
-            <button onClick={() => start('name')} aria-label="Rename run" title="Rename" className="text-xs font-mono font-normal text-py-faint hover:text-py-muted">
-              rename
+            <button onClick={() => start('name')} aria-label="Rename run" title="Rename run" className={editBtn}>
+              <Icon name="pencil" size={14} />
             </button>
           )}
         </h1>
       )}
 
-      <div className="flex flex-wrap items-center gap-1.5 mb-2 text-xs font-mono">
-        <span className="text-py-faint">{run.project}</span>
+      <div className="mb-2 flex flex-wrap items-center gap-1.5 text-[13px]">
+        <span className="font-mono text-xs text-py-muted">{run.project}</span>
         <span className="text-py-faint">·</span>
         {editing === 'group' ? (
           editForm('Group', 128)
         ) : (
           <span className="text-py-muted">
-            group: {run.group ?? <span className="text-py-faint">none</span>}
+            Group: {run.group ? <span className="font-mono text-xs">{run.group}</span> : <span className="text-py-faint">none</span>}
             {isAdmin && (
-              <button onClick={() => start('group')} aria-label="Edit group" className="ml-2 text-py-faint hover:text-py-muted">edit</button>
+              <button onClick={() => start('group')} aria-label="Edit group" title="Edit group" className={`ml-1 align-middle ${editBtn}`}>
+                <Icon name="pencil" size={12} />
+              </button>
             )}
           </span>
         )}
@@ -116,16 +122,16 @@ export function RunTitle({ run, isAdmin, onChanged }: CommonProps) {
 
       <div className="flex flex-wrap items-center gap-1.5" aria-label="Tags">
         {run.tags.map((tag) => (
-          <span key={tag} className="inline-flex items-center gap-1 text-xs font-mono px-2 py-0.5 rounded" style={{ backgroundColor: '#1a1d24', color: '#8b8fa8', border: '1px solid #252830' }}>
+          <span key={tag} className="inline-flex items-center gap-1 rounded border border-py-border bg-py-surface px-2 py-0.5 font-mono text-xs text-py-soft">
             #{tag}
             {isAdmin && (
               <button
                 aria-label={`Remove tag ${tag}`}
                 disabled={busy}
                 onClick={() => patch({ tags: run.tags.filter((t) => t !== tag) })}
-                className="text-py-faint hover:text-py-crashed"
+                className="text-py-faint transition-colors hover:text-py-red"
               >
-                ×
+                <Icon name="x" size={12} />
               </button>
             )}
           </span>
@@ -139,11 +145,11 @@ export function RunTitle({ run, isAdmin, onChanged }: CommonProps) {
               patch({ tags: [...new Set([...run.tags, ...add])] }).then((ok) => ok && setTagDraft(''))
             }}
           >
-            <input aria-label="Add tag" placeholder="+ tag" value={tagDraft} onChange={(e) => setTagDraft(e.target.value)} className={`${input} w-24`} />
+            <input aria-label="Add tag" placeholder="Add tag" value={tagDraft} onChange={(e) => setTagDraft(e.target.value)} className={`${input} w-24`} />
           </form>
         )}
       </div>
-      {error && <p role="alert" className="mt-1 text-xs text-py-crashed">{error}</p>}
+      {error && <p role="alert" className="mt-1 text-xs text-py-red">{error}</p>}
     </div>
   )
 }
@@ -172,7 +178,7 @@ export function RunNotes({ run, isAdmin, onChanged }: CommonProps) {
   }
 
   return (
-    <div className="p-4 rounded-lg mb-6 text-sm leading-relaxed" style={{ backgroundColor: '#111318', border: '1px solid #252830', color: '#8b8fa8' }}>
+    <div className="mb-6 rounded border border-py-border bg-py-surface p-4 text-[13px] leading-relaxed text-py-soft">
       {editing ? (
         <div className="flex flex-col gap-2">
           <textarea
@@ -182,9 +188,9 @@ export function RunNotes({ run, isAdmin, onChanged }: CommonProps) {
             onKeyDown={(e) => e.key === 'Escape' && setEditing(false)}
             rows={5}
             autoFocus
-            className={`${input} w-full`}
+            className={`${input} h-auto w-full py-1.5`}
           />
-          {error && <p role="alert" className="text-xs text-py-crashed">{error}</p>}
+          {error && <p role="alert" className="text-xs text-py-red">{error}</p>}
           <div className="flex gap-2">
             <button onClick={save} disabled={busy} className={ghost}>Save notes</button>
             <button onClick={() => setEditing(false)} className={ghost}>Cancel</button>
@@ -197,9 +203,9 @@ export function RunNotes({ run, isAdmin, onChanged }: CommonProps) {
             <button
               onClick={() => { setDraft(run.notes ?? ''); setEditing(true) }}
               aria-label="Edit notes"
-              className="text-xs font-mono text-py-faint hover:text-py-muted"
+              className={linkBtn}
             >
-              edit
+              Edit
             </button>
           )}
         </div>
@@ -269,35 +275,37 @@ export function RunActions({ run, isAdmin, canPin, onChanged }: CommonProps & { 
     api.listProjects().then(setProjects).catch(() => {})
   }
 
-  const itemCls = 'block w-full px-3 py-1.5 text-left text-xs font-mono text-py-muted hover:bg-py-elevated'
+  const itemCls = 'block w-full px-3 py-1.5 text-left text-[13px] text-py-soft transition-colors hover:bg-py-elevated hover:text-py-text'
 
   return (
-    <div className="flex flex-col items-end gap-1">
-      <div className="flex items-center gap-2">
+    <div className="flex flex-col items-end gap-1 max-sm:contents">
+      <div className="flex items-center gap-2 max-sm:contents">
         {canPin && (
           <button onClick={togglePin} aria-pressed={pinned} className={ghost} title={pinned ? 'Unpin from the top of the sidebar' : 'Pin to the top of the sidebar'}>
-            {pinned ? '★ pinned' : '☆ pin'}
+            <Icon name="pin" size={14} />
+            {pinned ? 'Pinned' : 'Pin'}
           </button>
         )}
         <a href={api.runExportUrl(run.run_id)} download className={ghost} title="Download every table of this run as a zip of Parquet files">
-          export
+          Export
         </a>
         {isAdmin && (
           <div className="relative" ref={menuRef}>
             <button onClick={() => setMenu((v) => !v)} aria-haspopup="menu" aria-expanded={menu} className={ghost}>
-              manage ▾
+              Manage
+              <Icon name="chevron-down" size={12} />
             </button>
             {menu && (
-              <div role="menu" className="absolute right-0 z-20 mt-1 w-44 rounded border border-py-border-hi bg-py-surface py-1 shadow-lg">
+              <div role="menu" className="absolute right-0 z-20 mt-1 w-44 rounded border border-py-border-hi bg-py-surface py-1">
                 <button role="menuitem" className={itemCls} onClick={archive}>{run.archived ? 'Unarchive' : 'Archive'}</button>
                 <button role="menuitem" className={itemCls} onClick={openMove}>Move to project…</button>
-                <button role="menuitem" className={`${itemCls} text-py-crashed`} onClick={() => { setMenu(false); setDialog('delete') }}>Delete…</button>
+                <button role="menuitem" className={`${itemCls} !text-py-red`} onClick={() => { setMenu(false); setDialog('delete') }}>Delete…</button>
               </div>
             )}
           </div>
         )}
       </div>
-      {error && <p role="alert" className="text-xs text-py-crashed">{error}</p>}
+      {error && <p role="alert" className="text-xs text-py-red">{error}</p>}
 
       {dialog === 'move' && (
         <ConfirmDialog
@@ -313,7 +321,7 @@ export function RunActions({ run, isAdmin, canPin, onChanged }: CommonProps & { 
         >
           <p>Moving changes who can see and write this run. API keys bound to <b>{run.project}</b> lose access to it.</p>
           <label className="flex flex-col gap-1">
-            Target project
+            <span className="log-label">Target project</span>
             <select value={target} onChange={(e) => setTarget(e.target.value)} className={input}>
               <option value="">Select…</option>
               {projects.filter((p) => p.name !== run.project && !p.archived).map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}

@@ -19,18 +19,48 @@ export function duration(start: string, end: string | null): string {
   return `${hours}h ${mins % 60}m`
 }
 
-/** Y-axis gutter in px: fits the widest tick label (e.g. `-28.000`, `1.70e+4`) in the 10px mono axis font. */
+/** Y-axis gutter in px: fits the widest tick label (e.g. `-0.8929`, `-48.7k`) in the 10px mono axis font. */
 export const Y_AXIS_WIDTH = 52
 
-export function formatMetricValue(v: number): string {
+const SUFFIXES: Array<[number, string]> = [
+  [1e12, 'T'],
+  [1e9, 'B'],
+  [1e6, 'M'],
+  [1e3, 'k'],
+]
+
+/**
+ * The one number formatter for charts (ticks, header values, legends, tooltips): at most 4 significant digits with
+ * trailing zeros trimmed (12, 2.17, 0.8929, 93.81); k/M/B/T suffixes from 1e4 (48.7k, 1.05M); compact scientific below
+ * 1e-3 (7.1e-5, 3e-4); "0" for zero and an em dash for non-finite input.
+ */
+export function formatNum(v: number): string {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—'
+  if (v === 0) return '0'
   const abs = Math.abs(v)
-  if (abs === 0) return '0'
-  if (abs >= 10000) return v.toExponential(2)
-  if (abs >= 100) return v.toFixed(1)
-  if (abs >= 1) return v.toFixed(3)
-  if (abs >= 0.0001) return v.toFixed(4)
-  return v.toExponential(2)
+  if (abs < 1e-3) {
+    const [m, e] = v.toExponential(1).split('e')
+    return `${m.replace(/\.0$/, '')}e${e.replace('+', '')}`
+  }
+  const rounded = +v.toPrecision(4)
+  if (Math.abs(rounded) < 1e4) return String(rounded)
+  for (let i = 0; i < SUFFIXES.length; i++) {
+    const [unit, suffix] = SUFFIXES[i]
+    if (abs < unit) continue
+    let scaled = +(v / unit).toPrecision(3)
+    // 999.6k rounds to 1000k: promote to the next unit instead.
+    if (Math.abs(scaled) >= 1000 && i > 0) {
+      const [u2, s2] = SUFFIXES[i - 1]
+      scaled = +(v / u2).toPrecision(3)
+      return `${scaled}${s2}`
+    }
+    return `${scaled}${suffix}`
+  }
+  return String(rounded)
 }
+
+/** Alias kept for existing call sites: chart values (see `formatNum`). */
+export const formatMetricValue = formatNum
 
 export function formatMicroseconds(us: number): string {
   if (us >= 1_000_000) return `${(us / 1_000_000).toFixed(2)}s`

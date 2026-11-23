@@ -77,7 +77,9 @@ The fixed left panel lists runs, most recently active first.
 Each row displays:
 
 - **Checkbox**: Select for comparison or bulk actions (color-coded). Shift-click selects the range from the last clicked run
-- **Status dot**: Green (running), blue (completed), orange (failed), red (crashed: no heartbeat from the SDK), yellow (killed)
+- **Heat chip**: a small bar coloured by status. Running runs glow on a blackbody scale by their GPU load over the last 60 s
+  (`gpu_heat` on `GET /runs`: dull red when idle, amber to white when busy) and pulse slowly; completed runs cool to steel grey;
+  failed and crashed (no heartbeat from the SDK) runs are red; killed runs are muted. Finished runs' names are dimmer than live ones
 - **Run name**: Click to navigate to run detail; a star marks pinned runs, "archived" marks archived ones
 - **Time ago**: Since the last update (or creation when sorted by created)
 - **Tags**: Hashtag pills
@@ -126,13 +128,47 @@ dashboard sessions may not write run metadata unless they are admins (see [auth.
 
 - **New run**: Appears immediately when `pyrometer.init()` is called
 - **Status change**: Updates when `run.finish()` marks the run complete
-- **Pulse animation**: Running runs have an animated status dot
+- **Pulse animation**: Running runs have a slowly pulsing heat chip (off with reduced motion)
 
 ---
 
 ## Run Detail View
 
-The main view for inspecting a single training run.
+The main view for inspecting a single training run. The page is split into tabs (the active tab is in the URL as `?tab=`; tabs
+with no data are hidden):
+
+| Tab | Contents |
+|---|---|
+| **Overview** | GPU load curve, key numbers (loss trend, steps, steps/sec, avg GPU, peak VRAM, efficiency grade, anomalies), pinned charts, recent events |
+| **Metrics** | Every metric chart, grouped by prefix (`auto/`, `val/`, `episode/`…), with a filter box, the chart defaults toolbar and the events toggle |
+| **System** | GPU charts (utilisation, memory, temperature, power; process vs device), per-GPU summary, hardware and environment |
+| **Model health** | Gradient heatmap and anomaly detail (from `run.watch()` and the anomaly detectors) |
+| **Profiler** | Kernel timeline, operator breakdown, memory deltas and hints for each profiled step |
+| **Logs** | Captured stdout/stderr |
+| **Media & samples** | Images, figures, histograms and `log_samples` tables |
+| **Artifacts** | Files recorded with `log_artifact` |
+| **Notes & config** | Notes and the hyperparameter table |
+
+### GPU load curve
+
+The Overview opens on the run's GPU utilisation over its whole life, coloured by load on a blackbody scale (idle is dark red,
+busy is amber, flat-out is white), averaged across GPUs (process-attributed utilisation when available). Triangle marks above it
+are events; red ones are anomalies. Hover for elapsed time, step, GPU % and the nearest event. Drag across a period (or click a
+point) to open the Metrics tab zoomed to that time window; **Reset zoom** returns to the full run.
+
+### Customize view (per project)
+
+**Customize view** (right of the tabs) chooses what each project shows: which tabs are visible, which metrics are pinned to the
+Overview (defaults: loss, val loss, learning rate, throughput or episode return, up to four) and which metrics are hidden. On the
+Metrics tab, hover a chart for **Pin** and **Hide** buttons; a group heading can hide the whole prefix (`auto/*`). Hidden metrics
+are listed under **Hidden (n)** with Show buttons. The settings apply to every run of that project and are stored in this browser
+(`localStorage`, key `pyrometer.view.<project>`), so each user keeps their own view.
+
+### Chart controls
+
+Each chart's options (x-axis, log scale, normalisation, smoothing, reset) are behind the **⋯** button in its header, shown on hover
+or keyboard focus (always on touch screens). Options that differ from the defaults show as small chips in the header (`log`,
+`ema 0.6`, `x: time`) so the state stays visible.
 
 ### Header & Metadata
 

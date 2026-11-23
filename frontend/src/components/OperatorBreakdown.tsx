@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import type { ProfileEvent } from '../api/types.ts'
 import { formatMicroseconds } from '../utils/format.ts'
+import { CHART, HEAT, N, STEEL } from '../theme.ts'
 import ExpandModal, { ExpandButton } from './ExpandModal.tsx'
 
 interface Props {
@@ -15,10 +16,10 @@ export default function OperatorBreakdown({ events, expanded = false }: Props) {
   if (events.length === 0) {
     return (
       <div
-        className="flex items-center justify-center text-xs font-mono rounded-lg"
-        style={{ height: 160, backgroundColor: '#111318', border: '1px solid #252830', color: '#4a4e60' }}
+        className="flex items-center justify-center rounded-sm border border-py-border bg-py-surface text-xs text-py-faint"
+        style={{ height: 160 }}
       >
-        no profile data
+        No profile data for this step
       </div>
     )
   }
@@ -44,13 +45,11 @@ export default function OperatorBreakdown({ events, expanded = false }: Props) {
 
   return (
     <>
-    <div className="rounded-lg p-4" style={{ backgroundColor: '#111318', border: '1px solid #252830' }}>
+    <div className="rounded-sm border border-py-border bg-py-surface p-3">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-mono" style={{ color: '#8b8fa8' }}>
-          Operator Breakdown
-        </span>
+        <span className="text-[13px] font-semibold text-py-text">Operator breakdown</span>
         <div className="flex items-center gap-3">
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>
+          <span className="text-[11px] text-py-muted">
             step total {formatMicroseconds(totalUs)}
           </span>
           {!expanded && <ExpandButton onClick={() => setIsExpanded(true)} />}
@@ -59,43 +58,35 @@ export default function OperatorBreakdown({ events, expanded = false }: Props) {
 
       <div className="flex gap-4 mb-3">
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: '#f59e0b' }} />
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>CUDA</span>
+          <div className="h-2 w-2 rounded-[1px]" style={{ backgroundColor: HEAT[4] }} />
+          <span className="text-[11px] text-py-muted">CUDA</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: '#6366f1' }} />
-          <span className="text-xs font-mono" style={{ color: '#4a4e60' }}>CPU</span>
+          <div className="h-2 w-2 rounded-[1px]" style={{ backgroundColor: STEEL }} />
+          <span className="text-[11px] text-py-muted">CPU</span>
         </div>
       </div>
 
       <ResponsiveContainer width="100%" height={height}>
         <BarChart data={top} layout="vertical" margin={{ top: 0, right: 56, left: 16, bottom: 0 }} barSize={13}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#1e2128" horizontal={false} />
+          <CartesianGrid strokeDasharray="2 4" stroke={CHART.grid} horizontal={false} />
           <XAxis
             type="number"
-            tick={{ fontSize: 10, fill: '#4a4e60', fontFamily: 'JetBrains Mono' }}
+            tick={CHART.tick}
             tickLine={false}
-            axisLine={false}
+            axisLine={{ stroke: CHART.axis }}
             tickFormatter={formatMicroseconds}
           />
           <YAxis
             type="category"
             dataKey="name"
             width={165}
-            tick={{ fontSize: 10, fill: '#8b8fa8', fontFamily: 'JetBrains Mono' }}
+            tick={{ ...CHART.tick, fill: N.n8 }}
             tickLine={false}
             axisLine={false}
           />
           <Tooltip
-            contentStyle={{
-              backgroundColor: '#1a1d24',
-              border: '1px solid #353840',
-              borderRadius: 6,
-              fontSize: 12,
-              fontFamily: 'JetBrains Mono',
-              padding: '6px 10px',
-            }}
-            labelStyle={{ color: '#e8eaf0', marginBottom: 4 }}
+            {...CHART.tooltip}
             formatter={(value: number, name: string, props) => {
               const label = name === 'cuda' ? 'CUDA' : 'CPU'
               const pct = props.payload.total > 0
@@ -103,10 +94,10 @@ export default function OperatorBreakdown({ events, expanded = false }: Props) {
                 : '0.0'
               return [`${formatMicroseconds(value)} (${pct}% of op)`, label]
             }}
-            cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+            cursor={{ fill: N.n3, fillOpacity: 0.5 }}
           />
-          <Bar dataKey="cuda" stackId="a" fill="#f59e0b" isAnimationActive={false} radius={0} />
-          <Bar dataKey="cpu" stackId="a" fill="#6366f1" isAnimationActive={false} radius={[0, 2, 2, 0]} />
+          <Bar dataKey="cuda" stackId="a" fill={HEAT[4]} isAnimationActive={false} radius={0} />
+          <Bar dataKey="cpu" stackId="a" fill={STEEL} isAnimationActive={false} radius={[0, 2, 2, 0]} />
         </BarChart>
       </ResponsiveContainer>
     </div>

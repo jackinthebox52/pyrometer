@@ -2,6 +2,33 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Tokens mirror src/theme.ts and tailwind.config.js (py-*). Keep the three in sync. */
+:root {
+  --n0: #110e0b;
+  --n1: #17130f;
+  --n2: #1e1814;
+  --n3: #261f19;
+  --n4: #30271f;
+  --n5: #3f3329;
+  --n6: #6b5b4d;
+  --n7: #a8998a;
+  --n8: #d6c8b8;
+  --n9: #f3e9dc;
+  --heat-0: #3b0f0a;
+  --heat-1: #7a2414;
+  --heat-2: #b8361a;
+  --heat-3: #e0521d;
+  --heat-4: #f6b23c;
+  --heat-5: #fbd36b;
+  --heat-6: #fff1cf;
+  --steel: #8a97a6;
+  --red: #e5484d;
+  --green: #5fb87a;
+  --font-ui: 'Archivo Variable', 'Archivo', system-ui, sans-serif;
+  --font-num: 'JetBrains Mono', ui-monospace, monospace;
+  color-scheme: dark;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -15,81 +42,104 @@ body,
 }
 
 body {
-  background-color: #0a0b0e;
-  color: #e8eaf0;
-  font-family: 'Sora', sans-serif;
+  background-color: var(--n1);
+  color: var(--n9);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  font-variant-numeric: tabular-nums;
 }
 
-/* Subtle dot grid — gives the "scientific instrument" feel */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
-  background-size: 28px 28px;
-  pointer-events: none;
-  z-index: 0;
+::selection {
+  background: var(--heat-1);
+  color: var(--heat-6);
 }
 
-#root {
-  position: relative;
-  z-index: 1;
+input,
+textarea {
+  caret-color: var(--heat-4);
 }
 
-/* Thin scrollbars */
+:focus-visible {
+  outline: 1px solid var(--heat-4);
+  outline-offset: 2px;
+}
+
+a {
+  text-underline-offset: 3px;
+}
+
+/* Thin warm scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--n5) transparent;
+}
 ::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #252830;
-  border-radius: 3px;
+  background: var(--n5);
+  border-radius: 2px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #353840;
+  background: var(--n6);
 }
 
-/* Status pulse for "running" indicator */
+/* Condensed uppercase label, like a firing-log form field */
+.log-label {
+  font-family: var(--font-ui);
+  font-stretch: 80%;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--n7);
+}
+
+.num {
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A running run's heat chip breathes slowly. */
 @keyframes status-pulse {
   0%,
   100% {
     opacity: 1;
   }
   50% {
-    opacity: 0.35;
+    opacity: 0.55;
   }
 }
 
 .status-pulse {
-  animation: status-pulse 2s ease-in-out infinite;
+  animation: status-pulse 2.4s ease-in-out infinite;
 }
 
-/* Sidebar nav link active state */
-.run-nav-link {
-  display: block;
-  padding: 10px 12px;
-  margin: 1px 4px;
-  border-radius: 6px;
-  border-left: 2px solid transparent;
-  text-decoration: none;
-  transition: background-color 0.1s;
+@media (prefers-reduced-motion: reduce) {
+  .status-pulse {
+    animation: none;
+  }
+  * {
+    transition-duration: 0ms !important;
+  }
 }
 
-.run-nav-link:hover {
-  background-color: #1a1d24;
+input[type='range'],
+input[type='checkbox'],
+input[type='radio'] {
+  accent-color: var(--heat-4);
 }
 
-.run-nav-link.active {
-  background-color: #1a1d24;
-  border-left-color: #f59e0b;
-}
-
-input[type="range"],
-input[type="checkbox"] {
-  accent-color: #f59e0b;
+select,
+input,
+textarea,
+button {
+  font-family: inherit;
 }

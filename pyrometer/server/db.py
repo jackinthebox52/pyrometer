@@ -745,9 +745,24 @@ def db_list_runs_page(
             {r[0] for r in get_conn().execute("SELECT run_id FROM pinned_runs WHERE username = ?", [pinned_by]).fetchall()}
             if pinned_by else set()
         )
+        # One grouped query for the whole page: mean utilization over each run's last 60s of snapshots.
+        heat = {}
+        if rows:
+            heat = {
+                r[0]: r[1]
+                for r in get_conn().execute(
+                    "WITH newest AS (SELECT run_id, MAX(timestamp) AS t FROM system_snapshots "
+                    "WHERE run_id IN (SELECT unnest(?::VARCHAR[])) GROUP BY run_id) "
+                    "SELECT s.run_id, AVG(COALESCE(s.attributed_utilization, s.gpu_utilization)) / 100.0 "
+                    "FROM system_snapshots s JOIN newest n ON n.run_id = s.run_id AND s.timestamp >= n.t - 60 "
+                    "GROUP BY s.run_id",
+                    [[r[0] for r in rows]],
+                ).fetchall()
+            }
     out = [_row_to_run_summary(r) for r in rows]
     for run in out:
         run["pinned"] = run["run_id"] in pinned
+        run["gpu_heat"] = heat.get(run["run_id"])  # None: no snapshots (or no utilization readings)
     return out, int(total)
 
 

@@ -1,4 +1,5 @@
 import type { Metric } from '../api/types.ts'
+import { formatNum } from './format.ts'
 
 /** 'step' | 'time' (wall clock) | 'rel' (time since run start) | 'metric:<name>' (any logged metric). */
 export type XAxis = string
@@ -144,14 +145,7 @@ export function eventX(
   return ev.step
 }
 
-function compact(v: number): string {
-  const abs = Math.abs(v)
-  if (abs >= 1e9) return `${+(v / 1e9).toPrecision(3)}B`
-  if (abs >= 1e6) return `${+(v / 1e6).toPrecision(3)}M`
-  if (abs >= 1e4) return `${+(v / 1e3).toPrecision(3)}k`
-  if (Number.isInteger(v)) return String(v)
-  return abs >= 1 ? v.toFixed(2) : v.toPrecision(3)
-}
+const compact = formatNum
 
 function formatElapsed(secs: number): string {
   const s = Math.round(Math.max(0, secs))

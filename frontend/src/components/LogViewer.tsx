@@ -24,29 +24,19 @@ export default function LogViewer({ logs }: Props) {
   const hasStderr = logs.some((l) => l.stream === 'stderr')
 
   return (
-    <div className="rounded-lg" style={{ backgroundColor: '#0d0f14', border: '1px solid #252830' }}>
-      {/* Controls bar */}
-      <div
-        className="flex items-center gap-3 px-3 py-2"
-        style={{ borderBottom: '1px solid #1a1d24' }}
-      >
-        <div className="flex gap-1">
+    <div className="rounded border border-py-border bg-py-n0">
+      <div className="flex items-center gap-3 border-b border-py-border px-3 py-2">
+        <div className="flex" role="group" aria-label="Log stream">
           {(['all', 'stdout', ...(hasStderr ? ['stderr'] : [])] as const).map((s) => (
             <button
               key={s}
               onClick={() => setStream(s as typeof stream)}
-              className="text-xs font-mono px-2 py-0.5 rounded transition-colors"
-              style={{
-                backgroundColor: stream === s ? '#1e2128' : 'transparent',
-                color:
-                  stream === s
-                    ? s === 'stderr'
-                      ? '#f97316'
-                      : '#8b8fa8'
-                    : '#4a4e60',
-                border: `1px solid ${stream === s ? '#353840' : 'transparent'}`,
-                cursor: 'pointer',
-              }}
+              aria-pressed={stream === s}
+              className={`-ml-px h-7 border px-3 text-[13px] transition-colors first:ml-0 first:rounded-l last:rounded-r ${
+                stream === s
+                  ? 'border-py-border-hi bg-py-elevated text-py-text'
+                  : 'border-py-border-hi bg-py-surface text-py-soft hover:bg-py-elevated hover:text-py-text'
+              }`}
             >
               {s}
             </button>
@@ -56,72 +46,29 @@ export default function LogViewer({ logs }: Props) {
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="filter…"
-          style={{
-            background: 'none',
-            border: 'none',
-            outline: 'none',
-            color: '#8b8fa8',
-            fontSize: 11,
-            fontFamily: 'JetBrains Mono, monospace',
-            flex: 1,
-            minWidth: 0,
-          }}
+          placeholder="Filter lines"
+          aria-label="Filter log lines"
+          className="h-7 min-w-0 flex-1 rounded border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text placeholder:text-py-faint"
         />
 
-        <span
-          className="text-xs font-mono flex-shrink-0"
-          style={{ color: '#4a4e60' }}
-        >
+        <span className="num flex-shrink-0 text-xs text-py-muted">
           {filtered.length}/{logs.length}
         </span>
       </div>
 
-      {/* Log lines */}
-      <div
-        style={{
-          maxHeight: 320,
-          overflowY: 'auto',
-          padding: '8px 0',
-          fontFamily: 'JetBrains Mono, monospace',
-          fontSize: 11,
-        }}
-      >
+      <div className="max-h-80 overflow-y-auto py-2 font-mono text-xs">
         {filtered.length === 0 ? (
-          <div
-            className="flex items-center justify-center text-xs font-mono"
-            style={{ height: 60, color: '#4a4e60' }}
-          >
-            no matching lines
+          <div className="flex h-[60px] items-center justify-center font-sans text-[13px] text-py-muted">
+            No matching lines
           </div>
         ) : (
           filtered.map((entry, i) => (
-            <div
-              key={i}
-              className="flex items-baseline gap-0 hover:bg-opacity-10"
-              style={{ paddingLeft: 12, paddingRight: 12, lineHeight: 1.65 }}
-            >
-              {/* Step gutter */}
-              <span
-                style={{
-                  color: '#2a2d38',
-                  minWidth: 44,
-                  textAlign: 'right',
-                  flexShrink: 0,
-                  paddingRight: 12,
-                  fontSize: 10,
-                  userSelect: 'none',
-                }}
-              >
+            <div key={i} className="flex items-baseline px-3 leading-[1.65] hover:bg-py-surface">
+              <span className="min-w-[44px] flex-shrink-0 select-none pr-3 text-right text-[11px] text-py-faint">
                 {entry.step != null ? entry.step : ''}
               </span>
-              {/* Line content */}
               <span
-                style={{
-                  color: entry.stream === 'stderr' ? '#f97316' : '#8b8fa8',
-                  wordBreak: 'break-all',
-                  whiteSpace: 'pre-wrap',
-                }}
+                className={`whitespace-pre-wrap break-all ${entry.stream === 'stderr' ? 'text-py-red/85' : 'text-py-soft'}`}
               >
                 {entry.line}
               </span>

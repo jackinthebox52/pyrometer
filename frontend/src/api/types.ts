@@ -78,6 +78,8 @@ export interface Run {
   archived?: boolean
   project_archived?: boolean
   pinned?: boolean
+  /** Recent GPU load 0..1 (list responses only); null when the run has no system snapshots. */
+  gpu_heat?: number | null
 }
 
 /** `GET /runs/facets`: what the run list can be filtered by. */

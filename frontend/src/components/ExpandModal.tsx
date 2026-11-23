@@ -1,11 +1,14 @@
 import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
+import Icon from './Icon.tsx'
+import { N } from '../theme.ts'
 
 interface Props {
   onClose: () => void
   children: React.ReactNode
 }
 
+/** Full-screen overlay for an expanded chart. Escape or a click on the backdrop closes it. */
 export default function ExpandModal({ onClose, children }: Props) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -16,29 +19,24 @@ export default function ExpandModal({ onClose, children }: Props) {
   return createPortal(
     <div
       onClick={onClose}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        zIndex: 200,
-        background: 'rgba(0,0,0,0.80)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 32,
-      }}
+      className="fixed inset-0 z-[200] flex items-center justify-center p-4 sm:p-8 "
+      style={{ backgroundColor: `${N.n1}d9` }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
         onClick={(e) => e.stopPropagation()}
-        style={{
-          width: '92vw',
-          maxWidth: 1400,
-          maxHeight: '88vh',
-          overflowY: 'auto',
-          borderRadius: 10,
-          border: '1px solid #353840',
-          background: '#0a0b0e',
-        }}
+        className="relative w-[92vw] max-w-[1400px] max-h-[88vh] overflow-y-auto rounded-sm border border-py-border-hi bg-py-base"
       >
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          title="Close (Esc)"
+          className="absolute right-2 top-2 z-10 inline-flex h-7 w-7 items-center justify-center rounded-sm border border-py-border-hi bg-py-surface text-py-soft transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text"
+        >
+          <Icon name="x" size={14} />
+        </button>
         {children}
       </div>
     </div>,
@@ -50,24 +48,13 @@ export default function ExpandModal({ onClose, children }: Props) {
 export function ExpandButton({ onClick }: { onClick: () => void }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       title="Expand"
-      style={{
-        background: 'none',
-        border: 'none',
-        cursor: 'pointer',
-        padding: '2px 4px',
-        color: '#4a4e60',
-        lineHeight: 1,
-        borderRadius: 4,
-      }}
-      onMouseEnter={(e) => ((e.currentTarget as HTMLButtonElement).style.color = '#8b8fa8')}
-      onMouseLeave={(e) => ((e.currentTarget as HTMLButtonElement).style.color = '#4a4e60')}
+      aria-label="Expand chart"
+      className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-py-muted transition-colors duration-150 ease-out hover:bg-py-elevated hover:text-py-text"
     >
-      {/* Simple "expand" SVG — two diagonal arrows */}
-      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-        <path d="M1 4.5V1h3.5M11 4.5V1H7.5M1 7.5V11h3.5M11 7.5V11H7.5" />
-      </svg>
+      <Icon name="expand" size={14} />
     </button>
   )
 }

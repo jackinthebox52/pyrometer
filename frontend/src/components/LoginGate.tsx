@@ -5,7 +5,7 @@ import type { Session } from '../api/types.ts'
 const MIN_PASSWORD = 6
 
 const inputCls =
-  'rounded border border-py-border bg-py-elevated px-2 py-1.5 text-xs font-mono text-py-text outline-none focus:border-py-border-hi'
+  'h-8 w-full rounded border border-py-border-hi bg-py-elevated px-2 text-[13px] text-py-text placeholder:text-py-faint'
 
 /**
  * Renders children once the server accepts us: auth off (local mode), a trusted reverse proxy
@@ -56,11 +56,15 @@ export default function LoginGate({ children }: { children: ReactNode }) {
     <div className="flex h-screen items-center justify-center bg-py-base">
       <form
         onSubmit={submit}
-        className="w-96 rounded-lg border border-py-border bg-py-surface p-6 flex flex-col gap-3"
+        className="w-[360px] max-w-[calc(100vw-32px)] rounded border border-py-border bg-py-surface p-6 flex flex-col gap-3"
       >
-        <h1 className="text-sm font-mono text-py-text">{setup ? 'Set up Pyrometer' : 'Pyrometer'}</h1>
+        <div>
+          <h1 className="text-[22px] font-semibold text-py-text">Pyrometer</h1>
+          <p className="text-[13px] text-py-muted">Experiment tracking and GPU profiling for PyTorch</p>
+        </div>
+        {setup && <h2 className="text-[15px] font-semibold text-py-text">Set up the first admin</h2>}
         {setup && (
-          <p className="text-xs text-py-muted">
+          <p className="text-[13px] text-py-muted">
             Enter the one-time setup token from the server log, then choose a username and password for the first admin. Find the
             token with <code className="font-mono">docker compose logs pyrometer | grep "setup token"</code>
             , or run <code className="font-mono">pyrometer admin set-password</code> on the host.
@@ -104,11 +108,15 @@ export default function LoginGate({ children }: { children: ReactNode }) {
             className={inputCls}
           />
         )}
-        {error && <p className="text-xs text-py-crashed">{error}</p>}
+        {error && (
+          <p role="alert" className="text-[13px] text-py-red">
+            {error}. {setup ? 'Check the setup token and try again.' : 'Check your username and password and try again.'}
+          </p>
+        )}
         <button
           type="submit"
           disabled={busy || username.trim() === '' || password === '' || (setup && token.trim() === '')}
-          className="rounded bg-py-amber px-2 py-1.5 text-xs font-mono text-black disabled:opacity-40"
+          className="h-8 w-full rounded bg-py-n8 px-3 text-[13px] font-medium text-py-base transition-colors hover:bg-py-text disabled:cursor-not-allowed disabled:opacity-50"
         >
           {busy ? 'Working…' : setup ? 'Create admin' : 'Sign in'}
         </button>
