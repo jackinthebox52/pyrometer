@@ -1,0 +1,295 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-23T00:00:00Z",
+  "title": "Design System: Pyrometer",
+  "extensions": {
+    "colorMeta": {
+      "soot-ground": {
+        "role": "neutral",
+        "displayName": "Soot Ground",
+        "canonical": "#17130f",
+        "tonalRamp": [
+          "#1f1a14",
+          "#382e24",
+          "#564738",
+          "#7b6651",
+          "#9e856b",
+          "#b7a390",
+          "#d3c7bb",
+          "#eeebe8"
+        ]
+      },
+      "soot-panel": {
+        "role": "neutral",
+        "displayName": "Panel Soot",
+        "canonical": "#1e1814",
+        "tonalRamp": [
+          "#1f1814",
+          "#372c25",
+          "#564539",
+          "#7a6252",
+          "#9d806c",
+          "#b6a091",
+          "#d2c5bc",
+          "#edeae8"
+        ]
+      },
+      "bone-text": {
+        "role": "neutral",
+        "displayName": "Bone Text",
+        "canonical": "#f3e9dc",
+        "tonalRamp": [
+          "#261b0d",
+          "#443117",
+          "#6a4c24",
+          "#986d34",
+          "#c08c49",
+          "#d0a976",
+          "#e2caab",
+          "#f2ece4"
+        ]
+      },
+      "heat-4": {
+        "role": "primary",
+        "displayName": "Amber Heat",
+        "canonical": "#f6b23c",
+        "tonalRamp": [
+          "#312002",
+          "#583904",
+          "#895906",
+          "#c37f09",
+          "#f4a315",
+          "#f7ba4f",
+          "#fad594",
+          "#f8eede"
+        ],
+        "note": "Keys heat-0..heat-6 form the blackbody ramp; see theme.ts HEAT."
+      },
+      "steel-finished": {
+        "role": "secondary",
+        "displayName": "Cooled Steel",
+        "canonical": "#8a97a6",
+        "tonalRamp": [
+          "#16191d",
+          "#282d34",
+          "#3e4751",
+          "#586574",
+          "#748395",
+          "#97a2b0",
+          "#bfc6cf",
+          "#e9eaed"
+        ]
+      },
+      "failure-red": {
+        "role": "secondary",
+        "displayName": "Failure Red",
+        "canonical": "#e5484d",
+        "tonalRamp": [
+          "#2d0608",
+          "#500b0e",
+          "#7d1215",
+          "#b3191e",
+          "#e1292f",
+          "#e85e63",
+          "#f19d9f",
+          "#f5e0e1"
+        ]
+      },
+      "improving-green": {
+        "role": "secondary",
+        "displayName": "Improving Green",
+        "canonical": "#5fb87a",
+        "tonalRamp": [
+          "#102316",
+          "#1c4027",
+          "#2c633d",
+          "#3f8d57",
+          "#55b472",
+          "#80c795",
+          "#b1ddbe",
+          "#e5f0e8"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "title": {
+        "displayName": "Title",
+        "purpose": "Page titles."
+      },
+      "heading": {
+        "displayName": "Heading",
+        "purpose": "Section headings in tabs."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Working UI text at 13px."
+      },
+      "small": {
+        "displayName": "Small",
+        "purpose": "Metadata and badges."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Condensed uppercase control labels only."
+      },
+      "numeric": {
+        "displayName": "Numeric",
+        "purpose": "All values, steps, ages and ids in JetBrains Mono."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "state-change",
+        "value": "150ms ease-out",
+        "purpose": "Hover and selection colour changes (150 to 200ms)."
+      },
+      {
+        "name": "status-pulse",
+        "value": "2.4s ease-in-out infinite, opacity 1 to 0.55",
+        "purpose": "Running heat chip breathing; disabled under prefers-reduced-motion."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "md",
+        "value": "768px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single primary action per view, e.g. Compare.",
+      "html": "<button class=\"ds-btn-primary\">Compare</button>",
+      "css": ".ds-btn-primary{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border-radius:2px;font:13px 'Archivo Variable',Archivo,system-ui,sans-serif;cursor:pointer;transition:background-color 150ms ease-out,color 150ms ease-out;border:0;background:#d6c8b8;color:#17130f;font-weight:500}.ds-btn-primary:hover{background:#f3e9dc}.ds-btn-primary:focus-visible{outline:1px solid #f6b23c;outline-offset:2px}"
+    },
+    {
+      "name": "Button",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Standard secondary action.",
+      "html": "<button class=\"ds-btn\">Copy for LLM</button>",
+      "css": ".ds-btn{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border-radius:2px;font:13px 'Archivo Variable',Archivo,system-ui,sans-serif;cursor:pointer;transition:background-color 150ms ease-out,color 150ms ease-out;border:1px solid #3f3329;background:#1e1814;color:#d6c8b8}.ds-btn:hover{background:#261f19;color:#f3e9dc}.ds-btn:focus-visible{outline:1px solid #f6b23c;outline-offset:2px}"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Raised fill, strong hairline, amber focus outline.",
+      "html": "<input class=\"ds-input\" placeholder=\"Search runs\">",
+      "css": ".ds-input{height:32px;width:220px;padding:0 8px;border:1px solid #3f3329;border-radius:2px;background:#261f19;color:#f3e9dc;font:13px 'Archivo Variable',Archivo,system-ui,sans-serif;caret-color:#f6b23c}.ds-input::placeholder{color:#6b5b4d}.ds-input:focus-visible{outline:1px solid #f6b23c;outline-offset:2px}"
+    },
+    {
+      "name": "Status Badge",
+      "kind": "chip",
+      "refersTo": "status-badge",
+      "description": "Square heat chip plus sentence-case label; running pulses.",
+      "html": "<span class=\"ds-badge\"><i class=\"ds-chip\"></i>Running</span>",
+      "css": ".ds-badge{display:inline-flex;align-items:center;gap:6px;padding:2px 6px;border:1px solid #30271f;border-radius:2px;background:#1e1814;color:#d6c8b8;font:12px 'Archivo Variable',Archivo,system-ui,sans-serif}.ds-chip{display:inline-block;width:8px;height:8px;border-radius:1px;background:#f6b23c;animation:ds-pulse 2.4s ease-in-out infinite}@keyframes ds-pulse{0%,100%{opacity:1}50%{opacity:.55}}@media (prefers-reduced-motion:reduce){.ds-chip{animation:none}}"
+    },
+    {
+      "name": "Tabs",
+      "kind": "nav",
+      "refersTo": "",
+      "description": "Standard tablist with a 2px soft-ash underline on the active tab.",
+      "html": "<div class=\"ds-tabs\"><button class=\"ds-tab on\">Overview</button><button class=\"ds-tab\">Metrics</button><button class=\"ds-tab\">System</button></div>",
+      "css": ".ds-tabs{display:flex;border-bottom:1px solid #30271f}.ds-tab{height:36px;padding:0 12px;margin-bottom:-1px;border:0;border-bottom:2px solid transparent;background:none;color:#a8998a;font:13px 'Archivo Variable',Archivo,system-ui,sans-serif;cursor:pointer;transition:color 150ms ease-out}.ds-tab:hover{color:#d6c8b8}.ds-tab.on{color:#f3e9dc;border-bottom-color:#d6c8b8}.ds-tab:focus-visible{outline:1px solid #f6b23c;outline-offset:2px}"
+    },
+    {
+      "name": "Sidebar Run Row",
+      "kind": "custom",
+      "refersTo": "sidebar",
+      "description": "Heat chip, name and mono age; the active row is raised with a strong hairline.",
+      "html": "<div class=\"ds-run on\"><i class=\"ds-rchip\"></i><div><div class=\"ds-rname\">lr-sweep-07</div><div class=\"ds-rage\">12m ago #sweep</div></div></div>",
+      "css": ".ds-run{display:flex;align-items:center;gap:8px;min-height:44px;width:260px;padding:4px 8px;border:1px solid transparent;border-radius:2px;background:#110e0b}.ds-run:hover{background:#1e1814}.ds-run.on{background:#261f19;border-color:#3f3329}.ds-rchip{width:8px;height:14px;border-radius:1px;background:#e0521d}.ds-rname{font:13px 'Archivo Variable',Archivo,system-ui,sans-serif;color:#f3e9dc}.ds-rage{font:11px 'JetBrains Mono',ui-monospace,monospace;color:#a8998a}"
+    },
+    {
+      "name": "Key Numbers",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "Hairline-divided readout cells: condensed label, mono value, mono sub line.",
+      "html": "<div class=\"ds-keys\"><div class=\"ds-cell\"><div class=\"ds-l\">Loss</div><div class=\"ds-v g\">0.412</div><div class=\"ds-s\">down</div></div><div class=\"ds-cell\"><div class=\"ds-l\">Avg GPU</div><div class=\"ds-v\">87.3%</div><div class=\"ds-s\">so far</div></div><div class=\"ds-cell\"><div class=\"ds-l\">Anomalies</div><div class=\"ds-v r\">3</div><div class=\"ds-s\">open Model health</div></div></div>",
+      "css": ".ds-keys{display:flex;gap:1px;border:1px solid #30271f;border-radius:2px;background:#30271f;overflow:hidden}.ds-cell{padding:8px 12px;background:#1e1814;min-width:110px}.ds-l{font-family:'Archivo Variable',Archivo,sans-serif;font-stretch:80%;font-weight:600;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#a8998a}.ds-v{margin-top:4px;font:20px/24px 'JetBrains Mono',monospace;color:#f3e9dc}.ds-v.g{color:#5fb87a}.ds-v.r{color:#e5484d}.ds-s{margin-top:2px;font:11px 'JetBrains Mono',monospace;color:#a8998a}"
+    },
+    {
+      "name": "Blackbody Ramp",
+      "kind": "custom",
+      "refersTo": "",
+      "description": "The heat ramp that the firing curve samples, cold to white-hot.",
+      "html": "<div class=\"ds-ramp\"></div>",
+      "css": ".ds-ramp{width:260px;height:14px;border-radius:1px;background:linear-gradient(90deg,#3b0f0a,#7a2414,#b8361a,#e0521d,#f6b23c,#fbd36b,#fff1cf)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Firing Log",
+    "overview": "A kiln operator's log book read in a dim room: warm soot surfaces, one stepped ramp of neutrals, and heat colour reserved for the data itself. Every run has a temperature. A live run glows on the blackbody scale; when it finishes it cools to steel; a failure goes red. The dashboard is dark-first, dense and quiet, built for a tab left open beside a terminal for hours.\n\nStructure is drawn with one-pixel hairlines and corners of 2px or less. There are no shadows. Depth comes from stepping up the neutral ramp. Controls are plain and standard (tabs, buttons, selects, inputs, tables) so the only expressive things on screen are the heat colours and the firing curve.",
+    "keyCharacteristics": [
+      "Warm soot ground, never grey; every neutral is a step of one ramp.",
+      "Blackbody ramp carries heat and data only, never chrome.",
+      "Steel means finished, red means failed, a green trend means improving.",
+      "Hairline borders, 2px radius, zero shadows.",
+      "Archivo for UI, condensed uppercase for form-style labels, JetBrains Mono for numbers only.",
+      "Dark only; a light theme is not built."
+    ],
+    "rules": [
+      {
+        "name": "The Heat Is Data Rule",
+        "body": "The blackbody ramp encodes values and state only. Buttons, borders, headings and backgrounds never take a heat colour.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Ramp Rule",
+        "body": "Every neutral is one of the ten ramp steps. No ad-hoc greys.",
+        "section": "colors"
+      },
+      {
+        "name": "The Cooled Rule",
+        "body": "Finished is steel, failed is red; neither is ever shown in heat colours.",
+        "section": "colors"
+      },
+      {
+        "name": "The Numbers Are Mono Rule",
+        "body": "Values, steps, ages and ids use the `num` class; prose and labels never do.",
+        "section": "typography"
+      },
+      {
+        "name": "The Form Label Rule",
+        "body": "Condensed uppercase is for short control labels only, never for decorative eyebrows above headings.",
+        "section": "typography"
+      },
+      {
+        "name": "The No Shadow Rule",
+        "body": "Never add a shadow. Step up the neutral ramp and add a hairline instead.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do take every neutral from the ten-step ramp and reference it through the `py-*` tokens or CSS variables.",
+      "Do keep heat colours for values, run liveness and the firing curve.",
+      "Do separate surfaces with 1px hairlines and a step on the neutral ramp.",
+      "Do keep radius at 2px or less.",
+      "Do set numbers in JetBrains Mono via `num`, and keep UI text at 13px.",
+      "Do use 150 to 200ms transitions for state changes, and honour `prefers-reduced-motion`.",
+      "Do keep theme values in sync across `theme.ts`, `index.css` and `tailwind.config.js`."
+    ],
+    "donts": [
+      "Don't use a shadow, glow or blur for depth.",
+      "Don't use heat colours for buttons, borders, tabs or headings.",
+      "Don't introduce a grey that is not a ramp step, or a blue accent for chrome.",
+      "Don't use steel or red for anything but finished and failed.",
+      "Don't add page-load choreography.",
+      "Don't use a rounded pill or circle for status; status is a square chip."
+    ]
+  }
+}
