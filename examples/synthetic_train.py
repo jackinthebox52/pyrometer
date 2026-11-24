@@ -121,7 +121,7 @@ def _train_torch(run: pyrometer.Run) -> None:
             val_loss = criterion(val_logits, y_val).item()
             val_acc = (val_logits.argmax(1) == y_val).float().mean().item()
 
-        run.log({"val/loss": val_loss, "val/accuracy": val_acc})
+        run.log({"val/loss": val_loss, "val/accuracy": val_acc, "eval/accuracy": val_acc})  # eval/* scores feed the Leaderboard page
         print(f"Epoch {epoch + 1}/5 — step={run.step}  val_loss={val_loss:.4f}")
 
         # Log a synthetic prediction confidence image (H=10 class probs, W=8 samples)
@@ -175,7 +175,7 @@ def _train_simulated(run: pyrometer.Run) -> None:
 
         val_loss = base_loss * math.exp(-global_step / 280) + 0.45 + random.gauss(0, 0.03)
         val_acc = min(1.0, max(0.0, 1 - val_loss / base_loss * 0.9))
-        run.log({"val/loss": val_loss, "val/accuracy": val_acc,
+        run.log({"val/loss": val_loss, "val/accuracy": val_acc, "eval/accuracy": val_acc,
                  "tokens_seen": global_step * TOKENS_PER_STEP}, step=global_step)
         print(f"Epoch {epoch + 1}/5 — val_loss={val_loss:.4f}")
 

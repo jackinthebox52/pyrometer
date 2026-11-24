@@ -1,4 +1,5 @@
-import type { RunFacets, BulkResponse, RetentionPolicy, RunListMeta, AlertRule, AlertRuleInput, ApiKey, ApiResponse, Artifact, CreatedApiKey, CreatedProject, Project, UserAccount, MediaItem, Metric, SampleStep, SamplesPage, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, Session, SystemSnapshot } from './types.ts'
+import type {
+  Leaderboard, RunFacets, BulkResponse, RetentionPolicy, RunListMeta, AlertRule, AlertRuleInput, ApiKey, ApiResponse, Artifact, CreatedApiKey, CreatedProject, Project, UserAccount, MediaItem, Metric, SampleStep, SamplesPage, ParamStat, ProfileEvent, Run, RunEvent, RunLog, RunSummary, Session, SystemSnapshot } from './types.ts'
 
 async function apiFetchFull<T>(path: string): Promise<{ data: T; meta?: ApiResponse<T>['meta'] }> {
   const res = await fetch(path)
@@ -131,6 +132,8 @@ export const api = {
     const { data, meta } = await apiFetchFull<Run[]>(`/runs${qs({ ...query })}`)
     return { runs: data, meta: (meta as RunListMeta | undefined) ?? null }
   },
+  leaderboard: (opts: { project?: string; group?: string; prefix?: string } = {}) =>
+    apiFetch<Leaderboard>(`/leaderboard${qs({ ...opts })}`),
   listPins: (include_archived = false) => apiFetch<Run[]>(`/pins${qs({ include_archived })}`),
   pinRun: (id: string) => authSend<{ pinned: boolean }>('PUT', `/runs/${id}/pin`),
   unpinRun: (id: string) => authSend<{ pinned: boolean }>('DELETE', `/runs/${id}/pin`),

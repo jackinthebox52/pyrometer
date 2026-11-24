@@ -7,6 +7,7 @@ import RunSidebar from './components/RunSidebar.tsx'
 import CompareView from './pages/CompareView.tsx'
 import EmptyState from './pages/EmptyState.tsx'
 import RunDetailPage from './pages/RunDetailPage.tsx'
+import LeaderboardPage from './pages/LeaderboardPage.tsx'
 import SettingsPage from './pages/SettingsPage.tsx'
 
 /** Opening or navigating (back/forward) to a compare URL makes its run ids the sidebar selection. */
@@ -110,6 +111,7 @@ function Shell({ selectedIds, onToggleSelect, onSelectMany, onClearSelection }: 
           <Route path="/" element={<EmptyState />} />
           <Route path="/runs/:runId" element={<RunDetailPage />} />
           <Route path="/compare" element={<CompareView />} />
+          <Route path="/leaderboard" element={<LeaderboardPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

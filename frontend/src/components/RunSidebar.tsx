@@ -591,17 +591,21 @@ export default function RunSidebar({ selectedIds, onToggleSelect, onSelectMany, 
       </div>
 
       <div className="flex items-center justify-between border-t border-py-border px-4 py-2.5">
+        <NavLink to="/leaderboard" className={quietLink}>
+          <Icon name="compare" size={14} />
+          Leaderboard
+        </NavLink>
         <NavLink to="/settings" className={quietLink}>
           <Icon name="settings" size={14} />
           Settings
         </NavLink>
         <button onClick={toggleTheme} className={quietLink} title="Switch light / dark theme">
           <Icon name="sun" size={14} />
-          Theme
+          <span className="sr-only">Theme</span>
         </button>
-        <button onClick={() => api.logout().finally(() => window.location.reload())} className={quietLink}>
+        <button title="Sign out" onClick={() => api.logout().finally(() => window.location.reload())} className={quietLink}>
           <Icon name="x" size={14} />
-          Sign out
+          <span className="sr-only">Sign out</span>
         </button>
       </div>
     </aside>

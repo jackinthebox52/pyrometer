@@ -193,7 +193,7 @@ class Pretrain(Job):
         for frac in (0.25, 0.5, 0.75, 1.0):
             if prev < self.total_steps * frac <= s:
                 vl = self.loss(s) + 0.07
-                self.metrics({"val/loss": vl, "val/ppl": math.exp(vl)})
+                self.metrics({"val/loss": vl, "val/ppl": math.exp(vl), "eval/loss": vl, "eval/ppl": math.exp(vl)})
                 self.event(f"eval at step {s:,}: val/loss {vl:.3f}", "eval")
                 self.log(f"[eval] step {s:>6} val/loss {vl:.4f} ppl {math.exp(vl):.1f}")
         if s // 5000 > self.ckpt:
@@ -271,7 +271,7 @@ class Sweep(Job):
                 self.log("RuntimeError: loss is NaN, stopping", "stderr")
                 self.finish("failed")
                 return
-        self.metrics({"auto/loss": loss * (1 + self.rng.gauss(0, 0.015)), "val/loss": loss + 0.1,
+        self.metrics({"auto/loss": loss * (1 + self.rng.gauss(0, 0.015)), "val/loss": loss + 0.1, "eval/loss": loss + 0.1,
                       "auto/lr": self.lr * min(1.0, s / 200), "auto/steps_per_sec": 11.5 + self.rng.gauss(0, 0.3)})
 
 
@@ -326,7 +326,7 @@ class Vision(Job):
     def tick(self, p: float, prev: int) -> None:
         s = self.step
         acc = 0.92 * (1 - math.exp(-s / 2500))
-        self.metrics({"auto/loss": 4.6 * math.exp(-s / 1800) + 0.35, "val/accuracy": acc, "train/accuracy": acc + 0.03,
+        self.metrics({"auto/loss": 4.6 * math.exp(-s / 1800) + 0.35, "val/accuracy": acc, "eval/accuracy": acc, "train/accuracy": acc + 0.03,
                       "auto/samples_per_sec": 2900 + self.rng.gauss(0, 80), "auto/lr": 0.1 * 0.5 * (1 + math.cos(math.pi * p))})
         bucket = int(p * 8)
         if bucket > self.last_media:

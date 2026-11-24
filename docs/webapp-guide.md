@@ -765,6 +765,14 @@ Tabular comparison of hyperparameters across selected runs:
 
 ---
 
+## Leaderboard
+
+**Leaderboard** in the sidebar footer ranks runs by an eval score. Log scores as ordinary metrics under `eval/`
+(`run.log({"eval/accuracy": 0.91})`) and every `eval/*` metric becomes a column. Filter by project and group (a sweep or
+a competition on one benchmark is just a group), pick the metric to rank by, and choose whether the score is the latest
+value or the best ever. Names containing loss, ppl, error, latency and similar rank lower-is-better automatically; override
+it with **Better is**. The page refreshes every 10 s and keeps its filters in the URL.
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |

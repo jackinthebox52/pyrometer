@@ -150,7 +150,7 @@ def train_one_run(
             val_loss = criterion(val_logits, y_val).item()
             val_acc = (val_logits.argmax(1) == y_val).float().mean().item()
 
-        run.log({"val/loss": val_loss, "val/accuracy": val_acc})  # step-less: the current optimizer step
+        run.log({"val/loss": val_loss, "val/accuracy": val_acc, "eval/accuracy": val_acc})  # step-less; eval/* feeds the Leaderboard
 
         # Log class-confidence heatmap: rows=classes, cols=16 val samples
         conf_img = torch.softmax(val_logits[:16], dim=1).T.unsqueeze(0).cpu()

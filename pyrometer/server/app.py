@@ -38,6 +38,7 @@ from pyrometer.server.db import (
     db_export_parquet,
     db_get_media_file,
     db_is_pinned,
+    db_leaderboard,
     db_list_groups,
     db_run_facets,
     db_list_run_ids,
@@ -1299,6 +1300,18 @@ def _parse_time(value: str | None, field: str) -> float | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.timestamp()
+
+
+@app.get("/leaderboard")
+def leaderboard(
+    request: Request, project: str | None = None, group: str | None = None, prefix: str = "eval/", limit: int = 200,
+):
+    """Eval scores across visible runs, optionally within one ``project`` and/or ``group``. Every metric under
+    ``prefix`` (default ``eval/``) is reported per run as latest value + step and best-ever min/max; the
+    dashboard ranks on any of them."""
+    if limit < 1 or limit > 1000:
+        err("limit must be between 1 and 1000", 400)
+    return ok(db_leaderboard(auth.visible_projects(_principal(request)), project, group, prefix, limit))
 
 
 @app.get("/runs/facets")

@@ -297,3 +297,24 @@ export interface BulkResponse {
   succeeded: number
   failed: number
 }
+
+export interface LeaderboardScore {
+  last: number
+  step: number
+  min: number
+  max: number
+}
+
+export interface LeaderboardRow {
+  run_id: string
+  name: string
+  status: string
+  project: string
+  group: string | null
+  scores: Record<string, LeaderboardScore>
+}
+
+export interface Leaderboard {
+  metrics: string[]
+  rows: LeaderboardRow[]
+}

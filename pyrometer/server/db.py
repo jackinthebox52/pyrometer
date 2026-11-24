@@ -1144,6 +1144,39 @@ def db_list_run_ids(project: str) -> list[str]:
         return [r[0] for r in get_conn().execute("SELECT run_id FROM runs WHERE project = ?", [project]).fetchall()]
 
 
+def db_leaderboard(
+    projects: list[str] | None, project: str | None, group: str | None, prefix: str = "eval/", limit: int = 200,
+) -> dict:
+    """Eval scores across runs: ``{"metrics": [names], "rows": [{run_id, name, status, project, group, scores}]}``.
+
+    ``scores`` maps each metric under ``prefix`` to ``{"last", "min", "max", "step"}`` (latest value and its step,
+    plus the best-ever extremes). Runs without any such metric are left out. Visibility follows ``projects``.
+    """
+    runs, _ = db_list_runs_page(projects, "updated", False, group, project, None, limit=limit)
+    if not runs:
+        return {"metrics": [], "rows": []}
+    ids = [r["run_id"] for r in runs]
+    like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    with _lock:
+        got = get_conn().execute(
+            "SELECT run_id, name, arg_max(value, step), max(step), min(value), max(value) FROM metrics "
+            f"WHERE run_id IN ({', '.join('?' * len(ids))}) AND name LIKE ? ESCAPE '\\' AND value IS NOT NULL "
+            "AND isfinite(value) GROUP BY run_id, name",
+            [*ids, like],
+        ).fetchall()
+    scores: dict[str, dict] = {}
+    names: set[str] = set()
+    for rid, name, last, step, lo, hi in got:
+        scores.setdefault(rid, {})[name] = {"last": last, "step": step, "min": lo, "max": hi}
+        names.add(name)
+    rows = [
+        {"run_id": r["run_id"], "name": r["name"], "status": r["status"], "project": r["project"],
+         "group": r.get("group"), "scores": scores[r["run_id"]]}
+        for r in runs if r["run_id"] in scores
+    ]
+    return {"metrics": sorted(names), "rows": rows}
+
+
 def db_list_groups(project: str, include_archived: bool = False) -> list[dict]:
     """Groups of a project (``init(group=...)``), most recently active first."""
     where = "" if include_archived else " AND archived_at IS NULL"

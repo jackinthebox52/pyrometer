@@ -1320,6 +1320,13 @@ and die with their run.
 
 ## Run Summaries
 
+### `GET /leaderboard`
+
+Eval scores across the runs you can see. Query: `project`, `group` (both optional), `prefix` (default `eval/`), `limit`
+(1-1000, default 200). Returns `{"metrics": ["eval/acc", ...], "rows": [...]}`; each row is `run_id`, `name`, `status`,
+`project`, `group` and `scores`, a map from metric name to `{last, step, min, max}` (latest value and its step, plus the
+extremes). Runs with no metric under the prefix are left out. Non-finite values are ignored.
+
 ### `GET /runs/{run_id}/summary`
 
 Get derived statistics for a run.
